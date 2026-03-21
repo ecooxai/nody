@@ -51,6 +51,7 @@ describe("D1 schema", () => {
         "document_assets",
         "folders",
         "folder_assets",
+        "prompt_templates",
         "provider_settings",
         "sync_events",
         "d1_migrations",
@@ -71,5 +72,6 @@ describe("D1 schema", () => {
     const migrationNames = rows.map((row) => String(row.name));
 
     expect(migrationNames).toContain("0004_repair_folders_parent_folder_id.sql");
+    expect(migrationNames).toContain("0005_ai_prompts.sql");
   });
 });

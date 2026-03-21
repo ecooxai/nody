@@ -1,12 +1,15 @@
 import type { AIRequest, ProviderSettings } from "../../shared/types";
 import { createDefaultSettings } from "../../lib/providers/defaults";
-import { askProvider } from "./ai";
+import { askProvider, streamProvider } from "./ai";
 import {
+  createPromptTemplate,
   createFolder,
   createDocument,
   getDocument,
   listFolders,
   listFolderAssets,
+  listPromptTemplates,
+  updatePromptTemplate,
   getSettings,
   listDocuments,
   saveAsset,
@@ -70,9 +73,20 @@ export default {
       if (request.method === "GET" && parts[0] === "folder-assets" && parts.length === 1) {
         return json(await listFolderAssets(env.DB, userId));
       }
+      if (request.method === "GET" && parts[0] === "prompts" && parts.length === 1) {
+        return json(await listPromptTemplates(env.DB, userId));
+      }
       if (request.method === "POST" && parts[0] === "folders" && parts.length === 1) {
         const payload = await request.json() as { name: string; parentFolderId?: string | null };
         return json(await createFolder(env.DB, userId, payload), { status: 201 });
+      }
+      if (request.method === "POST" && parts[0] === "prompts" && parts.length === 1) {
+        const payload = await request.json() as { name: string; content: string };
+        return json(await createPromptTemplate(env.DB, userId, payload), { status: 201 });
+      }
+      if (request.method === "PUT" && parts[0] === "prompts" && parts.length === 2) {
+        const payload = await request.json() as { name: string; content: string };
+        return json(await updatePromptTemplate(env.DB, userId, parts[1], payload));
       }
       if (request.method === "POST" && parts[0] === "folders" && parts[2] === "assets") {
         const formData = await request.formData();
@@ -130,7 +144,10 @@ export default {
       if (request.method === "POST" && parts[0] === "ai" && parts[1] === "ask") {
         const requestPayload = await request.json() as AIRequest;
         const settings = (await getSettings(env.DB, userId)) ?? createDefaultSettings();
-        return json(await askProvider(settings, requestPayload));
+        if (url.searchParams.get("stream") === "1") {
+          return streamProvider(env, userId, settings, requestPayload);
+        }
+        return json(await askProvider(env, userId, settings, requestPayload));
       }
       if (request.method === "GET" && parts[0] === "documents" && parts[1]) {
         const document = await getDocument(env.DB, parts[1], userId);

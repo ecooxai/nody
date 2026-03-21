@@ -1,8 +1,9 @@
 export type ProviderName = "openai" | "gemini";
+export type AIMediaKind = "image" | "audio" | "video";
 
 export type DocumentAsset = {
   id: string;
-  kind: "image" | "audio" | "video";
+  kind: AIMediaKind;
   url: string;
   mimeType: string;
   fileName: string;
@@ -12,7 +13,7 @@ export type DocumentAsset = {
 export type FolderAsset = {
   id: string;
   folderId: string | null;
-  kind: "image" | "audio" | "video";
+  kind: AIMediaKind;
   url: string;
   mimeType: string;
   fileName: string;
@@ -62,11 +63,39 @@ export type SyncResult = {
   message?: string;
 };
 
+export type PromptTemplate = {
+  id: string;
+  name: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+  builtin?: boolean;
+};
+
+export type AIRequestAttachment = {
+  id: string;
+  kind: AIMediaKind;
+  fileName: string;
+  mimeType: string;
+  source: "upload" | "folder";
+  dataBase64?: string;
+  assetUrl?: string;
+};
+
+export type AIMessageAttachment = Pick<AIRequestAttachment, "id" | "kind" | "fileName" | "mimeType"> & {
+  url?: string;
+};
+
+export type AIMessagePrompt = Pick<PromptTemplate, "id" | "name" | "content">;
+
 export type AIMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+  substitutions?: TextSubstitution[];
+  attachments?: AIMessageAttachment[];
+  prompts?: AIMessagePrompt[];
 };
 
 export type TextSubstitution = {
@@ -80,6 +109,7 @@ export type AIRequest = {
   title: string;
   bodyHtml: string;
   selection?: string;
+  attachments?: AIRequestAttachment[];
 };
 
 export type AIResponse = {

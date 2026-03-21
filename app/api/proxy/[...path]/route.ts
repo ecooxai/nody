@@ -1,5 +1,7 @@
 import { auth } from "@clerk/nextjs/server";
 
+import { clerkServerConfigured, localModeUserId } from "@/lib/auth/config";
+
 const methods = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 
 function corsHeaders() {
@@ -8,6 +10,26 @@ function corsHeaders() {
     "access-control-allow-methods": methods.join(", "),
     "access-control-allow-headers": "*",
   };
+}
+
+function sanitizeProxyResponseHeaders(response: Response) {
+  const headers = new Headers(response.headers);
+
+  // `fetch()` transparently decodes gzip/br content but may leave the original
+  // transport headers behind. Forwarding those stale headers causes the browser
+  // to attempt a second decode and fail.
+  headers.delete("content-encoding");
+  headers.delete("content-length");
+  headers.delete("transfer-encoding");
+  headers.delete("connection");
+  headers.delete("keep-alive");
+  headers.delete("proxy-authenticate");
+  headers.delete("proxy-authorization");
+  headers.delete("te");
+  headers.delete("trailer");
+  headers.delete("upgrade");
+
+  return headers;
 }
 
 async function forward(request: Request, params: { path: string[] }) {
@@ -24,8 +46,12 @@ async function forward(request: Request, params: { path: string[] }) {
 
   let userId: string | null = null;
   if (!isMediaRequest) {
-    const result = await auth();
-    userId = result.userId ?? null;
+    if (clerkServerConfigured) {
+      const result = await auth();
+      userId = result.userId ?? null;
+    } else {
+      userId = localModeUserId;
+    }
     if (!userId) {
       return Response.json({ error: "Unauthorized" }, { status: 401 });
     }
@@ -78,16 +104,16 @@ async function forward(request: Request, params: { path: string[] }) {
     );
   }
 
-  const buffer = await response.arrayBuffer();
-  const headers = new Headers({
-    "content-type": response.headers.get("content-type") ?? "application/json",
-  });
+  const headers = sanitizeProxyResponseHeaders(response);
+  if (!headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
   if (params.path[0] === "media") {
     for (const [key, value] of Object.entries(corsHeaders())) {
       headers.set(key, value);
     }
   }
-  return new Response(buffer, {
+  return new Response(response.body, {
     status: response.status,
     headers,
   });

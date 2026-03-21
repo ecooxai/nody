@@ -3,7 +3,7 @@ import { ClerkProvider } from "@clerk/nextjs";
 
 import { AppShell } from "@/components/layout/app-shell";
 import { ErrorToastProvider } from "@/components/notifications/error-toast";
-import { clerkConfigured } from "@/lib/auth/config";
+import { clerkServerConfigured } from "@/lib/auth/config";
 
 import "./globals.css";
 
@@ -24,6 +24,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   );
 
   return (
-    clerkConfigured ? <ClerkProvider>{content}</ClerkProvider> : content
+    clerkServerConfigured ? <ClerkProvider>{content}</ClerkProvider> : content
   );
 }

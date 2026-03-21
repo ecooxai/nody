@@ -6,7 +6,7 @@ RUN_WORKER=1
 WORKER_MODE="auto"
 WORKER_URL="http://127.0.0.1:8787/v1/health"
 WRANGLER_BIN="./node_modules/.bin/wrangler"
-WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
+export WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
 
 usage() {
   cat <<'EOF'
@@ -117,6 +117,20 @@ wait_for_worker() {
   return 1
 }
 
+prepare_standalone_assets() {
+  local standalone_dir=".next/standalone"
+
+  mkdir -p "${standalone_dir}/.next"
+
+  rm -rf "${standalone_dir}/.next/static"
+  cp -R .next/static "${standalone_dir}/.next/static"
+
+  if [[ -d public ]]; then
+    rm -rf "${standalone_dir}/public"
+    cp -R public "${standalone_dir}/public"
+  fi
+}
+
 if (( RUN_WORKER )); then
   if [[ ! -x "${WRANGLER_BIN}" ]]; then
     echo "Missing local Wrangler binary in ./node_modules/.bin. Run npm install first." >&2
@@ -130,4 +144,10 @@ if (( RUN_WORKER )); then
 fi
 
 ./node_modules/.bin/next build
+
+if [[ -f .next/standalone/server.js ]]; then
+  prepare_standalone_assets
+  exec node .next/standalone/server.js
+fi
+
 exec ./node_modules/.bin/next start

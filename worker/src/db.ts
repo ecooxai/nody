@@ -1,6 +1,18 @@
-import type { DocumentAsset, DocumentRecord, FolderAsset, FolderRecord, ProviderSettings, SyncResult } from "../../shared/types";
+import type {
+  DocumentAsset,
+  DocumentRecord,
+  FolderAsset,
+  FolderRecord,
+  PromptTemplate,
+  ProviderSettings,
+  SyncResult,
+} from "../../shared/types";
 
 type DB = D1Database;
+
+function isMissingTableError(error: unknown, tableName: string) {
+  return error instanceof Error && error.message.includes(`no such table: ${tableName}`);
+}
 
 function mapDocument(row: Record<string, unknown>, assets: DocumentAsset[]): DocumentRecord {
   return {
@@ -36,6 +48,16 @@ function mapFolderAsset(row: Record<string, unknown>): FolderAsset {
     fileName: String(row.file_name),
     sizeBytes: Number(row.size_bytes ?? 0),
     createdAt: String(row.created_at),
+  };
+}
+
+function mapPromptTemplate(row: Record<string, unknown>): PromptTemplate {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    content: String(row.content),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
   };
 }
 
@@ -213,4 +235,65 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
     .bind(userId, settings.provider, settings.apiUrl, settings.apiKey, settings.model, now)
     .run();
   return settings;
+}
+
+export async function listPromptTemplates(db: DB, userId: string) {
+  try {
+    const rows = await db
+      .prepare("SELECT * FROM prompt_templates WHERE user_id = ? ORDER BY updated_at DESC, name COLLATE NOCASE ASC")
+      .bind(userId)
+      .all<Record<string, unknown>>();
+    return (rows.results ?? []).map(mapPromptTemplate);
+  } catch (error) {
+    if (isMissingTableError(error, "prompt_templates")) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+export async function createPromptTemplate(db: DB, userId: string, payload: { name: string; content: string }) {
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  await db
+    .prepare("INSERT INTO prompt_templates (id, user_id, name, content, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(id, userId, payload.name, payload.content, now, now)
+    .run();
+  return {
+    id,
+    name: payload.name,
+    content: payload.content,
+    createdAt: now,
+    updatedAt: now,
+  } satisfies PromptTemplate;
+}
+
+export async function updatePromptTemplate(
+  db: DB,
+  userId: string,
+  promptId: string,
+  payload: { name: string; content: string },
+) {
+  const existing = await db
+    .prepare("SELECT created_at FROM prompt_templates WHERE id = ? AND user_id = ?")
+    .bind(promptId, userId)
+    .first<Record<string, unknown>>();
+
+  if (!existing) {
+    throw new Error("Prompt not found");
+  }
+
+  const now = new Date().toISOString();
+  await db
+    .prepare("UPDATE prompt_templates SET name = ?, content = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+    .bind(payload.name, payload.content, now, promptId, userId)
+    .run();
+
+  return {
+    id: promptId,
+    name: payload.name,
+    content: payload.content,
+    createdAt: String(existing.created_at),
+    updatedAt: now,
+  } satisfies PromptTemplate;
 }

@@ -1,12 +1,19 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
+import { NextResponse } from "next/server";
 
-const isProtectedRoute = createRouteMatcher(["/workspace(.*)", "/api/proxy(.*)"]);
+import { clerkServerConfigured } from "@/lib/auth/config";
 
-export default clerkMiddleware(async (auth, request) => {
-  if (isProtectedRoute(request)) {
-    await auth.protect();
-  }
-});
+const isProtectedRoute = createRouteMatcher(["/api/proxy(.*)"]);
+
+const middleware = clerkServerConfigured
+  ? clerkMiddleware(async (auth, request) => {
+      if (isProtectedRoute(request)) {
+        await auth.protect();
+      }
+    })
+  : (() => NextResponse.next());
+
+export default middleware;
 
 export const config = {
   matcher: ["/((?!_next|.*\\..*).*)", "/", "/(api|trpc)(.*)"],

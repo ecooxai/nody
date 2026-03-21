@@ -5,7 +5,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
-import { clerkConfigured } from "@/lib/auth/config";
+import { clerkClientConfigured } from "@/lib/auth/config";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
@@ -22,7 +22,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <Link className="hidden text-sm text-ink/70 sm:block" href="/workspace">
               Workspace
             </Link>
-            {clerkConfigured ? (
+            {clerkClientConfigured ? (
               <>
                 <SignedOut>
                   <SignInButton mode="modal">
@@ -34,7 +34,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
                 </SignedIn>
               </>
             ) : (
-              <div className="rounded-full bg-white px-3 py-2 text-xs text-ink/60">Set Clerk env keys to enable auth</div>
+              <div className="rounded-full bg-white px-3 py-2 text-xs text-ink/60">Local mode</div>
             )}
           </div>
         </header>
