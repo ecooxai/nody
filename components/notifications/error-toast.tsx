@@ -38,7 +38,7 @@ function Toast({ notice }: { notice: ErrorNotice }) {
       type="button"
     >
       <div className="font-semibold">{notice.code}</div>
-      <div className="text-white/80">{notice.message}</div>
+      <div className="max-h-[200px] overflow-y-auto whitespace-pre-wrap text-white/80">{notice.message}</div>
       <div className="mt-1 text-xs text-white/60">Tap to copy error details.</div>
     </button>
   );

@@ -143,6 +143,45 @@ function videoExtensionForMimeType(mimeType: string) {
   return "webm";
 }
 
+async function waitForPaintedVideoFrame(video: HTMLVideoElement) {
+  await waitForFrameTicks(2);
+
+  if ("requestVideoFrameCallback" in video) {
+    await new Promise<void>((resolve) => {
+      const nextVideo = video as HTMLVideoElement & {
+        requestVideoFrameCallback?: (callback: () => void) => number;
+      };
+      nextVideo.requestVideoFrameCallback?.(() => resolve());
+    });
+    return;
+  }
+
+  await waitForFrameTicks(2);
+}
+
+function waitForFrameTicks(count: number) {
+  return new Promise<void>((resolve) => {
+    const step = (remaining: number) => {
+      if (remaining <= 0) {
+        resolve();
+        return;
+      }
+      window.requestAnimationFrame(() => step(remaining - 1));
+    };
+
+    step(count);
+  });
+}
+
+function clampPanelHeight(height: number) {
+  if (typeof window === "undefined") {
+    return Math.min(Math.max(height, 320), 720);
+  }
+
+  const viewportLimitedMax = Math.max(window.innerHeight - 32, 320);
+  return Math.min(Math.max(height, 320), viewportLimitedMax);
+}
+
 export function AIChatPanel({
   messages,
   busy,
@@ -180,6 +219,9 @@ export function AIChatPanel({
   const [previewAttachment, setPreviewAttachment] = useState<PreviewAttachment | null>(null);
   const [previewPrompt, setPreviewPrompt] = useState<AIMessagePrompt | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [composerCondensed, setComposerCondensed] = useState(false);
+  const [cameraPreviewVisible, setCameraPreviewVisible] = useState(false);
+  const [panelHeight, setPanelHeight] = useState(460);
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [promptPickerOpen, setPromptPickerOpen] = useState(false);
   const [selectedPrompts, setSelectedPrompts] = useState<PromptTemplate[]>([]);
@@ -193,6 +235,9 @@ export function AIChatPanel({
   const [cameraPreparing, setCameraPreparing] = useState(false);
   const [cameraRecording, setCameraRecording] = useState(false);
   const attachmentsRef = useRef<LocalAttachment[]>([]);
+  const composerItemsRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const latestAssistantMessageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -204,9 +249,15 @@ export function AIChatPanel({
   const cameraChunksRef = useRef<Blob[]>([]);
   const cameraHoldActiveRef = useRef(false);
   const cameraLongPressTimerRef = useRef<number | null>(null);
+  const cameraLongPressTriggeredRef = useRef(false);
   const cameraCaptureHandledRef = useRef(false);
+  const pendingComposerScrollRef = useRef(false);
+  const resizePointerIdRef = useRef<number | null>(null);
+  const resizeStartYRef = useRef(0);
+  const resizeStartHeightRef = useRef(460);
   const supportsMedia = provider === "gemini";
   const availablePrompts = [...builtInPrompts, ...prompts];
+  const latestAssistantMessageId = [...messages].reverse().find((message) => message.role === "assistant")?.id ?? null;
 
   useEffect(() => {
     const trimmedSelection = selectedText?.trim();
@@ -217,6 +268,73 @@ export function AIChatPanel({
   useEffect(() => {
     attachmentsRef.current = attachments;
   }, [attachments]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handleWindowResize = () => {
+      setPanelHeight((current) => clampPanelHeight(current));
+    };
+
+    handleWindowResize();
+    window.addEventListener("resize", handleWindowResize);
+    return () => window.removeEventListener("resize", handleWindowResize);
+  }, []);
+
+  useEffect(() => {
+    if (!pendingComposerScrollRef.current) return;
+    const container = composerItemsRef.current;
+    if (!container) return;
+
+    pendingComposerScrollRef.current = false;
+    window.requestAnimationFrame(() => {
+      container.scrollTo({ left: container.scrollWidth, behavior: "smooth" });
+    });
+  }, [attachments.length, selectedPrompts.length]);
+
+  useEffect(() => {
+    const container = messagesContainerRef.current;
+    const latestAssistantMessage = latestAssistantMessageRef.current;
+    if (!container || !latestAssistantMessage) return;
+    if (messages[messages.length - 1]?.role !== "assistant") return;
+
+    if (!promptExpanded) {
+      setComposerCondensed(true);
+    }
+
+    container.scrollTo({
+      top: Math.max(latestAssistantMessage.offsetTop - container.offsetTop, 0),
+      behavior: "smooth",
+    });
+  }, [latestAssistantMessageId, messages]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const handlePointerMove = (event: PointerEvent) => {
+      if (resizePointerIdRef.current !== event.pointerId) return;
+      const deltaY = resizeStartYRef.current - event.clientY;
+      setPanelHeight(clampPanelHeight(resizeStartHeightRef.current + deltaY));
+    };
+
+    const stopResize = (pointerId?: number) => {
+      if (pointerId !== undefined && resizePointerIdRef.current !== pointerId) return;
+      resizePointerIdRef.current = null;
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      stopResize(event.pointerId);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+  }, []);
 
   useEffect(
     () => () => {
@@ -247,6 +365,7 @@ export function AIChatPanel({
   const stopCameraStream = () => {
     cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
     cameraStreamRef.current = null;
+    setCameraPreviewVisible(false);
     if (cameraVideoRef.current) {
       cameraVideoRef.current.pause();
       cameraVideoRef.current.srcObject = null;
@@ -352,6 +471,7 @@ export function AIChatPanel({
       return;
     }
 
+    pendingComposerScrollRef.current = true;
     setAttachments((current) => [...current, ...nextAttachments]);
   };
 
@@ -380,6 +500,7 @@ export function AIChatPanel({
       if (current.some((attachment) => attachment.source === "folder" && attachment.assetUrl === asset.url)) {
         return current;
       }
+      pendingComposerScrollRef.current = true;
       return [
         ...current,
         {
@@ -397,6 +518,7 @@ export function AIChatPanel({
   };
 
   const addPromptTemplate = (template: PromptTemplate) => {
+    pendingComposerScrollRef.current = true;
     setSelectedPrompts((current) => (current.some((item) => item.id === template.id) ? current : [...current, template]));
     setPromptPickerOpen(false);
   };
@@ -444,6 +566,7 @@ export function AIChatPanel({
         setSelectedPrompts((current) => current.map((item) => (item.id === updated.id ? updated : item)));
         setPreviewPrompt((current) => (current?.id === updated.id ? buildMessagePrompt(updated) : current));
       } else {
+        pendingComposerScrollRef.current = true;
         const created = await onCreatePrompt({ name, content });
         setSelectedPrompts((current) => [...current, created]);
       }
@@ -456,7 +579,13 @@ export function AIChatPanel({
     }
   };
 
-  const submitPrompt = async (items: LocalAttachment[], transientItems: LocalAttachment[] = []) => {
+  const submitPrompt = async (
+    items: LocalAttachment[],
+    transientItems: LocalAttachment[] = [],
+    options?: {
+      preserveComposer?: boolean;
+    },
+  ) => {
     try {
       const selectedMessagePrompts = selectedPrompts.map(buildMessagePrompt);
       const finalPrompt = composePrompt(prompt, selectedPrompts);
@@ -480,7 +609,9 @@ export function AIChatPanel({
       });
 
       if (sent) {
-        clearComposer();
+        if (!options?.preserveComposer) {
+          clearComposer();
+        }
         setFolderPickerOpen(false);
       }
     } catch (error) {
@@ -511,7 +642,7 @@ export function AIChatPanel({
             lastModified: Date.now(),
           });
           const recordedAttachment = createFileAttachment(file, "audio");
-          await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment]);
+          await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment], { preserveComposer: true });
           resolve();
         } catch (error) {
           reject(error);
@@ -598,37 +729,58 @@ export function AIChatPanel({
 
     try {
       await waitForCameraFrame(video);
-      const width = video.videoWidth || 1280;
-      const height = video.videoHeight || 720;
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-      if (!context) {
-        throw new Error("Camera capture is not supported in this browser.");
+      await waitForPaintedVideoFrame(video);
+
+      const videoTrack = cameraStreamRef.current.getVideoTracks()[0];
+      let blob: Blob | null = null;
+      const ImageCaptureCtor = (globalThis as { ImageCapture?: new (track: MediaStreamTrack) => { takePhoto: () => Promise<Blob> } })
+        .ImageCapture;
+
+      if (videoTrack && ImageCaptureCtor) {
+        try {
+          const capture = new ImageCaptureCtor(videoTrack);
+          blob = await capture.takePhoto();
+        } catch {
+          blob = null;
+        }
       }
-      context.drawImage(video, 0, 0, width, height);
-      const blob = await new Promise<Blob>((resolve, reject) => {
-        canvas.toBlob((nextBlob) => {
-          if (!nextBlob) {
-            reject(new Error("Failed to capture photo."));
-            return;
-          }
-          resolve(nextBlob);
-        }, "image/jpeg", 0.92);
-      });
+
+      if (!blob) {
+        const width = video.videoWidth || 1280;
+        const height = video.videoHeight || 720;
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Camera capture is not supported in this browser.");
+        }
+        context.drawImage(video, 0, 0, width, height);
+        blob = await new Promise<Blob>((resolve, reject) => {
+          canvas.toBlob((nextBlob) => {
+            if (!nextBlob) {
+              reject(new Error("Failed to capture photo."));
+              return;
+            }
+            resolve(nextBlob);
+          }, "image/jpeg", 0.92);
+        });
+      }
+
       const file = new File([blob], `photo-${Date.now()}.jpg`, {
         type: "image/jpeg",
         lastModified: Date.now(),
       });
       const photoAttachment = createFileAttachment(file, "image");
-      await submitPrompt([...attachmentsRef.current, photoAttachment], [photoAttachment]);
-    } catch (error) {
-      onError(error instanceof Error ? error.message : "Failed to capture photo.");
-    } finally {
       setCameraPreparing(false);
       setCameraRecording(false);
       stopCameraStream();
+      await submitPrompt([...attachmentsRef.current, photoAttachment], [photoAttachment], { preserveComposer: true });
+    } catch (error) {
+      setCameraPreparing(false);
+      setCameraRecording(false);
+      stopCameraStream();
+      onError(error instanceof Error ? error.message : "Failed to capture photo.");
     }
   };
 
@@ -649,34 +801,35 @@ export function AIChatPanel({
             lastModified: Date.now(),
           });
           const videoAttachment = createFileAttachment(file, "video");
-          await submitPrompt([...attachmentsRef.current, videoAttachment], [videoAttachment]);
+          await submitPrompt([...attachmentsRef.current, videoAttachment], [videoAttachment], { preserveComposer: true });
           resolve();
         } catch (error) {
           reject(error);
         } finally {
           cameraRecorderRef.current = null;
-          setCameraPreparing(false);
-          setCameraRecording(false);
-          stopCameraStream();
         }
       };
 
       recorder.onerror = () => {
         cameraRecorderRef.current = null;
         cameraChunksRef.current = [];
-        setCameraPreparing(false);
-        setCameraRecording(false);
-        stopCameraStream();
         reject(new Error("Video recording failed."));
       };
 
       recorder.stop();
+      setCameraPreparing(false);
+      setCameraRecording(false);
+      stopCameraStream();
     }).catch((error) => {
+      setCameraPreparing(false);
+      setCameraRecording(false);
+      stopCameraStream();
       onError(error instanceof Error ? error.message : "Video recording failed.");
     });
   };
 
   const startVideoRecording = () => {
+    if (cameraRecorderRef.current?.state === "recording") return;
     if (typeof MediaRecorder === "undefined") {
       onError("Video recording is not supported in this browser.");
       setCameraPreparing(false);
@@ -702,7 +855,9 @@ export function AIChatPanel({
       }
     };
     cameraRecorderRef.current = recorder;
+    setCameraPreviewVisible(true);
     recorder.start();
+    setCameraPreparing(false);
     setCameraRecording(true);
   };
 
@@ -719,6 +874,7 @@ export function AIChatPanel({
 
     setCameraPreparing(true);
     cameraCaptureHandledRef.current = false;
+    setCameraPreviewVisible(false);
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -735,14 +891,17 @@ export function AIChatPanel({
       video.playsInline = true;
       await video.play().catch(() => undefined);
       await waitForCameraFrame(video);
-      clearCameraLongPressTimer();
-      cameraLongPressTimerRef.current = window.setTimeout(() => {
-        cameraLongPressTimerRef.current = null;
-        if (!cameraHoldActiveRef.current) return;
+      if (cameraLongPressTriggeredRef.current && cameraHoldActiveRef.current) {
         startVideoRecording();
-      }, 2000);
+        return;
+      }
 
-      if (!cameraHoldActiveRef.current && !cameraRecording) {
+      if (!cameraHoldActiveRef.current) {
+        if (cameraLongPressTriggeredRef.current) {
+          setCameraPreparing(false);
+          stopCameraStream();
+          return;
+        }
         await capturePhotoAndSend();
       }
     } catch (error) {
@@ -757,6 +916,16 @@ export function AIChatPanel({
     cameraHoldActiveRef.current = false;
     clearCameraLongPressTimer();
     if (cameraPreparing && !cameraStreamRef.current) return;
+    if (cameraLongPressTriggeredRef.current) {
+      if (cameraRecorderRef.current?.state === "recording") {
+        await stopVideoRecordingAndSend();
+        return;
+      }
+      setCameraPreparing(false);
+      setCameraRecording(false);
+      stopCameraStream();
+      return;
+    }
     if (cameraRecording && cameraRecorderRef.current?.state === "recording") {
       await stopVideoRecordingAndSend();
       return;
@@ -767,7 +936,19 @@ export function AIChatPanel({
   };
 
   return (
-    <Panel className="relative z-0 flex h-[460px] w-full flex-col overflow-visible overscroll-contain border-0 p-0 shadow-none">
+    <Panel className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 p-0 shadow-none" style={{ height: panelHeight }}>
+      <div
+        className="flex cursor-ns-resize justify-center pb-1 pt-0 touch-none"
+        onPointerDown={(event) => {
+          resizePointerIdRef.current = event.pointerId;
+          resizeStartYRef.current = event.clientY;
+          resizeStartHeightRef.current = panelHeight;
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+      >
+        <div className="h-1.5 w-14 rounded-full bg-ink/15" />
+      </div>
+
       <input
         accept="image/*,audio/*,video/*"
         className="hidden"
@@ -783,7 +964,11 @@ export function AIChatPanel({
 
       <textarea
         className="w-full resize-none overflow-y-auto rounded-[10px] border border-pine/40 bg-[#fffdf8] px-4 py-3 text-sm leading-6 overscroll-contain transition-[height] duration-200 ease-out"
-        onChange={(event) => setPrompt(event.target.value)}
+        onChange={(event) => {
+          setComposerCondensed(false);
+          setPrompt(event.target.value);
+        }}
+        onFocus={() => setComposerCondensed(false)}
         onPaste={(event) => {
           const files = Array.from(event.clipboardData.items)
             .map((item) => item.getAsFile())
@@ -798,47 +983,46 @@ export function AIChatPanel({
             ? "Ask Gemini about this note and attach images, audio, or video."
             : "Send the whole document, ask questions, or switch to Gemini to attach media."
         }
-        style={{ height: promptExpanded ? 300 : 130 }}
+        style={{ height: promptExpanded ? 300 : composerCondensed ? 50 : 130 }}
         value={prompt}
       />
 
-      {selectedPrompts.length > 0 ? (
-        <div className="mt-3 max-h-[220px] overflow-y-auto overscroll-contain rounded-[12px] border border-ink/10 bg-[#fffdf8] p-2 touch-pan-y">
-          <div className="flex flex-wrap gap-2">
-            {selectedPrompts.map((selectedPrompt) => (
-              <div className="relative h-[30px] w-[80px] min-w-[80px]" key={selectedPrompt.id}>
-                <button
-                  className="group flex h-[30px] w-[80px] flex-col overflow-hidden rounded-[10px] border border-ink/10 bg-white px-1.5 py-1 text-left transition hover:border-ink/25 hover:bg-mist"
-                  onClick={() => setPreviewPrompt(buildMessagePrompt(selectedPrompt))}
-                  type="button"
-                >
-                  <div className="min-w-0 text-[9px] font-semibold leading-3 text-ink">{selectedPrompt.name}</div>
-                  <div className="min-h-0 text-[8px] leading-3 text-ink/55">
-                    <div className="max-h-8 overflow-hidden break-words">{selectedPrompt.content}</div>
-                  </div>
-                </button>
-                <button
-                  aria-label={`Remove ${selectedPrompt.name}`}
-                  className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
-                  onClick={() => removePromptTemplate(selectedPrompt.id)}
-                  type="button"
-                >
-                  <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
-                    <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+      {selectedPrompts.length > 0 || attachments.length > 0 ? (
+        <div className="mt-3 flex gap-2 overflow-x-auto overscroll-contain pb-1" ref={composerItemsRef}>
+          {selectedPrompts.map((selectedPrompt) => (
+            <div className="relative shrink-0" key={selectedPrompt.id}>
+              <button
+                className="group flex h-11 w-[172px] items-center gap-2 overflow-hidden rounded-[10px] border border-ink/10 bg-white px-2 py-2 text-left transition hover:border-ink/25 hover:bg-mist"
+                onClick={() => setPreviewPrompt(buildMessagePrompt(selectedPrompt))}
+                type="button"
+              >
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] bg-mist text-ink/70">
+                  <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                    <path d="M7 7.5h10M7 12h10M7 16.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
                   </svg>
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      ) : null}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Prompt</div>
+                  <div className="truncate text-xs font-medium text-ink">{selectedPrompt.name}</div>
+                </div>
+              </button>
+              <button
+                aria-label={`Remove ${selectedPrompt.name}`}
+                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
+                onClick={() => removePromptTemplate(selectedPrompt.id)}
+                type="button"
+              >
+                <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
+                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                </svg>
+              </button>
+            </div>
+          ))}
 
-      {attachments.length > 0 ? (
-        <div className="mt-3 flex gap-2 overflow-x-auto overscroll-contain pb-1">
           {attachments.map((attachment) => (
             <div className="relative shrink-0" key={attachment.id}>
               <button
-                className="group flex h-20 w-24 flex-col overflow-hidden rounded-[10px] border border-ink/10 bg-white text-left transition hover:border-ink/25 hover:bg-mist"
+                className="group flex h-11 w-[172px] items-center gap-2 overflow-hidden rounded-[10px] border border-ink/10 bg-white px-2 py-2 text-left transition hover:border-ink/25 hover:bg-mist"
                 onClick={() =>
                   setPreviewAttachment(
                     toPreviewAttachment({
@@ -852,30 +1036,30 @@ export function AIChatPanel({
                 type="button"
               >
                 {attachment.kind === "image" ? (
-                  <img alt={attachment.fileName} className="h-12 w-full object-cover" src={attachment.previewUrl} />
+                  <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[8px] object-cover" src={attachment.previewUrl} />
                 ) : attachment.kind === "video" ? (
-                  <video className="h-12 w-full object-cover" muted playsInline preload="metadata" src={attachment.previewUrl} />
+                  <video className="h-7 w-7 shrink-0 rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.previewUrl} />
                 ) : (
-                  <div className="flex h-12 w-full items-center justify-center bg-mist text-ink/70">
-                    <svg aria-hidden="true" className="h-5 w-5" fill="none" viewBox="0 0 24 24">
+                  <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] bg-mist text-ink/70">
+                    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
                       <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
                       <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
                       <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
                     </svg>
                   </div>
                 )}
-                <div className="flex min-h-0 flex-1 flex-col px-2 py-1">
-                  <span className="text-[9px] font-semibold uppercase tracking-[0.16em] text-ink/45">{attachmentBadge(attachment.kind)}</span>
-                  <span className="truncate text-xs font-medium text-ink">{attachment.fileName}</span>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">{attachmentBadge(attachment.kind)}</div>
+                  <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
                 </div>
               </button>
               <button
                 aria-label={`Remove ${attachment.fileName}`}
-                className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-white/90 text-ink shadow-sm transition hover:bg-white"
+                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
                 onClick={() => removeAttachment(attachment.id)}
                 type="button"
               >
-                <svg aria-hidden="true" className="h-3 w-3" fill="none" viewBox="0 0 24 24">
+                <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
                   <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
                 </svg>
               </button>
@@ -1031,6 +1215,15 @@ export function AIChatPanel({
             onPointerCancel={() => void releaseCameraCapture()}
             onPointerDown={(event) => {
               cameraHoldActiveRef.current = true;
+              cameraLongPressTriggeredRef.current = false;
+              clearCameraLongPressTimer();
+              cameraLongPressTimerRef.current = window.setTimeout(() => {
+                cameraLongPressTimerRef.current = null;
+                cameraLongPressTriggeredRef.current = true;
+                if (cameraHoldActiveRef.current && cameraStreamRef.current && cameraRecorderRef.current?.state !== "recording") {
+                  startVideoRecording();
+                }
+              }, 2000);
               event.currentTarget.setPointerCapture(event.pointerId);
               void startCameraCapture();
             }}
@@ -1243,13 +1436,15 @@ export function AIChatPanel({
         ) : null}
       </div>
 
-      <div className="mt-2 text-[11px] text-ink/45">
-        {supportsMedia
-          ? "Add prompts, paste or capture media, and Gemini will receive everything with your request."
-          : "Media attachments are enabled when Gemini is selected in Settings."}
-      </div>
-
-      <div className="mt-4 min-h-0 flex-1 overflow-auto overscroll-contain rounded-[4px] bg-mist/80 p-3">
+      <div
+        className="mt-4 min-h-0 flex-1 overflow-auto overscroll-contain rounded-[4px] bg-mist/80 p-3"
+        onClick={() => {
+          if (!promptExpanded) {
+            setComposerCondensed(true);
+          }
+        }}
+        ref={messagesContainerRef}
+      >
         <div className="flex flex-col gap-3">
           {messages.map((message) => {
             const edits = message.substitutions ?? [];
@@ -1257,13 +1452,13 @@ export function AIChatPanel({
               <div
                 className={`max-w-[92%] rounded-[4px] px-3 py-2 text-sm ${message.role === "assistant" ? "bg-white" : "self-end bg-ink text-white"}`}
                 key={message.id}
+                ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
               >
-                <div className="whitespace-pre-wrap break-words">{message.content}</div>
-                {message.prompts?.length ? (
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    {message.prompts.map((promptItem) => (
+                {message.prompts?.length || message.attachments?.length ? (
+                  <div className="flex gap-2 overflow-x-auto overscroll-contain pb-1">
+                    {message.prompts?.map((promptItem) => (
                       <button
-                        className={`rounded-[10px] border px-3 py-2 text-left text-xs transition ${
+                        className={`shrink-0 rounded-[10px] border px-3 py-2 text-left text-xs transition ${
                           message.role === "assistant"
                             ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
                             : "border-white/10 bg-white/10 text-white hover:bg-white/15"
@@ -1276,65 +1471,53 @@ export function AIChatPanel({
                         <div className="max-w-48 truncate font-medium">{promptItem.name}</div>
                       </button>
                     ))}
-                  </div>
-                ) : null}
-                {message.attachments?.length ? (
-                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                    {message.attachments.map((attachment) => {
+                    {message.attachments?.map((attachment) => {
                       const cardTone =
                         message.role === "assistant"
-                          ? "border-ink/10 bg-mist/70 text-ink"
-                          : "border-white/10 bg-white/10 text-white";
-                      const metaTone = message.role === "assistant" ? "text-ink/55" : "text-white/65";
+                          ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
+                          : "border-white/10 bg-white/10 text-white hover:bg-white/15";
+                      const labelTone = message.role === "assistant" ? "text-ink/45" : "text-white/65";
+                      const iconTone = message.role === "assistant" ? "bg-white text-ink/70" : "bg-white/10 text-white/80";
                       return (
-                        <div className={`rounded-[10px] border p-2 ${cardTone}`} key={attachment.id}>
-                          <button
-                            className="w-full text-left"
-                            disabled={!attachment.url}
-                            onClick={() => {
-                              const preview = toPreviewAttachment(attachment);
-                              if (preview) setPreviewAttachment(preview);
-                            }}
-                            type="button"
-                          >
-                            {attachment.kind === "image" && attachment.url ? (
-                              <img alt={attachment.fileName} className="mb-2 h-24 w-full rounded-[8px] object-cover" src={attachment.url} />
-                            ) : null}
-                            {attachment.kind === "video" && attachment.url ? (
-                              <video className="mb-2 h-24 w-full rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.url} />
-                            ) : null}
-                            {attachment.kind === "audio" ? (
-                              <div className="mb-2 flex h-24 items-center justify-center rounded-[8px] bg-black/5">
-                                <svg aria-hidden="true" className="h-7 w-7" fill="none" viewBox="0 0 24 24">
-                                  <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                                  <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                                  <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                                </svg>
-                              </div>
-                            ) : null}
-                            <div className="text-[10px] font-semibold uppercase tracking-[0.14em]">{attachmentBadge(attachment.kind)}</div>
-                            <div className="truncate text-sm font-medium">{attachment.fileName}</div>
-                          </button>
-                          <div className={`mt-2 flex items-center justify-between gap-2 text-xs ${metaTone}`}>
-                            <span>{attachment.mimeType || "file"}</span>
-                            {attachment.url ? (
-                              <a
-                                className="rounded-full border border-current/20 px-2 py-1 font-semibold uppercase tracking-[0.14em] hover:bg-black/5"
-                                download={attachment.fileName}
-                                href={attachment.url}
-                                onClick={(event) => event.stopPropagation()}
-                                rel="noreferrer"
-                                target="_blank"
-                              >
-                                Download
-                              </a>
-                            ) : null}
+                        <button
+                          className={`flex h-11 w-[172px] shrink-0 items-center gap-2 overflow-hidden rounded-[10px] border px-2 py-2 text-left transition ${cardTone}`}
+                          disabled={!attachment.url}
+                          key={attachment.id}
+                          onClick={() => {
+                            const preview = toPreviewAttachment(attachment);
+                            if (preview) setPreviewAttachment(preview);
+                          }}
+                          type="button"
+                        >
+                          {attachment.kind === "image" && attachment.url ? (
+                            <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[8px] object-cover" src={attachment.url} />
+                          ) : null}
+                          {attachment.kind === "video" && attachment.url ? (
+                            <video className="h-7 w-7 shrink-0 rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.url} />
+                          ) : null}
+                          {attachment.kind === "audio" ? (
+                            <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] ${iconTone}`}>
+                              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                                <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                                <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                                <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                              </svg>
+                            </div>
+                          ) : null}
+                          <div className="min-w-0 flex-1">
+                            <div className={`text-[9px] font-semibold uppercase tracking-[0.14em] ${labelTone}`}>
+                              {attachmentBadge(attachment.kind)}
+                            </div>
+                            <div className="truncate text-xs font-medium">{attachment.fileName}</div>
                           </div>
-                        </div>
+                        </button>
                       );
                     })}
                   </div>
                 ) : null}
+                <div className={`${message.prompts?.length || message.attachments?.length ? "mt-3" : ""} whitespace-pre-wrap break-words`}>
+                  {message.content}
+                </div>
                 {message.role === "assistant" && edits.length > 0 ? (
                   <div className="mt-3 flex justify-end">
                     <button
@@ -1359,6 +1542,7 @@ export function AIChatPanel({
               </div>
             );
           })}
+          <div aria-hidden="true" className="shrink-0" style={{ height: Math.max(panelHeight * 0.45, 120) }} />
         </div>
       </div>
 
@@ -1416,7 +1600,14 @@ export function AIChatPanel({
           </div>
         </div>
       ) : null}
-      <video className="hidden" muted playsInline ref={cameraVideoRef} />
+      <div
+        className={`pointer-events-none absolute left-3 top-3 z-20 overflow-hidden rounded-[12px] border border-white/20 bg-black shadow-[0_14px_32px_rgba(0,0,0,0.28)] transition-opacity ${
+          cameraPreviewVisible ? "opacity-100" : "opacity-0"
+        }`}
+        style={{ width: 200 }}
+      >
+        <video className="aspect-[4/3] w-full object-cover" muted playsInline ref={cameraVideoRef} />
+      </div>
     </Panel>
   );
 }
