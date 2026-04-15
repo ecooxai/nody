@@ -4,11 +4,20 @@ import type {
   FolderAsset,
   FolderRecord,
   PromptTemplate,
+  ProviderName,
   ProviderSettings,
   SyncResult,
 } from "../../shared/types";
+import { providerDefaults } from "../../lib/providers/defaults";
 
 type DB = D1Database;
+
+const defaultGeminiLiveModel = "gemini-3.1-flash-live-preview";
+const defaultGeminiImageModel = "gemini-2.5-flash-image";
+const deprecatedGeminiLiveModels = new Set([
+  "gemini-2.5-flash-native-audio-preview-12-2025",
+  "gemini-live-2.5-flash-preview",
+]);
 
 function isMissingTableError(error: unknown, tableName: string) {
   return error instanceof Error && error.message.includes(`no such table: ${tableName}`);
@@ -214,15 +223,29 @@ export async function syncDocument(
 
 export async function getSettings(db: DB, userId: string): Promise<ProviderSettings | null> {
   const row = await db
-    .prepare("SELECT provider, api_url, api_key, model FROM provider_settings WHERE user_id = ?")
+    .prepare(
+      "SELECT provider, api_url, api_key, model, COALESCE(live_model, '') AS live_model, COALESCE(image_model, '') AS image_model FROM provider_settings WHERE user_id = ?",
+    )
     .bind(userId)
     .first<Record<string, unknown>>();
   if (!row) return null;
+  const liveModel = String(row.live_model);
+  const imageModel = String(row.image_model);
+  const provider = row.provider as ProviderSettings["provider"];
+  const fallbackModel = providerDefaults[provider as ProviderName]?.model ?? "";
+  const normalizedLiveModel = liveModel.trim();
   return {
-    provider: row.provider as ProviderSettings["provider"],
+    provider,
     apiUrl: String(row.api_url),
     apiKey: String(row.api_key),
-    model: String(row.model),
+    model: String(row.model).trim() ? String(row.model) : fallbackModel,
+    liveModel:
+      provider === "gemini"
+        ? normalizedLiveModel && !deprecatedGeminiLiveModels.has(normalizedLiveModel)
+          ? normalizedLiveModel
+          : defaultGeminiLiveModel
+        : "",
+    imageModel: imageModel.trim() ? imageModel : provider === "gemini" ? defaultGeminiImageModel : "",
   };
 }
 
@@ -230,9 +253,18 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
   const now = new Date().toISOString();
   await db
     .prepare(
-      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, updated_at = excluded.updated_at",
+      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_model, image_model, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_model = excluded.live_model, image_model = excluded.image_model, updated_at = excluded.updated_at",
     )
-    .bind(userId, settings.provider, settings.apiUrl, settings.apiKey, settings.model, now)
+    .bind(
+      userId,
+      settings.provider,
+      settings.apiUrl,
+      settings.apiKey,
+      settings.model,
+      settings.liveModel ?? "",
+      settings.imageModel ?? "",
+      now,
+    )
     .run();
   return settings;
 }

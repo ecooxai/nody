@@ -27,6 +27,8 @@ export function ProviderSettingsForm({
       apiUrl: providerDefaults[provider].apiUrl,
       apiKey: value.apiKey,
       model: providerDefaults[provider].model,
+      liveModel: providerDefaults[provider].liveModel,
+      imageModel: providerDefaults[provider].imageModel,
     });
   };
 
@@ -76,9 +78,29 @@ export function ProviderSettingsForm({
             value={value.model}
           />
         </label>
+        {value.provider === "gemini" ? (
+          <>
+            <label className="grid gap-1 text-sm">
+              <span>Live model</span>
+              <input
+                className="rounded-2xl border border-ink/10 px-3 py-2"
+                onChange={(event) => setValue({ ...value, liveModel: event.target.value })}
+                value={value.liveModel}
+              />
+            </label>
+            <label className="grid gap-1 text-sm">
+              <span>Image model</span>
+              <input
+                className="rounded-2xl border border-ink/10 px-3 py-2"
+                onChange={(event) => setValue({ ...value, imageModel: event.target.value })}
+                value={value.imageModel}
+              />
+            </label>
+          </>
+        ) : null}
       </div>
       <Button
-        className="mt-4 bg-ink text-white hover:bg-ink/90"
+        className="mt-4 !bg-ink !text-white hover:!bg-ink/90"
         disabled={saving}
         onClick={async () => {
           setSaving(true);

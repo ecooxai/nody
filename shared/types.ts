@@ -46,6 +46,8 @@ export type ProviderSettings = {
   apiUrl: string;
   apiKey: string;
   model: string;
+  liveModel: string;
+  imageModel: string;
 };
 
 export type SyncPayload = {

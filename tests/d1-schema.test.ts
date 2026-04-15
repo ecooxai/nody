@@ -62,9 +62,12 @@ describe("D1 schema", () => {
   it("includes the columns the worker writes to", () => {
     const folderColumns = querySqlite(dbPath, "PRAGMA table_info(folders);").map((row) => String(row.name));
     const documentColumns = querySqlite(dbPath, "PRAGMA table_info(documents);").map((row) => String(row.name));
+    const providerColumns = querySqlite(dbPath, "PRAGMA table_info(provider_settings);").map((row) => String(row.name));
 
     expect(folderColumns).toContain("parent_folder_id");
     expect(documentColumns).toContain("folder_id");
+    expect(providerColumns).toContain("live_model");
+    expect(providerColumns).toContain("image_model");
   });
 
   it("records the repair migration", () => {

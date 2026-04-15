@@ -1,21 +1,30 @@
 import type { ProviderName, ProviderSettings } from "@/shared/types";
 
-export const providerDefaults: Record<ProviderName, { apiUrl: string; model: string }> = {
+export const providerDefaults: Record<
+  ProviderName,
+  { apiUrl: string; model: string; liveModel: string; imageModel: string }
+> = {
   openai: {
     apiUrl: "https://api.openai.com",
     model: "gpt-4.1-mini",
+    liveModel: "",
+    imageModel: "",
   },
   gemini: {
     apiUrl: "https://generativelanguage.googleapis.com",
-    model: "gemini-2.5-flash",
+    model: "gemini-flash-latest",
+    liveModel: "gemini-3.1-flash-live-preview",
+    imageModel: "gemini-2.5-flash-image",
   },
 };
 
 export function createDefaultSettings(): ProviderSettings {
   return {
-    provider: "openai",
-    apiUrl: providerDefaults.openai.apiUrl,
+    provider: "gemini",
+    apiUrl: providerDefaults.gemini.apiUrl,
     apiKey: "",
-    model: providerDefaults.openai.model,
+    model: providerDefaults.gemini.model,
+    liveModel: providerDefaults.gemini.liveModel,
+    imageModel: providerDefaults.gemini.imageModel,
   };
 }

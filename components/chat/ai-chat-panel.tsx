@@ -2,7 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { LiveTalkPanel } from "@/components/chat/live-talk-panel";
 import { Panel } from "@/components/ui/panel";
+import type { ProviderSettings } from "@/shared/types";
 import type {
   AIMessage,
   AIMessageAttachment,
@@ -31,6 +33,12 @@ type PreviewAttachment = {
   kind: AIMediaKind;
   mimeType: string;
   previewUrl: string;
+};
+
+type LiveSessionState = {
+  connecting: boolean;
+  ready: boolean;
+  status: string;
 };
 
 const builtInPrompts: PromptTemplate[] = [
@@ -194,6 +202,9 @@ export function AIChatPanel({
   onError,
   prompts,
   provider,
+  providerSettings,
+  currentNoteBodyHtml,
+  currentNoteTitle,
   selectedText,
 }: {
   messages: AIMessage[];
@@ -212,6 +223,9 @@ export function AIChatPanel({
   onError: (message: string) => void;
   prompts: PromptTemplate[];
   provider: ProviderName;
+  providerSettings: ProviderSettings;
+  currentNoteBodyHtml: string;
+  currentNoteTitle: string;
   selectedText?: string;
 }) {
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
@@ -220,8 +234,9 @@ export function AIChatPanel({
   const [previewPrompt, setPreviewPrompt] = useState<AIMessagePrompt | null>(null);
   const [prompt, setPrompt] = useState("");
   const [composerCondensed, setComposerCondensed] = useState(false);
+  const [composerFocused, setComposerFocused] = useState(false);
   const [cameraPreviewVisible, setCameraPreviewVisible] = useState(false);
-  const [panelHeight, setPanelHeight] = useState(460);
+  const [panelHeight, setPanelHeight] = useState(640);
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [promptPickerOpen, setPromptPickerOpen] = useState(false);
   const [selectedPrompts, setSelectedPrompts] = useState<PromptTemplate[]>([]);
@@ -234,6 +249,13 @@ export function AIChatPanel({
   const [preparingRecording, setPreparingRecording] = useState(false);
   const [cameraPreparing, setCameraPreparing] = useState(false);
   const [cameraRecording, setCameraRecording] = useState(false);
+  const [activeTab, setActiveTab] = useState<"chat" | "live">("chat");
+  const [liveSessionState, setLiveSessionState] = useState<LiveSessionState>({
+    connecting: false,
+    ready: false,
+    status: "Open the Live tab to start a session.",
+  });
+  const [liveSendText, setLiveSendText] = useState<((text: string) => boolean) | null>(null);
   const attachmentsRef = useRef<LocalAttachment[]>([]);
   const composerItemsRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -256,8 +278,15 @@ export function AIChatPanel({
   const resizeStartYRef = useRef(0);
   const resizeStartHeightRef = useRef(460);
   const supportsMedia = provider === "gemini";
+  const supportsLive = provider === "gemini" && Boolean(providerSettings.apiKey) && Boolean(providerSettings.liveModel || providerSettings.model);
   const availablePrompts = [...builtInPrompts, ...prompts];
   const latestAssistantMessageId = [...messages].reverse().find((message) => message.role === "assistant")?.id ?? null;
+
+  useEffect(() => {
+    if (provider !== "gemini" && activeTab === "live") {
+      setActiveTab("chat");
+    }
+  }, [activeTab, provider]);
 
   useEffect(() => {
     const trimmedSelection = selectedText?.trim();
@@ -279,6 +308,10 @@ export function AIChatPanel({
     handleWindowResize();
     window.addEventListener("resize", handleWindowResize);
     return () => window.removeEventListener("resize", handleWindowResize);
+  }, []);
+
+  useEffect(() => {
+    setPanelHeight(clampPanelHeight(window.innerHeight * 0.8));
   }, []);
 
   useEffect(() => {
@@ -626,6 +659,28 @@ export function AIChatPanel({
     await submitPrompt(attachments);
   };
 
+  const handleComposerSubmit = async () => {
+    if (activeTab === "live") {
+      const text = prompt.trim();
+      if (!text) return;
+      if (!liveSendText) {
+        onError(liveSessionState.ready ? "Live talk is not ready yet." : liveSessionState.status);
+        return;
+      }
+
+      const sent = liveSendText(text);
+      if (!sent) {
+        onError(liveSessionState.ready ? "Live talk is not ready yet." : liveSessionState.status);
+        return;
+      }
+
+      setPrompt("");
+      return;
+    }
+
+    await handleSend();
+  };
+
   const stopRecordingAndSend = async () => {
     const recorder = mediaRecorderRef.current;
     if (!recorder) return;
@@ -936,19 +991,54 @@ export function AIChatPanel({
   };
 
   return (
-    <Panel className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 p-0 shadow-none" style={{ height: panelHeight }}>
-      <div
-        className="flex cursor-ns-resize justify-center pb-1 pt-0 touch-none"
-        onPointerDown={(event) => {
-          resizePointerIdRef.current = event.pointerId;
-          resizeStartYRef.current = event.clientY;
-          resizeStartHeightRef.current = panelHeight;
-          event.currentTarget.setPointerCapture(event.pointerId);
-        }}
-      >
-        <div className="h-1.5 w-14 rounded-full bg-ink/15" />
+    <Panel className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-[5px] shadow-none" style={{ height: panelHeight }}>
+      <div className="flex items-center justify-between gap-3 border-b border-ink/10 px-3 py-1.5">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="inline-flex rounded-full border border-ink/10 bg-white p-1 text-sm">
+            <button
+              className={`rounded-full px-3 py-1.5 font-medium transition ${activeTab === "chat" ? "bg-ink text-white" : "text-ink/65 hover:bg-mist"}`}
+              onClick={() => setActiveTab("chat")}
+              type="button"
+            >
+              Chat
+            </button>
+            <button
+              className={`rounded-full px-3 py-1.5 font-medium transition ${
+                activeTab === "live"
+                  ? "bg-ink text-white"
+                  : supportsLive
+                    ? "text-ink/65 hover:bg-mist"
+                    : "cursor-not-allowed text-ink/35"
+              }`}
+              disabled={!supportsLive}
+              onClick={() => setActiveTab("live")}
+              title={supportsLive ? "Start live talk" : "Switch to Gemini and save a live model first"}
+              type="button"
+              >
+                Live
+              </button>
+            </div>
+          <button
+            className="ml-1 flex h-8 w-10 cursor-ns-resize touch-none items-center justify-center rounded-full border border-ink/10 bg-white text-ink/45 transition hover:border-ink/20 hover:bg-mist"
+            onPointerDown={(event) => {
+              resizePointerIdRef.current = event.pointerId;
+              resizeStartYRef.current = event.clientY;
+              resizeStartHeightRef.current = panelHeight;
+              event.currentTarget.setPointerCapture(event.pointerId);
+            }}
+            title="Resize panel"
+            type="button"
+          >
+            <div className="h-1.5 w-10 rounded-full bg-ink/15" />
+          </button>
+        </div>
+        <div className="rounded-full bg-black/[0.04] px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-ink/55">
+          {activeTab === "live" ? "Realtime" : "Composer"}
+        </div>
       </div>
 
+      {provider === "gemini" ? (
+        <>
       <input
         accept="image/*,audio/*,video/*"
         className="hidden"
@@ -968,8 +1058,19 @@ export function AIChatPanel({
           setComposerCondensed(false);
           setPrompt(event.target.value);
         }}
-        onFocus={() => setComposerCondensed(false)}
+        onFocus={() => {
+          setComposerFocused(true);
+          setComposerCondensed(false);
+        }}
+        onBlur={() => setComposerFocused(false)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            void handleComposerSubmit();
+          }
+        }}
         onPaste={(event) => {
+          if (activeTab !== "chat") return;
           const files = Array.from(event.clipboardData.items)
             .map((item) => item.getAsFile())
             .filter((file): file is File => Boolean(file))
@@ -979,15 +1080,19 @@ export function AIChatPanel({
           appendFiles(files);
         }}
         placeholder={
-          supportsMedia
-            ? "Ask Gemini about this note and attach images, audio, or video."
-            : "Send the whole document, ask questions, or switch to Gemini to attach media."
+          activeTab === "live"
+            ? liveSessionState.ready
+              ? "Type a follow-up and press Ctrl+Enter to send."
+              : liveSessionState.status
+            : supportsMedia
+              ? "Ask Gemini about this note and attach images, audio, or video."
+              : "Send the whole document, ask questions, or switch to Gemini to attach media."
         }
-        style={{ height: promptExpanded ? 300 : composerCondensed ? 50 : 130 }}
+        style={{ height: composerFocused ? (promptExpanded ? 300 : composerCondensed ? 50 : 130) : 44 }}
         value={prompt}
       />
 
-      {selectedPrompts.length > 0 || attachments.length > 0 ? (
+      {activeTab === "chat" && (selectedPrompts.length > 0 || attachments.length > 0) ? (
         <div className="mt-3 flex gap-2 overflow-x-auto overscroll-contain pb-1" ref={composerItemsRef}>
           {selectedPrompts.map((selectedPrompt) => (
             <div className="relative shrink-0" key={selectedPrompt.id}>
@@ -1158,109 +1263,119 @@ export function AIChatPanel({
           </button>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            aria-label={recording ? "Release to stop recording" : "Hold to record audio"}
-            className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
-              recording
-                ? "border-[#bb3e2d] bg-[#bb3e2d] text-white"
-                : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
-            }`}
-            disabled={!supportsMedia || busy || cameraPreparing || cameraRecording}
-            onPointerCancel={() => void releaseRecording()}
-            onPointerDown={(event) => {
-              recordHoldActiveRef.current = true;
-              event.currentTarget.setPointerCapture(event.pointerId);
-              void startRecording();
-            }}
-            onPointerUp={(event) => {
-              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                event.currentTarget.releasePointerCapture(event.pointerId);
-              }
-              void releaseRecording();
-            }}
-            title={
-              supportsMedia
-                ? recording
-                  ? "Release to stop and send audio"
-                  : "Hold to record and send audio"
-                : "Switch to Gemini to record audio"
-            }
-            type="button"
-          >
-            {preparingRecording ? (
-              <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
-            ) : (
-              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                <path
-                  d="M12 4.5a2.5 2.5 0 0 1 2.5 2.5v4.5a2.5 2.5 0 0 1-5 0V7a2.5 2.5 0 0 1 2.5-2.5Z"
-                  stroke="currentColor"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="1.8"
-                />
-                <path d="M7.5 11.5a4.5 4.5 0 0 0 9 0M12 16v3.5M9 19.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-              </svg>
-            )}
-          </button>
-          <button
-            aria-label={cameraRecording ? "Release to stop video recording" : "Click for photo, hold for video"}
-            className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
-              cameraRecording
-                ? "border-[#1f6f78] bg-[#1f6f78] text-white"
-                : cameraPreparing
-                  ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]"
-                  : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
-            }`}
-            disabled={!supportsMedia || busy || preparingRecording || recording}
-            onPointerCancel={() => void releaseCameraCapture()}
-            onPointerDown={(event) => {
-              cameraHoldActiveRef.current = true;
-              cameraLongPressTriggeredRef.current = false;
-              clearCameraLongPressTimer();
-              cameraLongPressTimerRef.current = window.setTimeout(() => {
-                cameraLongPressTimerRef.current = null;
-                cameraLongPressTriggeredRef.current = true;
-                if (cameraHoldActiveRef.current && cameraStreamRef.current && cameraRecorderRef.current?.state !== "recording") {
-                  startVideoRecording();
+          {activeTab === "chat" ? (
+            <>
+              <button
+                aria-label={recording ? "Release to stop recording" : "Hold to record audio"}
+                className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  recording
+                    ? "border-[#bb3e2d] bg-[#bb3e2d] text-white"
+                    : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
+                }`}
+                disabled={!supportsMedia || busy || cameraPreparing || cameraRecording}
+                onPointerCancel={() => void releaseRecording()}
+                onPointerDown={(event) => {
+                  recordHoldActiveRef.current = true;
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  void startRecording();
+                }}
+                onPointerUp={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    event.currentTarget.releasePointerCapture(event.pointerId);
+                  }
+                  void releaseRecording();
+                }}
+                title={
+                  supportsMedia
+                    ? recording
+                      ? "Release to stop and send audio"
+                      : "Hold to record and send audio"
+                    : "Switch to Gemini to record audio"
                 }
-              }, 2000);
-              event.currentTarget.setPointerCapture(event.pointerId);
-              void startCameraCapture();
-            }}
-            onPointerUp={(event) => {
-              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                event.currentTarget.releasePointerCapture(event.pointerId);
-              }
-              void releaseCameraCapture();
-            }}
-            title={
-              supportsMedia
-                ? cameraRecording
-                  ? "Release to stop and send video"
-                  : "Click for photo, hold 2 seconds for video"
-                : "Switch to Gemini to use camera capture"
-            }
-            type="button"
-          >
-            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-              <path
-                d="M5.5 8.5A1.5 1.5 0 0 1 7 7h2l1.2-1.5h3.6L15 7h2a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 17 18H7a1.5 1.5 0 0 1-1.5-1.5v-8Z"
-                stroke="currentColor"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="1.7"
-              />
-              <circle cx="12" cy="12.5" r="3" stroke="currentColor" strokeWidth="1.7" />
-            </svg>
-          </button>
+                type="button"
+              >
+                {preparingRecording ? (
+                  <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
+                ) : (
+                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                    <path
+                      d="M12 4.5a2.5 2.5 0 0 1 2.5 2.5v4.5a2.5 2.5 0 0 1-5 0V7a2.5 2.5 0 0 1 2.5-2.5Z"
+                      stroke="currentColor"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth="1.8"
+                    />
+                    <path d="M7.5 11.5a4.5 4.5 0 0 0 9 0M12 16v3.5M9 19.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                  </svg>
+                )}
+              </button>
+              <button
+                aria-label={cameraRecording ? "Release to stop video recording" : "Click for photo, hold for video"}
+                className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  cameraRecording
+                    ? "border-[#1f6f78] bg-[#1f6f78] text-white"
+                    : cameraPreparing
+                      ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]"
+                      : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
+                }`}
+                disabled={!supportsMedia || busy || preparingRecording || recording}
+                onPointerCancel={() => void releaseCameraCapture()}
+                onPointerDown={(event) => {
+                  cameraHoldActiveRef.current = true;
+                  cameraLongPressTriggeredRef.current = false;
+                  clearCameraLongPressTimer();
+                  cameraLongPressTimerRef.current = window.setTimeout(() => {
+                    cameraLongPressTimerRef.current = null;
+                    cameraLongPressTriggeredRef.current = true;
+                    if (cameraHoldActiveRef.current && cameraStreamRef.current && cameraRecorderRef.current?.state !== "recording") {
+                      startVideoRecording();
+                    }
+                  }, 2000);
+                  event.currentTarget.setPointerCapture(event.pointerId);
+                  void startCameraCapture();
+                }}
+                onPointerUp={(event) => {
+                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    event.currentTarget.releasePointerCapture(event.pointerId);
+                  }
+                  void releaseCameraCapture();
+                }}
+                title={
+                  supportsMedia
+                    ? cameraRecording
+                      ? "Release to stop and send video"
+                      : "Click for photo, hold 2 seconds for video"
+                    : "Switch to Gemini to use camera capture"
+                }
+                type="button"
+              >
+                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <path
+                    d="M5.5 8.5A1.5 1.5 0 0 1 7 7h2l1.2-1.5h3.6L15 7h2a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 17 18H7a1.5 1.5 0 0 1-1.5-1.5v-8Z"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.7"
+                  />
+                  <circle cx="12" cy="12.5" r="3" stroke="currentColor" strokeWidth="1.7" />
+                </svg>
+              </button>
+            </>
+          ) : null}
           <button
-            aria-label="Ask"
+            aria-label={activeTab === "live" ? "Send to live" : "Ask"}
             className="flex h-10 w-10 items-center justify-center rounded-[4px] bg-ember text-ink transition hover:bg-ember/90 disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={busy || preparingRecording || recording || cameraPreparing || cameraRecording || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)}
-            onClick={() => void handleSend()}
+            disabled={
+              activeTab === "live"
+                ? !liveSessionState.ready || !prompt.trim()
+                : busy || preparingRecording || recording || cameraPreparing || cameraRecording || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)
+            }
+            onClick={() => void handleComposerSubmit()}
             type="button"
           >
-            {busy ? (
+            {activeTab === "live" && liveSessionState.connecting ? (
+              <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
+            ) : busy ? (
               <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
             ) : (
               <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -1276,7 +1391,7 @@ export function AIChatPanel({
           </button>
         </div>
 
-        {promptPickerOpen ? (
+      {activeTab === "chat" && promptPickerOpen ? (
           <div className="absolute bottom-[calc(100%+8px)] left-0 z-[80] flex h-[360px] w-full flex-col overflow-hidden rounded-[12px] border border-ink/10 bg-white p-2 shadow-[0_18px_32px_rgba(15,23,42,0.12)]">
             <div className="mb-2 shrink-0 flex items-center justify-between gap-2 px-1">
               <div>
@@ -1394,7 +1509,7 @@ export function AIChatPanel({
           </div>
         ) : null}
 
-        {folderPickerOpen ? (
+        {activeTab === "chat" && folderPickerOpen ? (
           <div className="absolute bottom-[calc(100%+8px)] left-0 z-[80] w-full rounded-[12px] border border-ink/10 bg-white p-2 shadow-[0_18px_32px_rgba(15,23,42,0.12)]">
             <div className="mb-2 flex items-center justify-between gap-2 px-1">
               <div>
@@ -1436,113 +1551,128 @@ export function AIChatPanel({
         ) : null}
       </div>
 
-      <div
-        className="mt-4 min-h-0 flex-1 overflow-auto overscroll-contain rounded-[4px] bg-mist/80 p-3"
-        onClick={() => {
-          if (!promptExpanded) {
-            setComposerCondensed(true);
-          }
-        }}
-        ref={messagesContainerRef}
-      >
-        <div className="flex flex-col gap-3">
-          {messages.map((message) => {
-            const edits = message.substitutions ?? [];
-            return (
-              <div
-                className={`max-w-[92%] rounded-[4px] px-3 py-2 text-sm ${message.role === "assistant" ? "bg-white" : "self-end bg-ink text-white"}`}
-                key={message.id}
-                ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
-              >
-                {message.prompts?.length || message.attachments?.length ? (
-                  <div className="flex gap-2 overflow-x-auto overscroll-contain pb-1">
-                    {message.prompts?.map((promptItem) => (
-                      <button
-                        className={`shrink-0 rounded-[10px] border px-3 py-2 text-left text-xs transition ${
-                          message.role === "assistant"
-                            ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
-                            : "border-white/10 bg-white/10 text-white hover:bg-white/15"
-                        }`}
-                        key={promptItem.id}
-                        onClick={() => setPreviewPrompt(promptItem)}
-                        type="button"
-                      >
-                        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] opacity-70">Prompt</div>
-                        <div className="max-w-48 truncate font-medium">{promptItem.name}</div>
-                      </button>
-                    ))}
-                    {message.attachments?.map((attachment) => {
-                      const cardTone =
-                        message.role === "assistant"
-                          ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
-                          : "border-white/10 bg-white/10 text-white hover:bg-white/15";
-                      const labelTone = message.role === "assistant" ? "text-ink/45" : "text-white/65";
-                      const iconTone = message.role === "assistant" ? "bg-white text-ink/70" : "bg-white/10 text-white/80";
-                      return (
+      <div className="mt-4 min-h-0 flex-1">
+        <div
+          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 p-3"
+          hidden={activeTab !== "chat"}
+          onClick={() => {
+            if (!promptExpanded) {
+              setComposerCondensed(true);
+            }
+          }}
+          ref={messagesContainerRef}
+        >
+          <div className="flex flex-col gap-3">
+            {messages.map((message) => {
+              const edits = message.substitutions ?? [];
+              return (
+                <div
+                  className={`max-w-[92%] rounded-[4px] px-3 py-2 text-sm ${message.role === "assistant" ? "bg-white" : "self-end bg-ink text-white"}`}
+                  key={message.id}
+                  ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
+                >
+                  {message.prompts?.length || message.attachments?.length ? (
+                    <div className="flex gap-2 overflow-x-auto overscroll-contain pb-1">
+                      {message.prompts?.map((promptItem) => (
                         <button
-                          className={`flex h-11 w-[172px] shrink-0 items-center gap-2 overflow-hidden rounded-[10px] border px-2 py-2 text-left transition ${cardTone}`}
-                          disabled={!attachment.url}
-                          key={attachment.id}
-                          onClick={() => {
-                            const preview = toPreviewAttachment(attachment);
-                            if (preview) setPreviewAttachment(preview);
-                          }}
+                          className={`shrink-0 rounded-[10px] border px-3 py-2 text-left text-xs transition ${
+                            message.role === "assistant"
+                              ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
+                              : "border-white/10 bg-white/10 text-white hover:bg-white/15"
+                          }`}
+                          key={promptItem.id}
+                          onClick={() => setPreviewPrompt(promptItem)}
                           type="button"
                         >
-                          {attachment.kind === "image" && attachment.url ? (
-                            <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[8px] object-cover" src={attachment.url} />
-                          ) : null}
-                          {attachment.kind === "video" && attachment.url ? (
-                            <video className="h-7 w-7 shrink-0 rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.url} />
-                          ) : null}
-                          {attachment.kind === "audio" ? (
-                            <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] ${iconTone}`}>
-                              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
-                                <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                                <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                                <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                              </svg>
-                            </div>
-                          ) : null}
-                          <div className="min-w-0 flex-1">
-                            <div className={`text-[9px] font-semibold uppercase tracking-[0.14em] ${labelTone}`}>
-                              {attachmentBadge(attachment.kind)}
-                            </div>
-                            <div className="truncate text-xs font-medium">{attachment.fileName}</div>
-                          </div>
+                          <div className="text-[10px] font-semibold uppercase tracking-[0.14em] opacity-70">Prompt</div>
+                          <div className="max-w-48 truncate font-medium">{promptItem.name}</div>
                         </button>
-                      );
-                    })}
+                      ))}
+                      {message.attachments?.map((attachment) => {
+                        const cardTone =
+                          message.role === "assistant"
+                            ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
+                            : "border-white/10 bg-white/10 text-white hover:bg-white/15";
+                        const labelTone = message.role === "assistant" ? "text-ink/45" : "text-white/65";
+                        const iconTone = message.role === "assistant" ? "bg-white text-ink/70" : "bg-white/10 text-white/80";
+                        return (
+                          <button
+                            className={`flex h-11 w-[172px] shrink-0 items-center gap-2 overflow-hidden rounded-[10px] border px-2 py-2 text-left transition ${cardTone}`}
+                            disabled={!attachment.url}
+                            key={attachment.id}
+                            onClick={() => {
+                              const preview = toPreviewAttachment(attachment);
+                              if (preview) setPreviewAttachment(preview);
+                            }}
+                            type="button"
+                          >
+                            {attachment.kind === "image" && attachment.url ? (
+                              <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[8px] object-cover" src={attachment.url} />
+                            ) : null}
+                            {attachment.kind === "video" && attachment.url ? (
+                              <video className="h-7 w-7 shrink-0 rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.url} />
+                            ) : null}
+                            {attachment.kind === "audio" ? (
+                              <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] ${iconTone}`}>
+                                <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                                  <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                                  <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                                  <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                                </svg>
+                              </div>
+                            ) : null}
+                            <div className="min-w-0 flex-1">
+                              <div className={`text-[9px] font-semibold uppercase tracking-[0.14em] ${labelTone}`}>
+                                {attachmentBadge(attachment.kind)}
+                              </div>
+                              <div className="truncate text-xs font-medium">{attachment.fileName}</div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+                  <div className={`${message.prompts?.length || message.attachments?.length ? "mt-3" : ""} whitespace-pre-wrap break-words`}>
+                    {message.content}
                   </div>
-                ) : null}
-                <div className={`${message.prompts?.length || message.attachments?.length ? "mt-3" : ""} whitespace-pre-wrap break-words`}>
-                  {message.content}
+                  {message.role === "assistant" && edits.length > 0 ? (
+                    <div className="mt-3 flex justify-end">
+                      <button
+                        aria-label="Apply AI edits"
+                        className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-mist text-ink transition hover:border-ink/25 hover:bg-[#efe5d3]"
+                        onClick={() => onApply(edits)}
+                        title="Apply AI edits"
+                        type="button"
+                      >
+                        <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                          <path
+                            d="M7 12.5l3.2 3.2L17 9"
+                            stroke="currentColor"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth="1.8"
+                          />
+                        </svg>
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
-                {message.role === "assistant" && edits.length > 0 ? (
-                  <div className="mt-3 flex justify-end">
-                    <button
-                      aria-label="Apply AI edits"
-                      className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-mist text-ink transition hover:border-ink/25 hover:bg-[#efe5d3]"
-                      onClick={() => onApply(edits)}
-                      title="Apply AI edits"
-                      type="button"
-                    >
-                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                        <path
-                          d="M7 12.5l3.2 3.2L17 9"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="1.8"
-                        />
-                      </svg>
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            );
-          })}
-          <div aria-hidden="true" className="shrink-0" style={{ height: Math.max(panelHeight * 0.45, 120) }} />
+              );
+            })}
+            <div aria-hidden="true" className="shrink-0" style={{ height: Math.max(panelHeight * 0.45, 120) }} />
+          </div>
+        </div>
+
+        <div className="h-full p-3" hidden={activeTab !== "live"}>
+          <LiveTalkPanel
+            active={activeTab === "live"}
+            currentNoteBodyHtml={currentNoteBodyHtml}
+            currentNoteTitle={currentNoteTitle}
+            onError={onError}
+            onRegisterSend={setLiveSendText}
+            onSessionStateChange={setLiveSessionState}
+            providerSettings={providerSettings}
+          />
         </div>
       </div>
 
@@ -1608,6 +1738,14 @@ export function AIChatPanel({
       >
         <video className="aspect-[4/3] w-full object-cover" muted playsInline ref={cameraVideoRef} />
       </div>
+      </>
+      ) : (
+        <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-center">
+          <div className="max-w-md rounded-[4px] border border-ink/10 bg-mist/40 px-4 py-6 text-sm text-ink/65">
+            Live talk is only available with the Gemini provider.
+          </div>
+        </div>
+      )}
     </Panel>
   );
 }

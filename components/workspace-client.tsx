@@ -1613,38 +1613,43 @@ function WorkspaceClientContent() {
             editable={isEditing}
             onSelectionChange={setSelectedText}
             onRequestEdit={enterEditMode}
-            overlay={activeWindow === "ai" ? (
-              <div className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-50 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-center sm:p-4">
-                <div className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[500px] sm:rounded-[4px]">
-                  <AIChatPanel
-                    busy={thinking}
-                    currentFolderFiles={aiCurrentFolderFiles}
-                    currentFolderName={selectedFolderName}
-                    messages={messages}
-                    onApply={applyAiEdits}
-                    onAsk={askAi}
-                    onCreatePrompt={async (value) => {
-                      const created = await apiClient.createPrompt(value);
-                      setPromptTemplates((current) => [created, ...current.filter((item) => item.id !== created.id)]);
-                      return created;
-                    }}
-                    onUpdatePrompt={async (id, value) => {
-                      const updated = await apiClient.updatePrompt(id, value);
-                      setPromptTemplates((current) =>
-                        current.map((item) => (item.id === updated.id ? updated : item)).sort((left, right) =>
-                          new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
-                        ),
-                      );
-                      return updated;
-                    }}
-                    onError={pushError}
-                    prompts={promptTemplates}
-                    provider={settings.provider}
-                    selectedText={selectedText}
-                  />
+            overlay={
+              activeWindow === "ai" ? (
+                <div className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-center sm:p-4">
+                  <div className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[500px] sm:rounded-[4px]">
+                    <AIChatPanel
+                      busy={thinking}
+                      currentFolderFiles={aiCurrentFolderFiles}
+                      currentFolderName={selectedFolderName}
+                      currentNoteBodyHtml={document.bodyHtml}
+                      currentNoteTitle={document.title}
+                      messages={messages}
+                      onApply={applyAiEdits}
+                      onAsk={askAi}
+                      onCreatePrompt={async (value) => {
+                        const created = await apiClient.createPrompt(value);
+                        setPromptTemplates((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+                        return created;
+                      }}
+                      onUpdatePrompt={async (id, value) => {
+                        const updated = await apiClient.updatePrompt(id, value);
+                        setPromptTemplates((current) =>
+                          current.map((item) => (item.id === updated.id ? updated : item)).sort((left, right) =>
+                            new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+                          ),
+                        );
+                        return updated;
+                      }}
+                      onError={pushError}
+                      prompts={promptTemplates}
+                      provider={settings.provider}
+                      providerSettings={settings}
+                      selectedText={selectedText}
+                    />
+                  </div>
                 </div>
-              </div>
-            ) : null}
+              ) : null
+            }
             onBodyChange={(bodyHtml) => updateDocument({ bodyHtml })}
             onTitleChange={(title) => updateDocument({ title })}
             title={document.title}
