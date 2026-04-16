@@ -24,7 +24,7 @@ export type FolderAsset = {
 export type DocumentRecord = {
   id: string;
   title: string;
-  bodyHtml: string;
+  bodyMarkdown: string;
   folderId: string | null;
   revision: number;
   deviceId: string;
@@ -52,7 +52,7 @@ export type ProviderSettings = {
 
 export type SyncPayload = {
   title: string;
-  bodyHtml: string;
+  bodyMarkdown: string;
   baseRevision: number;
   deviceId: string;
 };
@@ -84,8 +84,11 @@ export type AIRequestAttachment = {
   assetUrl?: string;
 };
 
+export type AIRequestMode = "chat" | "image";
+
 export type AIMessageAttachment = Pick<AIRequestAttachment, "id" | "kind" | "fileName" | "mimeType"> & {
   url?: string;
+  origin?: "uploaded" | "generated";
 };
 
 export type AIMessagePrompt = Pick<PromptTemplate, "id" | "name" | "content">;
@@ -109,12 +112,21 @@ export type TextSubstitution = {
 export type AIRequest = {
   prompt: string;
   title: string;
-  bodyHtml: string;
+  bodyMarkdown: string;
   selection?: string;
   attachments?: AIRequestAttachment[];
+  mode?: AIRequestMode;
+};
+
+export type AIResponseAttachment = {
+  kind: AIMediaKind;
+  fileName: string;
+  mimeType: string;
+  dataBase64: string;
 };
 
 export type AIResponse = {
   answer: string;
   substitutions: TextSubstitution[];
+  attachments?: AIResponseAttachment[];
 };

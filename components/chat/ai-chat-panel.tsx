@@ -1,14 +1,22 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-import { LiveTalkPanel } from "@/components/chat/live-talk-panel";
+import {
+  LiveTalkPanel,
+  type LiveSendAttachment,
+  type LiveSendHandle,
+  type LiveVideoControls,
+  type LiveVideoShareState,
+  type LiveVideoSource,
+} from "@/components/chat/live-talk-panel";
 import { Panel } from "@/components/ui/panel";
 import type { ProviderSettings } from "@/shared/types";
 import type {
   AIMessage,
   AIMessageAttachment,
   AIMessagePrompt,
+  AIRequestMode,
   AIRequestAttachment,
   AIMediaKind,
   FolderAsset,
@@ -35,10 +43,24 @@ type PreviewAttachment = {
   previewUrl: string;
 };
 
+type ExternalAttachmentSeed = {
+  id: string;
+  kind: AIMediaKind;
+  fileName: string;
+  mimeType: string;
+  assetUrl: string;
+  previewUrl: string;
+};
+
 type LiveSessionState = {
   connecting: boolean;
   ready: boolean;
   status: string;
+};
+
+type MicrophoneSource = {
+  deviceId: string;
+  label: string;
 };
 
 const builtInPrompts: PromptTemplate[] = [
@@ -100,6 +122,31 @@ function revokeAttachmentPreview(attachment: LocalAttachment) {
 
 function attachmentBadge(kind: AIMediaKind) {
   return kind.charAt(0).toUpperCase() + kind.slice(1);
+}
+
+function describeLiveAttachment(attachment: LocalAttachment) {
+  return `${attachment.fileName} (${attachment.kind})`;
+}
+
+function shouldUseImageGeneration(prompt: string, templates: PromptTemplate[], attachments: LocalAttachment[]) {
+  const combined = composePromptTextForModeDetection(prompt, templates).toLowerCase();
+  if (!combined.trim()) return false;
+
+  const imageIntentPattern =
+    /\b(generate|create|make|draw|design|illustrate|render|paint|mock up|concept art|poster|logo|wallpaper|cover art|thumbnail)\b/;
+  const imageEditPattern =
+    /\b(edit|restyle|transform|change|replace|remove|add|extend|recolor|retouch|cleanup)\b/;
+  const hasImageAttachment = attachments.some((attachment) => attachment.kind === "image");
+
+  if (hasImageAttachment && imageEditPattern.test(combined)) {
+    return true;
+  }
+
+  return imageIntentPattern.test(combined) && /\b(image|picture|photo|illustration|art|icon|logo|poster|wallpaper|scene|portrait|background)\b/.test(combined);
+}
+
+function composePromptTextForModeDetection(messagePrompt: string, templates: PromptTemplate[]) {
+  return [messagePrompt.trim(), ...templates.map((template) => template.content.trim())].filter(Boolean).join("\n");
 }
 
 function getPreferredRecordingMimeType() {
@@ -190,6 +237,43 @@ function clampPanelHeight(height: number) {
   return Math.min(Math.max(height, 320), viewportLimitedMax);
 }
 
+async function listMicrophoneSources() {
+  if (typeof navigator === "undefined" || !navigator.mediaDevices?.enumerateDevices) {
+    return [] as MicrophoneSource[];
+  }
+
+  let devices = await navigator.mediaDevices.enumerateDevices();
+  const microphones = devices.filter((device) => device.kind === "audioinput");
+  if (microphones.some((device) => device.label)) {
+    return microphones.map((device, index) => ({
+      deviceId: device.deviceId,
+      label: device.label || `Microphone ${index + 1}`,
+    }));
+  }
+
+  let probeStream: MediaStream | null = null;
+  try {
+    if (navigator.mediaDevices.getUserMedia) {
+      probeStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      devices = await navigator.mediaDevices.enumerateDevices();
+    }
+  } catch {
+    return microphones.map((device, index) => ({
+      deviceId: device.deviceId,
+      label: device.label || `Microphone ${index + 1}`,
+    }));
+  } finally {
+    probeStream?.getTracks().forEach((track) => track.stop());
+  }
+
+  return devices
+    .filter((device) => device.kind === "audioinput")
+    .map((device, index) => ({
+      deviceId: device.deviceId,
+      label: device.label || `Microphone ${index + 1}`,
+    }));
+}
+
 export function AIChatPanel({
   messages,
   busy,
@@ -197,15 +281,20 @@ export function AIChatPanel({
   currentFolderName,
   onAsk,
   onApply,
+  onAddAttachmentToNote,
   onCreatePrompt,
   onUpdatePrompt,
   onError,
+  pendingExternalAttachment,
+  onPendingExternalAttachmentHandled,
   prompts,
   provider,
   providerSettings,
-  currentNoteBodyHtml,
+  currentNoteBodyMarkdown,
   currentNoteTitle,
   selectedText,
+  storedPanelHeight,
+  onPanelHeightChange,
 }: {
   messages: AIMessage[];
   busy: boolean;
@@ -216,17 +305,23 @@ export function AIChatPanel({
     attachments: AIRequestAttachment[];
     messageAttachments: AIMessageAttachment[];
     prompts: AIMessagePrompt[];
+    mode: AIRequestMode;
   }) => Promise<boolean>;
   onApply: (edits: TextSubstitution[]) => void;
+  onAddAttachmentToNote: (attachment: AIMessageAttachment) => void;
   onCreatePrompt: (value: Pick<PromptTemplate, "name" | "content">) => Promise<PromptTemplate>;
   onUpdatePrompt: (id: string, value: Pick<PromptTemplate, "name" | "content">) => Promise<PromptTemplate>;
   onError: (message: string) => void;
+  pendingExternalAttachment?: ExternalAttachmentSeed | null;
+  onPendingExternalAttachmentHandled?: () => void;
   prompts: PromptTemplate[];
   provider: ProviderName;
   providerSettings: ProviderSettings;
-  currentNoteBodyHtml: string;
+  currentNoteBodyMarkdown: string;
   currentNoteTitle: string;
   selectedText?: string;
+  storedPanelHeight?: number | null;
+  onPanelHeightChange?: (height: number) => void;
 }) {
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
@@ -236,7 +331,7 @@ export function AIChatPanel({
   const [composerCondensed, setComposerCondensed] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [cameraPreviewVisible, setCameraPreviewVisible] = useState(false);
-  const [panelHeight, setPanelHeight] = useState(640);
+  const [panelHeight, setPanelHeight] = useState(() => clampPanelHeight(storedPanelHeight ?? 640));
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [promptPickerOpen, setPromptPickerOpen] = useState(false);
   const [selectedPrompts, setSelectedPrompts] = useState<PromptTemplate[]>([]);
@@ -255,7 +350,17 @@ export function AIChatPanel({
     ready: false,
     status: "Open the Live tab to start a session.",
   });
-  const [liveSendText, setLiveSendText] = useState<((text: string) => boolean) | null>(null);
+  const [liveSendHandle, setLiveSendHandle] = useState<LiveSendHandle | null>(null);
+  const [liveVideoControls, setLiveVideoControls] = useState<LiveVideoControls | null>(null);
+  const [liveVideoSources, setLiveVideoSources] = useState<LiveVideoSource[]>([]);
+  const [liveVideoMenuOpen, setLiveVideoMenuOpen] = useState(false);
+  const [liveVideoMenuLoading, setLiveVideoMenuLoading] = useState(false);
+  const [liveVideoShareMode, setLiveVideoShareMode] = useState<LiveVideoShareState["mode"]>(null);
+  const [liveMicrophoneEnabled, setLiveMicrophoneEnabled] = useState(true);
+  const [microphoneSources, setMicrophoneSources] = useState<MicrophoneSource[]>([]);
+  const [microphoneMenuOpen, setMicrophoneMenuOpen] = useState(false);
+  const [microphoneMenuLoading, setMicrophoneMenuLoading] = useState(false);
+  const [selectedMicrophoneId, setSelectedMicrophoneId] = useState<string | null>(null);
   const attachmentsRef = useRef<LocalAttachment[]>([]);
   const composerItemsRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -264,7 +369,10 @@ export function AIChatPanel({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
+  const recordingTargetRef = useRef<"chat" | "live">("chat");
   const recordHoldActiveRef = useRef(false);
+  const microphoneLongPressTimerRef = useRef<number | null>(null);
+  const microphoneLongPressTriggeredRef = useRef(false);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const cameraRecorderRef = useRef<MediaRecorder | null>(null);
@@ -274,6 +382,8 @@ export function AIChatPanel({
   const cameraLongPressTriggeredRef = useRef(false);
   const cameraCaptureHandledRef = useRef(false);
   const pendingComposerScrollRef = useRef(false);
+  const microphoneMenuRef = useRef<HTMLDivElement>(null);
+  const liveVideoMenuRef = useRef<HTMLDivElement>(null);
   const resizePointerIdRef = useRef<number | null>(null);
   const resizeStartYRef = useRef(0);
   const resizeStartHeightRef = useRef(460);
@@ -289,6 +399,28 @@ export function AIChatPanel({
   }, [activeTab, provider]);
 
   useEffect(() => {
+    if (activeTab !== "live") {
+      setLiveVideoMenuOpen(false);
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (!liveVideoMenuOpen && !microphoneMenuOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Node)) return;
+      if (liveVideoMenuRef.current?.contains(target)) return;
+      if (microphoneMenuRef.current?.contains(target)) return;
+      setLiveVideoMenuOpen(false);
+      setMicrophoneMenuOpen(false);
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [liveVideoMenuOpen, microphoneMenuOpen]);
+
+  useEffect(() => {
     const trimmedSelection = selectedText?.trim();
     if (!trimmedSelection) return;
     setPrompt(`\n${trimmedSelection}\n`);
@@ -297,6 +429,36 @@ export function AIChatPanel({
   useEffect(() => {
     attachmentsRef.current = attachments;
   }, [attachments]);
+
+  useEffect(() => {
+    if (!pendingExternalAttachment) return;
+
+    if (!supportsMedia) {
+      onError("Switch the AI provider to Gemini to attach media.");
+      onPendingExternalAttachmentHandled?.();
+      return;
+    }
+
+    setAttachments((current) => {
+      if (current.some((attachment) => attachment.source === "folder" && attachment.assetUrl === pendingExternalAttachment.assetUrl)) {
+        return current;
+      }
+      pendingComposerScrollRef.current = true;
+      return [
+        ...current,
+        {
+          id: pendingExternalAttachment.id,
+          kind: pendingExternalAttachment.kind,
+          fileName: pendingExternalAttachment.fileName,
+          mimeType: pendingExternalAttachment.mimeType,
+          source: "folder",
+          previewUrl: pendingExternalAttachment.previewUrl,
+          assetUrl: pendingExternalAttachment.assetUrl,
+        },
+      ];
+    });
+    onPendingExternalAttachmentHandled?.();
+  }, [onError, onPendingExternalAttachmentHandled, pendingExternalAttachment, supportsMedia]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -311,8 +473,13 @@ export function AIChatPanel({
   }, []);
 
   useEffect(() => {
-    setPanelHeight(clampPanelHeight(window.innerHeight * 0.8));
-  }, []);
+    if (typeof window === "undefined") return;
+    setPanelHeight((current) => clampPanelHeight(current || storedPanelHeight || window.innerHeight * 0.8));
+  }, [storedPanelHeight]);
+
+  useEffect(() => {
+    onPanelHeightChange?.(panelHeight);
+  }, [onPanelHeightChange, panelHeight]);
 
   useEffect(() => {
     if (!pendingComposerScrollRef.current) return;
@@ -374,6 +541,9 @@ export function AIChatPanel({
       attachmentsRef.current.forEach(revokeAttachmentPreview);
       mediaRecorderRef.current?.stop?.();
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+      if (microphoneLongPressTimerRef.current) {
+        window.clearTimeout(microphoneLongPressTimerRef.current);
+      }
       if (cameraLongPressTimerRef.current) {
         window.clearTimeout(cameraLongPressTimerRef.current);
       }
@@ -386,6 +556,13 @@ export function AIChatPanel({
   const stopRecordingStream = () => {
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
+  };
+
+  const clearMicrophoneLongPressTimer = () => {
+    if (microphoneLongPressTimerRef.current) {
+      window.clearTimeout(microphoneLongPressTimerRef.current);
+      microphoneLongPressTimerRef.current = null;
+    }
   };
 
   const clearCameraLongPressTimer = () => {
@@ -436,6 +613,7 @@ export function AIChatPanel({
     fileName: attachment.fileName,
     kind: attachment.kind,
     mimeType: attachment.mimeType,
+    origin: "uploaded",
     url: attachment.file ? URL.createObjectURL(attachment.file) : attachment.assetUrl ?? attachment.previewUrl,
   });
 
@@ -451,6 +629,14 @@ export function AIChatPanel({
     return [sections.length ? `Reusable prompts:\n${sections.join("\n\n")}` : "", trimmedPrompt ? `User request:\n${trimmedPrompt}` : ""]
       .filter(Boolean)
       .join("\n\n");
+  };
+
+  const composeLivePrompt = (messagePrompt: string, templates: PromptTemplate[], items: LocalAttachment[]) => {
+    const basePrompt = composePrompt(messagePrompt, templates);
+    const attachmentSummary =
+      items.length > 0 ? `Selected files:\n${items.map((attachment, index) => `${index + 1}. ${describeLiveAttachment(attachment)}`).join("\n")}` : "";
+
+    return [basePrompt, attachmentSummary].filter(Boolean).join("\n\n").trim();
   };
 
   const waitForCameraFrame = async (video: HTMLVideoElement) => {
@@ -550,6 +736,35 @@ export function AIChatPanel({
     setFolderPickerOpen(false);
   };
 
+  const attachGeneratedImageForEdit = (attachment: AIMessageAttachment) => {
+    if (attachment.kind !== "image" || !attachment.url) {
+      onError("Only generated images can be edited.");
+      return;
+    }
+    const imageUrl = attachment.url;
+
+    setAttachments((current) => {
+      if (current.some((item) => item.assetUrl === imageUrl || item.previewUrl === imageUrl)) {
+        return current;
+      }
+      pendingComposerScrollRef.current = true;
+      return [
+        ...current,
+        {
+          id: attachment.id,
+          kind: "image",
+          fileName: attachment.fileName,
+          mimeType: attachment.mimeType,
+          source: "folder",
+          previewUrl: imageUrl,
+          assetUrl: imageUrl,
+        },
+      ];
+    });
+    setPromptExpanded(true);
+    setActiveTab("chat");
+  };
+
   const addPromptTemplate = (template: PromptTemplate) => {
     pendingComposerScrollRef.current = true;
     setSelectedPrompts((current) => (current.some((item) => item.id === template.id) ? current : [...current, template]));
@@ -616,6 +831,7 @@ export function AIChatPanel({
     items: LocalAttachment[],
     transientItems: LocalAttachment[] = [],
     options?: {
+      mode?: AIRequestMode;
       preserveComposer?: boolean;
     },
   ) => {
@@ -639,6 +855,7 @@ export function AIChatPanel({
         attachments: requestAttachments,
         messageAttachments: items.map(buildMessageAttachment),
         prompts: selectedMessagePrompts,
+        mode: options?.mode ?? "chat",
       });
 
       if (sent) {
@@ -656,30 +873,223 @@ export function AIChatPanel({
 
   const handleSend = async () => {
     if (busy || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)) return;
-    await submitPrompt(attachments);
+    const mode: AIRequestMode =
+      provider === "gemini" && providerSettings.imageModel.trim() && shouldUseImageGeneration(prompt, selectedPrompts, attachments)
+        ? "image"
+        : "chat";
+    await submitPrompt(attachments, [], { mode });
   };
 
   const handleComposerSubmit = async () => {
     if (activeTab === "live") {
-      const text = prompt.trim();
-      if (!text) return;
-      if (!liveSendText) {
-        onError(liveSessionState.ready ? "Live talk is not ready yet." : liveSessionState.status);
+      const mode: AIRequestMode =
+        provider === "gemini" && providerSettings.imageModel.trim() && shouldUseImageGeneration(prompt, selectedPrompts, attachments)
+          ? "image"
+          : "chat";
+      if (mode === "image") {
+        setActiveTab("chat");
+        await submitPrompt(attachments, [], { mode });
         return;
       }
 
-      const sent = liveSendText(text);
-      if (!sent) {
-        onError(liveSessionState.ready ? "Live talk is not ready yet." : liveSessionState.status);
+      const supportedLiveAttachments = attachments.filter((attachment) => attachment.kind === "image" || attachment.kind === "video");
+      const summaryText = composeLivePrompt(prompt, selectedPrompts, attachments);
+
+      if (!summaryText && supportedLiveAttachments.length === 0) return;
+      if (!liveSendHandle) {
+        onError(liveSessionState.status);
         return;
       }
 
-      setPrompt("");
+      if (summaryText) {
+        const sent = liveSendHandle.sendText(summaryText);
+        if (!sent) {
+          onError(liveSessionState.status);
+          return;
+        }
+      }
+
+      try {
+        for (const attachment of supportedLiveAttachments) {
+          const sent = await liveSendHandle.sendAttachment({
+            kind: attachment.kind,
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            file: attachment.file,
+            url: attachment.assetUrl ?? attachment.previewUrl,
+          } satisfies LiveSendAttachment);
+          if (!sent) {
+            onError(`Couldn't send ${attachment.fileName} to live talk.`);
+            return;
+          }
+        }
+      } catch (error) {
+        onError(error instanceof Error ? error.message : "Failed to send media to live talk.");
+        return;
+      }
+
+      clearComposer();
       return;
     }
 
     await handleSend();
   };
+
+  const refreshLiveVideoSources = async () => {
+    if (!liveVideoControls) return [];
+    setLiveVideoMenuLoading(true);
+    try {
+      const sources = await liveVideoControls.listSources();
+      setLiveVideoSources(sources);
+      return sources;
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Failed to load cameras.");
+      return [];
+    } finally {
+      setLiveVideoMenuLoading(false);
+    }
+  };
+
+  const toggleLiveVideoMenu = async () => {
+    if (!liveVideoControls) {
+      onError(liveSessionState.status);
+      return;
+    }
+    if (liveVideoMenuOpen) {
+      setLiveVideoMenuOpen(false);
+      return;
+    }
+    setPromptPickerOpen(false);
+    setFolderPickerOpen(false);
+    setLiveVideoMenuOpen(true);
+    void refreshLiveVideoSources();
+  };
+
+  const startLiveCameraShare = async (deviceId?: string) => {
+    if (!liveVideoControls) return;
+    try {
+      await liveVideoControls.startCameraShare(deviceId);
+      setLiveVideoMenuOpen(false);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Failed to share the camera.");
+    }
+  };
+
+  const startLiveScreenShare = async () => {
+    if (!liveVideoControls) return;
+    try {
+      await liveVideoControls.startScreenShare();
+      setLiveVideoMenuOpen(false);
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Failed to share the screen.");
+    }
+  };
+
+  const refreshMicrophoneSources = async () => {
+    setMicrophoneMenuLoading(true);
+    try {
+      const sources = await listMicrophoneSources();
+      setMicrophoneSources(sources);
+      if (!selectedMicrophoneId && sources[0]) {
+        setSelectedMicrophoneId(sources[0].deviceId);
+      }
+      return sources;
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Failed to load microphones.");
+      return [];
+    } finally {
+      setMicrophoneMenuLoading(false);
+    }
+  };
+
+  const toggleMicrophoneMenu = async () => {
+    if (microphoneMenuOpen) {
+      setMicrophoneMenuOpen(false);
+      return;
+    }
+    setPromptPickerOpen(false);
+    setFolderPickerOpen(false);
+    setLiveVideoMenuOpen(false);
+    setMicrophoneMenuOpen(true);
+    void refreshMicrophoneSources();
+  };
+
+  const selectMicrophoneSource = (deviceId: string) => {
+    setSelectedMicrophoneId(deviceId);
+    setLiveMicrophoneEnabled(true);
+    setMicrophoneMenuOpen(false);
+  };
+
+  const disableLiveMicrophone = () => {
+    setLiveMicrophoneEnabled(false);
+    setMicrophoneMenuOpen(false);
+  };
+
+  const enableLiveMicrophone = () => {
+    setLiveMicrophoneEnabled(true);
+    setMicrophoneMenuOpen(false);
+  };
+
+  const handleLiveVideoShareStateChange = useCallback((state: LiveVideoShareState) => {
+    setLiveVideoShareMode((current) => (current === state.mode ? current : state.mode));
+  }, []);
+
+  const renderGeneratedImageCard = (attachment: AIMessageAttachment) => (
+    <div className="group relative overflow-hidden rounded-[16px] border border-ink/10 bg-white shadow-[0_12px_28px_rgba(15,23,42,0.08)]" key={attachment.id}>
+      <button
+        className="block w-full bg-[#f7f1e6]"
+        onClick={() => {
+          const preview = toPreviewAttachment(attachment);
+          if (preview) setPreviewAttachment(preview);
+        }}
+        type="button"
+      >
+        <img alt={attachment.fileName} className="h-[150px] w-full object-cover" src={attachment.url} />
+      </button>
+      <div className="flex items-center justify-between gap-2 px-3 py-2">
+        <div className="min-w-0">
+          <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Generated image</div>
+          <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+            onClick={() => attachGeneratedImageForEdit(attachment)}
+            title="Edit with AI"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path d="M4 20h4l10-10-4-4L4 16v4Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" />
+              <path d="m12.5 7.5 4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+            </svg>
+          </button>
+          <button
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+            onClick={() => {
+              const preview = toPreviewAttachment(attachment);
+              if (preview) setPreviewAttachment(preview);
+            }}
+            title="Large view"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path d="M14 4h6v6M10 20H4v-6M20 10V4h-6M4 14v6h6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+            </svg>
+          </button>
+          <button
+            className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+            onClick={() => onAddAttachmentToNote(attachment)}
+            title="Add to note"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   const stopRecordingAndSend = async () => {
     const recorder = mediaRecorderRef.current;
@@ -696,8 +1106,23 @@ export function AIChatPanel({
             type: mimeType,
             lastModified: Date.now(),
           });
-          const recordedAttachment = createFileAttachment(file, "audio");
-          await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment], { preserveComposer: true });
+          if (recordingTargetRef.current === "live") {
+            if (!liveSendHandle) {
+              throw new Error(liveSessionState.status);
+            }
+            const sent = await liveSendHandle.sendAttachment({
+              kind: "audio",
+              fileName: file.name,
+              mimeType: file.type,
+              file,
+            } satisfies LiveSendAttachment);
+            if (!sent) {
+              throw new Error("Couldn't send the recording to live talk.");
+            }
+          } else {
+            const recordedAttachment = createFileAttachment(file, "audio");
+            await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment], { preserveComposer: true });
+          }
           resolve();
         } catch (error) {
           reject(error);
@@ -727,7 +1152,12 @@ export function AIChatPanel({
       onError("Switch the AI provider to Gemini to attach media.");
       return;
     }
-    if (busy || recording || preparingRecording) return;
+    if (recording || preparingRecording) return;
+    if (recordingTargetRef.current === "chat" && busy) return;
+    if (recordingTargetRef.current === "live" && !liveSendHandle) {
+      onError(liveSessionState.status);
+      return;
+    }
     if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
       onError("Audio recording is not supported in this browser.");
       return;
@@ -746,7 +1176,20 @@ export function AIChatPanel({
     setPreparingRecording(true);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: selectedMicrophoneId
+          ? {
+              deviceId: { exact: selectedMicrophoneId },
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            }
+          : {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+      });
       mediaStreamRef.current = stream;
       recordedChunksRef.current = [];
       const recorder = new MediaRecorder(stream, { mimeType });
@@ -771,10 +1214,35 @@ export function AIChatPanel({
 
   const releaseRecording = async () => {
     recordHoldActiveRef.current = false;
+    clearMicrophoneLongPressTimer();
     if (preparingRecording) return;
     if (mediaRecorderRef.current?.state === "recording") {
       await stopRecordingAndSend();
     }
+  };
+
+  const beginMicrophoneInteraction = (target: "chat" | "live") => {
+    recordHoldActiveRef.current = true;
+    recordingTargetRef.current = target;
+    microphoneLongPressTriggeredRef.current = false;
+    clearMicrophoneLongPressTimer();
+    microphoneLongPressTimerRef.current = window.setTimeout(() => {
+      microphoneLongPressTimerRef.current = null;
+      microphoneLongPressTriggeredRef.current = true;
+      if (recordHoldActiveRef.current) {
+        void startRecording();
+      }
+    }, 2000);
+  };
+
+  const finishMicrophoneInteraction = async () => {
+    if (microphoneLongPressTriggeredRef.current) {
+      await releaseRecording();
+      return;
+    }
+    recordHoldActiveRef.current = false;
+    clearMicrophoneLongPressTimer();
+    await toggleMicrophoneMenu();
   };
 
   const capturePhotoAndSend = async () => {
@@ -992,9 +1460,10 @@ export function AIChatPanel({
 
   return (
     <Panel className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-[5px] shadow-none" style={{ height: panelHeight }}>
-      <div className="flex items-center justify-between gap-3 border-b border-ink/10 px-3 py-1.5">
+      <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-7 rounded-full bg-ink/20 blur-xl" />
+      <div className="flex items-center justify-between gap-3 px-0 py-1.5">
         <div className="flex min-w-0 items-center gap-3">
-          <div className="inline-flex rounded-full border border-ink/10 bg-white p-1 text-sm">
+          <div className="inline-flex rounded-full bg-white p-1 text-sm shadow-[0_10px_24px_rgba(15,23,42,0.08)]">
             <button
               className={`rounded-full px-3 py-1.5 font-medium transition ${activeTab === "chat" ? "bg-ink text-white" : "text-ink/65 hover:bg-mist"}`}
               onClick={() => setActiveTab("chat")}
@@ -1018,23 +1487,29 @@ export function AIChatPanel({
                 Live
               </button>
             </div>
-          <button
-            className="ml-1 flex h-8 w-10 cursor-ns-resize touch-none items-center justify-center rounded-full border border-ink/10 bg-white text-ink/45 transition hover:border-ink/20 hover:bg-mist"
-            onPointerDown={(event) => {
-              resizePointerIdRef.current = event.pointerId;
-              resizeStartYRef.current = event.clientY;
-              resizeStartHeightRef.current = panelHeight;
-              event.currentTarget.setPointerCapture(event.pointerId);
-            }}
-            title="Resize panel"
-            type="button"
-          >
-            <div className="h-1.5 w-10 rounded-full bg-ink/15" />
-          </button>
         </div>
-        <div className="rounded-full bg-black/[0.04] px-3 py-1 text-xs font-medium uppercase tracking-[0.2em] text-ink/55">
-          {activeTab === "live" ? "Realtime" : "Composer"}
-        </div>
+        <button
+          className="flex h-9 w-11 cursor-ns-resize touch-none items-center justify-center rounded-full bg-white text-ink/45 transition hover:bg-mist"
+          onPointerDown={(event) => {
+            resizePointerIdRef.current = event.pointerId;
+            resizeStartYRef.current = event.clientY;
+            resizeStartHeightRef.current = panelHeight;
+            event.currentTarget.setPointerCapture(event.pointerId);
+          }}
+          title="Resize panel"
+          type="button"
+        >
+          <svg aria-hidden="true" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24">
+            <path
+              d="M12 4V20M8.5 7.5L12 4l3.5 3.5M8.5 16.5L12 20l3.5-3.5"
+              stroke="currentColor"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth="1.7"
+            />
+            <path d="M7 12H17" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+          </svg>
+        </button>
       </div>
 
       {provider === "gemini" ? (
@@ -1053,7 +1528,7 @@ export function AIChatPanel({
       />
 
       <textarea
-        className="w-full resize-none overflow-y-auto rounded-[10px] border border-pine/40 bg-[#fffdf8] px-4 py-3 text-sm leading-6 overscroll-contain transition-[height] duration-200 ease-out"
+        className="hide-scrollbar w-full resize-none overflow-y-auto rounded-[10px] border border-pine/40 bg-[#fffdf8] px-4 py-3 text-sm leading-6 overscroll-contain transition-[height] duration-200 ease-out"
         onChange={(event) => {
           setComposerCondensed(false);
           setPrompt(event.target.value);
@@ -1064,13 +1539,13 @@ export function AIChatPanel({
         }}
         onBlur={() => setComposerFocused(false)}
         onKeyDown={(event) => {
-          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+          if (event.nativeEvent.isComposing) return;
+          if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
             void handleComposerSubmit();
           }
         }}
         onPaste={(event) => {
-          if (activeTab !== "chat") return;
           const files = Array.from(event.clipboardData.items)
             .map((item) => item.getAsFile())
             .filter((file): file is File => Boolean(file))
@@ -1082,17 +1557,17 @@ export function AIChatPanel({
         placeholder={
           activeTab === "live"
             ? liveSessionState.ready
-              ? "Type a follow-up and press Ctrl+Enter to send."
+              ? "Live talk on, speak with AI now."
               : liveSessionState.status
             : supportsMedia
-              ? "Ask Gemini about this note and attach images, audio, or video."
-              : "Send the whole document, ask questions, or switch to Gemini to attach media."
+              ? "Ask Gemini about this note. Press Enter to send, Shift+Enter for a new line."
+              : "Send the whole document or ask questions. Press Enter to send, Shift+Enter for a new line."
         }
         style={{ height: composerFocused ? (promptExpanded ? 300 : composerCondensed ? 50 : 130) : 44 }}
         value={prompt}
       />
 
-      {activeTab === "chat" && (selectedPrompts.length > 0 || attachments.length > 0) ? (
+      {selectedPrompts.length > 0 || attachments.length > 0 ? (
         <div className="mt-3 flex gap-2 overflow-x-auto overscroll-contain pb-1" ref={composerItemsRef}>
           {selectedPrompts.map((selectedPrompt) => (
             <div className="relative shrink-0" key={selectedPrompt.id}>
@@ -1263,53 +1738,192 @@ export function AIChatPanel({
           </button>
         </div>
         <div className="flex items-center gap-2">
-          {activeTab === "chat" ? (
-            <>
-              <button
-                aria-label={recording ? "Release to stop recording" : "Hold to record audio"}
-                className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                  recording
-                    ? "border-[#bb3e2d] bg-[#bb3e2d] text-white"
+          <div className="relative" ref={microphoneMenuRef}>
+            <button
+              aria-expanded={microphoneMenuOpen}
+              aria-label={recording ? "Release to stop recording" : "Quick tap for microphones, hold 2 seconds to record audio"}
+              className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                recording
+                  ? "border-[#bb3e2d] bg-[#bb3e2d] text-white"
+                  : activeTab === "live" && liveMicrophoneEnabled
+                    ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]"
                     : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
-                }`}
-                disabled={!supportsMedia || busy || cameraPreparing || cameraRecording}
-                onPointerCancel={() => void releaseRecording()}
-                onPointerDown={(event) => {
-                  recordHoldActiveRef.current = true;
-                  event.currentTarget.setPointerCapture(event.pointerId);
-                  void startRecording();
-                }}
-                onPointerUp={(event) => {
-                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                    event.currentTarget.releasePointerCapture(event.pointerId);
-                  }
+              }`}
+              disabled={!supportsMedia || cameraPreparing || cameraRecording}
+              onPointerCancel={() => {
+                recordHoldActiveRef.current = false;
+                clearMicrophoneLongPressTimer();
+                if (microphoneLongPressTriggeredRef.current) {
                   void releaseRecording();
-                }}
-                title={
-                  supportsMedia
-                    ? recording
-                      ? "Release to stop and send audio"
-                      : "Hold to record and send audio"
-                    : "Switch to Gemini to record audio"
                 }
+              }}
+              onPointerDown={(event) => {
+                beginMicrophoneInteraction(activeTab === "live" ? "live" : "chat");
+                event.currentTarget.setPointerCapture(event.pointerId);
+              }}
+              onPointerUp={(event) => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+                void finishMicrophoneInteraction();
+              }}
+              title={
+                supportsMedia
+                  ? recording
+                    ? "Release to stop and send audio"
+                    : "Tap for microphone choices, hold 2 seconds to record"
+                  : "Switch to Gemini to use microphones"
+              }
+              type="button"
+            >
+              {preparingRecording ? (
+                <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
+              ) : (
+                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <path
+                    d="M12 4.5a2.5 2.5 0 0 1 2.5 2.5v4.5a2.5 2.5 0 0 1-5 0V7a2.5 2.5 0 0 1 2.5-2.5Z"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.8"
+                  />
+                  <path d="M7.5 11.5a4.5 4.5 0 0 0 9 0M12 16v3.5M9 19.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                </svg>
+              )}
+            </button>
+            {microphoneMenuOpen ? (
+              <div className="absolute bottom-12 right-0 z-30 grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Microphones</div>
+                    <div className="text-xs text-ink/55">
+                      {activeTab === "live"
+                        ? liveMicrophoneEnabled
+                          ? "Live microphone is enabled."
+                          : "Live microphone is disabled."
+                        : "Choose a microphone or hold to record."}
+                    </div>
+                  </div>
+                  <button
+                    className="rounded-full border border-ink/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => (liveMicrophoneEnabled ? disableLiveMicrophone() : enableLiveMicrophone())}
+                    type="button"
+                  >
+                    {liveMicrophoneEnabled ? "Disable" : "Enable"}
+                  </button>
+                </div>
+                <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Available microphones</div>
+                {microphoneMenuLoading ? (
+                  <div className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-xs text-ink/45">Loading microphones...</div>
+                ) : microphoneSources.length === 0 ? (
+                  <button
+                    className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-left text-xs text-ink/55 transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => void refreshMicrophoneSources()}
+                    type="button"
+                  >
+                    Refresh microphone list
+                  </button>
+                ) : (
+                  microphoneSources.map((source) => {
+                    const selected = selectedMicrophoneId === source.deviceId;
+                    return (
+                      <button
+                        className={`rounded-[12px] border px-3 py-2 text-left text-sm transition ${
+                          selected ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]" : "border-ink/10 bg-[#fffdfa] text-ink hover:border-ink/20 hover:bg-mist"
+                        }`}
+                        key={source.deviceId}
+                        onClick={() => selectMicrophoneSource(source.deviceId)}
+                        type="button"
+                      >
+                        {source.label}
+                      </button>
+                    );
+                  })
+                )}
+              </div>
+            ) : null}
+          </div>
+          {activeTab === "live" ? (
+            <div className="relative" ref={liveVideoMenuRef}>
+              <button
+                aria-expanded={liveVideoMenuOpen}
+                aria-label={liveVideoShareMode ? "Manage live video share" : "Share camera or screen"}
+                className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  liveVideoShareMode ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]" : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
+                }`}
+                disabled={!liveSendHandle}
+                onClick={() => void toggleLiveVideoMenu()}
+                title={liveVideoShareMode ? "Manage live video share" : "Share camera or screen"}
                 type="button"
               >
-                {preparingRecording ? (
-                  <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
-                ) : (
-                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                    <path
-                      d="M12 4.5a2.5 2.5 0 0 1 2.5 2.5v4.5a2.5 2.5 0 0 1-5 0V7a2.5 2.5 0 0 1 2.5-2.5Z"
-                      stroke="currentColor"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      strokeWidth="1.8"
-                    />
-                    <path d="M7.5 11.5a4.5 4.5 0 0 0 9 0M12 16v3.5M9 19.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-                  </svg>
-                )}
+                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <path
+                    d="M4.5 7.5A1.5 1.5 0 0 1 6 6h8a1.5 1.5 0 0 1 1.5 1.5v1.3l3-2A1 1 0 0 1 20 7.6v8.8a1 1 0 0 1-1.5.8l-3-2v1.3A1.5 1.5 0 0 1 14 18H6a1.5 1.5 0 0 1-1.5-1.5v-9Z"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.7"
+                  />
+                </svg>
               </button>
-              <button
+              {liveVideoMenuOpen ? (
+                <div className="absolute bottom-12 right-0 z-30 grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Live video</div>
+                      <div className="text-xs text-ink/55">{liveVideoShareMode ? `Currently sharing ${liveVideoShareMode}.` : "Share a camera or your screen."}</div>
+                    </div>
+                    <button
+                      className="rounded-full border border-ink/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                      onClick={() => {
+                        liveVideoControls?.stopVideoShare();
+                        setLiveVideoMenuOpen(false);
+                      }}
+                      type="button"
+                    >
+                      Disable
+                    </button>
+                  </div>
+                  <button
+                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => void startLiveScreenShare()}
+                    type="button"
+                  >
+                    <span>Share screen</span>
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8A1.5 1.5 0 0 1 18.5 16h-13A1.5 1.5 0 0 1 4 14.5v-8Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" />
+                      <path d="M9 19h6M12 16v3" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+                    </svg>
+                  </button>
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Available cameras</div>
+                  {liveVideoMenuLoading ? (
+                    <div className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-xs text-ink/45">Loading cameras...</div>
+                  ) : liveVideoSources.length === 0 ? (
+                    <button
+                      className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-left text-xs text-ink/55 transition hover:border-ink/20 hover:bg-mist"
+                      onClick={() => void refreshLiveVideoSources()}
+                      type="button"
+                    >
+                      Refresh camera list
+                    </button>
+                  ) : (
+                    liveVideoSources.map((source) => (
+                      <button
+                        className="rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                        key={source.deviceId}
+                        onClick={() => void startLiveCameraShare(source.deviceId)}
+                        type="button"
+                      >
+                        {source.label}
+                      </button>
+                    ))
+                  )}
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {activeTab === "chat" ? (
+            <button
                 aria-label={cameraRecording ? "Release to stop video recording" : "Click for photo, hold for video"}
                 className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
                   cameraRecording
@@ -1360,14 +1974,13 @@ export function AIChatPanel({
                   <circle cx="12" cy="12.5" r="3" stroke="currentColor" strokeWidth="1.7" />
                 </svg>
               </button>
-            </>
           ) : null}
           <button
             aria-label={activeTab === "live" ? "Send to live" : "Ask"}
             className="flex h-10 w-10 items-center justify-center rounded-[4px] bg-ember text-ink transition hover:bg-ember/90 disabled:cursor-not-allowed disabled:opacity-50"
             disabled={
               activeTab === "live"
-                ? !liveSessionState.ready || !prompt.trim()
+                ? !liveSendHandle || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)
                 : busy || preparingRecording || recording || cameraPreparing || cameraRecording || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)
             }
             onClick={() => void handleComposerSubmit()}
@@ -1391,9 +2004,9 @@ export function AIChatPanel({
           </button>
         </div>
 
-      {activeTab === "chat" && promptPickerOpen ? (
-          <div className="absolute bottom-[calc(100%+8px)] left-0 z-[80] flex h-[360px] w-full flex-col overflow-hidden rounded-[12px] border border-ink/10 bg-white p-2 shadow-[0_18px_32px_rgba(15,23,42,0.12)]">
-            <div className="mb-2 shrink-0 flex items-center justify-between gap-2 px-1">
+      {promptPickerOpen ? (
+          <div className="mt-3 flex max-h-[360px] w-full flex-col overflow-hidden rounded-[18px] border border-ink/10 bg-white p-3 shadow-[0_12px_28px_rgba(15,23,42,0.08)]">
+            <div className="mb-3 shrink-0 flex items-center justify-between gap-2">
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Prompt Library</div>
                 <div className="text-xs text-ink/55">Built-ins and synced prompts</div>
@@ -1463,34 +2076,41 @@ export function AIChatPanel({
                 </div>
               </div>
             ) : null}
-            <div className="min-h-0 flex-1 space-y-2 overflow-y-auto overscroll-contain pr-1 touch-pan-y">
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1 touch-pan-y">
+              <div className="flex flex-wrap gap-2">
               {availablePrompts.map((item) => {
                 const selected = selectedPrompts.some((promptItem) => promptItem.id === item.id);
                 return (
-                  <div className="flex items-start gap-2" key={item.id}>
+                  <div className="relative" key={item.id}>
                     <button
-                      className={`flex min-w-0 flex-1 items-start justify-between gap-3 rounded-[10px] border px-3 py-2 text-left transition ${
-                        selected ? "border-ink bg-mist" : "border-ink/10 bg-white hover:border-ink/20 hover:bg-mist"
+                      className={`flex h-[50px] w-[70px] flex-col justify-between rounded-[12px] border px-2 py-2 text-left transition ${
+                        selected ? "border-ink bg-mist" : "border-ink/10 bg-[#fffdfa] hover:border-ink/20 hover:bg-mist"
                       }`}
                       onClick={() => addPromptTemplate(item)}
                       type="button"
                     >
-                      <div className="min-w-0 flex-1 overflow-hidden">
-                        <div className="break-words text-sm font-medium text-ink">{item.name}</div>
-                        <div className="mt-1 max-h-12 overflow-hidden break-words text-xs leading-5 text-ink/55">{item.content}</div>
+                      <div className="flex items-start justify-between gap-2">
+                        <span className="rounded-full bg-black/[0.04] px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-[0.12em] text-ink/55">
+                          {item.builtin ? "Built-in" : "Cloud"}
+                        </span>
+                        {selected ? (
+                          <span className="rounded-full bg-ink px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-[0.12em] text-white">
+                            Added
+                          </span>
+                        ) : null}
                       </div>
-                      <span className="shrink-0 rounded-full bg-black/[0.04] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink/55">
-                        {item.builtin ? "Built-in" : "Cloud"}
-                      </span>
+                      <div className="min-w-0">
+                        <div className="line-clamp-2 break-words text-[10px] font-semibold leading-4 text-ink">{item.name}</div>
+                      </div>
                     </button>
                     {!item.builtin ? (
                       <button
                         aria-label={`Edit ${item.name}`}
-                        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                        className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-[8px] border border-ink/10 bg-white/95 text-ink transition hover:border-ink/20 hover:bg-mist"
                         onClick={() => openPromptEditor(item)}
                         type="button"
                       >
-                        <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <svg aria-hidden="true" className="h-3 w-3" fill="none" viewBox="0 0 24 24">
                           <path
                             d="M4 20h4l9.5-9.5a1.4 1.4 0 0 0 0-2L15.5 6a1.4 1.4 0 0 0-2 0L4 15.5V20Z"
                             stroke="currentColor"
@@ -1505,13 +2125,14 @@ export function AIChatPanel({
                   </div>
                 );
               })}
+              </div>
             </div>
           </div>
         ) : null}
 
-        {activeTab === "chat" && folderPickerOpen ? (
-          <div className="absolute bottom-[calc(100%+8px)] left-0 z-[80] w-full rounded-[12px] border border-ink/10 bg-white p-2 shadow-[0_18px_32px_rgba(15,23,42,0.12)]">
-            <div className="mb-2 flex items-center justify-between gap-2 px-1">
+        {folderPickerOpen ? (
+          <div className="mt-3 w-full rounded-[18px] border border-ink/10 bg-white p-3 shadow-[0_12px_28px_rgba(15,23,42,0.08)]">
+            <div className="mb-3 flex items-center justify-between gap-2">
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Current Folder Files</div>
                 <div className="text-xs text-ink/55">{currentFolderName}</div>
@@ -1526,25 +2147,30 @@ export function AIChatPanel({
                 </svg>
               </button>
             </div>
-            <div className="max-h-52 space-y-2 overflow-auto overscroll-contain pr-1">
+            <div className="max-h-52 overflow-auto overscroll-contain pr-1">
               {currentFolderFiles.length === 0 ? (
                 <div className="rounded-[10px] border border-dashed border-ink/10 px-3 py-4 text-sm text-ink/45">
                   No image, audio, or video files in this folder yet.
                 </div>
               ) : (
-                currentFolderFiles.map((asset) => (
-                  <button
-                    className="flex w-full items-center justify-between gap-3 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-left transition hover:border-ink/20 hover:bg-mist"
-                    key={asset.id}
-                    onClick={() => addFolderAsset(asset)}
-                    type="button"
-                  >
-                    <span className="min-w-0 truncate text-sm font-medium text-ink">{asset.fileName}</span>
-                    <span className="shrink-0 rounded-full bg-black/[0.04] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink/55">
-                      {attachmentBadge(asset.kind)}
-                    </span>
-                  </button>
-                ))
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {currentFolderFiles.map((asset) => (
+                    <button
+                      className="flex items-start justify-between gap-3 rounded-[14px] border border-ink/10 bg-[#fffdfa] px-3 py-3 text-left transition hover:border-ink/20 hover:bg-mist"
+                      key={asset.id}
+                      onClick={() => addFolderAsset(asset)}
+                      type="button"
+                    >
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium text-ink">{asset.fileName}</div>
+                        <div className="mt-1 text-xs text-ink/45">{asset.mimeType}</div>
+                      </div>
+                      <span className="shrink-0 rounded-full bg-black/[0.04] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink/55">
+                        {attachmentBadge(asset.kind)}
+                      </span>
+                    </button>
+                  ))}
+                </div>
               )}
             </div>
           </div>
@@ -1553,7 +2179,7 @@ export function AIChatPanel({
 
       <div className="mt-4 min-h-0 flex-1">
         <div
-          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 p-3"
+          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 pb-3 pl-3 pr-0 pt-3"
           hidden={activeTab !== "chat"}
           onClick={() => {
             if (!promptExpanded) {
@@ -1565,13 +2191,22 @@ export function AIChatPanel({
           <div className="flex flex-col gap-3">
             {messages.map((message) => {
               const edits = message.substitutions ?? [];
+              const generatedImageAttachments =
+                message.role === "assistant"
+                  ? (message.attachments ?? []).filter((attachment) => attachment.kind === "image" && attachment.url)
+                  : [];
+              const compactAttachments =
+                message.role === "assistant"
+                  ? (message.attachments ?? []).filter((attachment) => attachment.kind !== "image" || !attachment.url)
+                  : (message.attachments ?? []);
               return (
                 <div
                   className={`max-w-[92%] rounded-[4px] px-3 py-2 text-sm ${message.role === "assistant" ? "bg-white" : "self-end bg-ink text-white"}`}
                   key={message.id}
                   ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
+                  style={message.role === "user" ? { minWidth: "min(300px, 92%)" } : undefined}
                 >
-                  {message.prompts?.length || message.attachments?.length ? (
+                  {message.prompts?.length || compactAttachments.length ? (
                     <div className="flex gap-2 overflow-x-auto overscroll-contain pb-1">
                       {message.prompts?.map((promptItem) => (
                         <button
@@ -1588,7 +2223,7 @@ export function AIChatPanel({
                           <div className="max-w-48 truncate font-medium">{promptItem.name}</div>
                         </button>
                       ))}
-                      {message.attachments?.map((attachment) => {
+                      {compactAttachments.map((attachment) => {
                         const cardTone =
                           message.role === "assistant"
                             ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
@@ -1632,16 +2267,25 @@ export function AIChatPanel({
                       })}
                     </div>
                   ) : null}
-                  <div className={`${message.prompts?.length || message.attachments?.length ? "mt-3" : ""} whitespace-pre-wrap break-words`}>
+                  {generatedImageAttachments.length > 0 ? (
+                    <div className={`${message.prompts?.length || compactAttachments.length ? "mt-3" : ""} grid gap-3 sm:grid-cols-2`}>
+                      {generatedImageAttachments.map((attachment) => renderGeneratedImageCard(attachment))}
+                    </div>
+                  ) : null}
+                  <div
+                    className={`${
+                      message.prompts?.length || compactAttachments.length || generatedImageAttachments.length ? "mt-3" : ""
+                    } whitespace-pre-wrap break-words`}
+                  >
                     {message.content}
                   </div>
                   {message.role === "assistant" && edits.length > 0 ? (
                     <div className="mt-3 flex justify-end">
                       <button
-                        aria-label="Apply AI edits"
+                        aria-label="Preview AI edits"
                         className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-mist text-ink transition hover:border-ink/25 hover:bg-[#efe5d3]"
                         onClick={() => onApply(edits)}
-                        title="Apply AI edits"
+                        title="Preview AI edits"
                         type="button"
                       >
                         <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -1663,14 +2307,18 @@ export function AIChatPanel({
           </div>
         </div>
 
-        <div className="h-full p-3" hidden={activeTab !== "live"}>
+        <div className="h-full pb-3 pl-3 pr-0 pt-3" hidden={activeTab !== "live"}>
           <LiveTalkPanel
             active={activeTab === "live"}
-            currentNoteBodyHtml={currentNoteBodyHtml}
+            currentNoteBodyMarkdown={currentNoteBodyMarkdown}
             currentNoteTitle={currentNoteTitle}
+            microphoneDeviceId={selectedMicrophoneId}
+            microphoneEnabled={liveMicrophoneEnabled}
             onError={onError}
-            onRegisterSend={setLiveSendText}
+            onRegisterSend={setLiveSendHandle}
+            onRegisterVideoControls={setLiveVideoControls}
             onSessionStateChange={setLiveSessionState}
+            onVideoShareStateChange={handleLiveVideoShareStateChange}
             providerSettings={providerSettings}
           />
         </div>

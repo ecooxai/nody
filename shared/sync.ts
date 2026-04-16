@@ -3,7 +3,7 @@ import type { DocumentRecord, SyncPayload, SyncResult } from "./types";
 export function buildSyncPayload(document: DocumentRecord, deviceId: string): SyncPayload {
   return {
     title: document.title,
-    bodyHtml: document.bodyHtml,
+    bodyMarkdown: document.bodyMarkdown,
     baseRevision: document.revision,
     deviceId,
   };

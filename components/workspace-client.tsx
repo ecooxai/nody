@@ -11,20 +11,24 @@ import { Panel } from "@/components/ui/panel";
 import { apiClient } from "@/lib/api/client";
 import type { EditorCommand } from "@/lib/editor/commands";
 import { clerkClientConfigured } from "@/lib/auth/config";
-import { createStarterDocument } from "@/lib/editor/html";
+import { createStarterMarkdown, normalizeStoredMarkdown } from "@/lib/editor/markdown";
 import { useServiceWorker } from "@/lib/hooks/use-service-worker";
 import { createDefaultSettings } from "@/lib/providers/defaults";
 import { getDeviceId } from "@/lib/storage/device";
 import {
   loadCachedDocument,
+  loadAiPanelHeight,
   loadRecentDocumentIds,
   saveCachedDocument,
+  saveAiPanelHeight,
   saveRecentDocumentIds,
 } from "@/lib/storage/local-cache";
-import { applySubstitutions } from "@/shared/substitutions";
+import { buildSubstitutionReplay, type TextSubstitutionReplayStep } from "@/shared/substitutions";
 import { buildSyncPayload, shouldApplyRemote } from "@/shared/sync";
 import type {
   AIMessage,
+  AIMessageAttachment,
+  AIMediaKind,
   AIMessagePrompt,
   AIRequestAttachment,
   DocumentRecord,
@@ -37,6 +41,20 @@ import type {
 
 type WorkspaceWindow = "library" | "format" | "create" | "settings" | "ai" | "info" | null;
 type AssetInsertionPlacement = "cursor" | "top";
+type PendingAiAttachment = {
+  id: string;
+  kind: AIMediaKind;
+  fileName: string;
+  mimeType: string;
+  assetUrl: string;
+  previewUrl: string;
+};
+type PendingAiEditPreview = {
+  nextBodyMarkdown: string;
+  stepCount: number;
+  firstStep: TextSubstitutionReplayStep;
+  skippedCount: number;
+};
 const RECENT_NOTE_LIMIT = 5;
 const RECENT_NOTE_HISTORY_LIMIT = 20;
 
@@ -55,7 +73,7 @@ function emptyDocument(deviceId: string, folderId: string | null): DocumentRecor
   return {
     id: "",
     title: "Untitled note",
-    bodyHtml: createStarterDocument(),
+    bodyMarkdown: createStarterMarkdown(),
     folderId,
     revision: 0,
     deviceId,
@@ -63,6 +81,13 @@ function emptyDocument(deviceId: string, folderId: string | null): DocumentRecor
     createdAt: now,
     assets: [],
   };
+}
+
+function normalizeDocumentRecord(document: DocumentRecord & { bodyHtml?: string }) {
+  return {
+    ...document,
+    bodyMarkdown: normalizeStoredMarkdown(document.bodyMarkdown ?? document.bodyHtml ?? ""),
+  } satisfies DocumentRecord;
 }
 
 function sortDocuments(documents: DocumentRecord[]) {
@@ -100,6 +125,18 @@ function formatAssetKind(kind: FolderAsset["kind"]) {
 function shortenMiddle(value: string, start = 10, end = 10) {
   if (value.length <= start + end + 3) return value;
   return `${value.slice(0, start)}...${value.slice(-end)}`;
+}
+
+function base64ToFile(base64: string, fileName: string, mimeType: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new File([bytes], fileName, {
+    type: mimeType,
+    lastModified: Date.now(),
+  });
 }
 
 function formatCommandIcon(command: EditorCommand) {
@@ -309,6 +346,9 @@ function WorkspaceClientContent() {
   const [activeWindow, setActiveWindow] = useState<WorkspaceWindow>(null);
   const [dirty, setDirty] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
+  const [pendingAiAttachment, setPendingAiAttachment] = useState<PendingAiAttachment | null>(null);
+  const [pendingAiEditPreview, setPendingAiEditPreview] = useState<PendingAiEditPreview | null>(null);
+  const [pendingEditorInsertAsset, setPendingEditorInsertAsset] = useState<FolderAsset | null>(null);
   const [selectedText, setSelectedText] = useState("");
   const [recentOpen, setRecentOpen] = useState(true);
   const [showAllRecent, setShowAllRecent] = useState(false);
@@ -322,6 +362,17 @@ function WorkspaceClientContent() {
   const dirtyStateRef = useRef(dirty);
   const refreshDocumentsFromServerRef = useRef<(statusWhenFresh?: string) => Promise<void>>(async () => {});
   const [previewUrlCopied, setPreviewUrlCopied] = useState(false);
+
+  useEffect(() => {
+    if (!isEditing || !pendingEditorInsertAsset) return;
+    editorRef.current?.insertAsset(pendingEditorInsertAsset, "cursor");
+    setPendingEditorInsertAsset(null);
+  }, [isEditing, pendingEditorInsertAsset]);
+
+  useEffect(() => {
+    if (!isEditing || !pendingAiEditPreview) return;
+    editorRef.current?.focusRange(pendingAiEditPreview.firstStep.start, pendingAiEditPreview.firstStep.end);
+  }, [isEditing, pendingAiEditPreview]);
 
   const documentsByFolder = useMemo(() => {
     const grouped = new Map<string, DocumentRecord[]>();
@@ -485,6 +536,7 @@ function WorkspaceClientContent() {
     documentStateRef.current = next;
     setDocument(next);
     setIsEditing(false);
+    setPendingAiEditPreview(null);
     setSelectedFolderId(next.folderId);
     setSelectedFolderAsset(null);
     setSelectedText("");
@@ -504,6 +556,7 @@ function WorkspaceClientContent() {
 
   const exitEditMode = () => {
     setIsEditing(false);
+    setPendingAiEditPreview(null);
     setActiveWindow((current) => (current === "format" || current === "create" ? null : current));
   };
 
@@ -519,7 +572,7 @@ function WorkspaceClientContent() {
     if (syncInFlightRef.current) return;
     syncInFlightRef.current = true;
     try {
-      const remoteDocs = await apiClient.listDocuments();
+      const remoteDocs = (await apiClient.listDocuments()).map(normalizeDocumentRecord);
       setDocuments(sortDocuments(remoteDocs));
 
       const currentDocument = documentStateRef.current;
@@ -553,9 +606,10 @@ function WorkspaceClientContent() {
           apiClient.listFolderAssets(),
           apiClient.getSettings(),
         ]);
+        const normalizedRemoteDocs = remoteDocs.map(normalizeDocumentRecord);
         setFolders(sortFolders(remoteFolders));
         setSettings(remoteSettings);
-        setDocuments(sortDocuments(remoteDocs));
+        setDocuments(sortDocuments(normalizedRemoteDocs));
         setFolderAssets(remoteFolderAssets);
 
         void apiClient
@@ -563,19 +617,20 @@ function WorkspaceClientContent() {
           .then((remotePrompts) => setPromptTemplates(remotePrompts))
           .catch(() => setPromptTemplates([]));
 
-        if (remoteDocs[0]) {
-          const initialDocument = (cachedDocument && remoteDocs.find((item) => item.id === cachedDocument.id)) ?? remoteDocs[0];
+        if (normalizedRemoteDocs[0]) {
+          const initialDocument =
+            (cachedDocument && normalizedRemoteDocs.find((item) => item.id === cachedDocument.id)) ?? normalizedRemoteDocs[0];
           selectDocument(initialDocument);
           setSyncStatus("Live");
           return;
         }
 
-        const created = await apiClient.createDocument({
+        const created = normalizeDocumentRecord(await apiClient.createDocument({
           title: cachedDocument?.title ?? "Untitled note",
-          bodyHtml: cachedDocument?.bodyHtml ?? createStarterDocument(),
+          bodyMarkdown: cachedDocument?.bodyMarkdown ?? createStarterMarkdown(),
           deviceId,
           folderId: cachedDocument?.folderId ?? null,
-        });
+        }));
         setDocuments([created]);
         selectDocument(created);
         setSyncStatus("Live");
@@ -601,13 +656,14 @@ function WorkspaceClientContent() {
         if (dirtyStateRef.current) {
           syncInFlightRef.current = true;
           const result = await apiClient.syncDocument(currentDocument.id, buildSyncPayload(currentDocument, deviceId));
-          documentStateRef.current = result.document;
+          const normalizedDocument = normalizeDocumentRecord(result.document);
+          documentStateRef.current = normalizedDocument;
           dirtyStateRef.current = false;
-          setDocument(result.document);
-          setDocuments((current) => upsertDocument(current, result.document));
+          setDocument(normalizedDocument);
+          setDocuments((current) => upsertDocument(current, normalizedDocument));
           setDirty(false);
           setSyncStatus(result.conflict ? "Conflict" : "Synced");
-          saveCachedDocument(result.document);
+          saveCachedDocument(normalizedDocument);
           if (result.conflict) pushError(result.message ?? "Sync conflict detected");
           return;
         }
@@ -672,13 +728,29 @@ function WorkspaceClientContent() {
   };
 
   const applyAiEdits = (edits: TextSubstitution[]) => {
-    if (!isEditing) {
-      pushError("Click the edit button on the note to enter edit mode.");
+    if (edits.length === 0) return;
+    const replay = buildSubstitutionReplay(document.bodyMarkdown, edits);
+    if (replay.steps.length === 0) {
+      pushError("The suggested edit text could not be found in this note.");
       return;
     }
-    if (edits.length === 0) return;
-    const bodyHtml = applySubstitutions(document.bodyHtml, edits);
-    updateDocument({ bodyHtml });
+    setPendingAiEditPreview({
+      nextBodyMarkdown: replay.next,
+      stepCount: replay.steps.length,
+      firstStep: replay.steps[0],
+      skippedCount: replay.unapplied.length,
+    });
+    setIsEditing(true);
+  };
+
+  const confirmAiEdits = () => {
+    if (!pendingAiEditPreview) return;
+    const { firstStep, nextBodyMarkdown } = pendingAiEditPreview;
+    updateDocument({ bodyMarkdown: nextBodyMarkdown });
+    setPendingAiEditPreview(null);
+    window.requestAnimationFrame(() => {
+      editorRef.current?.focusRange(firstStep.start, firstStep.start + firstStep.replace.length);
+    });
   };
 
   useEffect(() => {
@@ -728,12 +800,12 @@ function WorkspaceClientContent() {
   const createNote = async (folderId: string | null) => {
     setCreatingNote(true);
     try {
-      const created = await apiClient.createDocument({
+      const created = normalizeDocumentRecord(await apiClient.createDocument({
         title: "Untitled note",
-        bodyHtml: createStarterDocument(),
+        bodyMarkdown: createStarterMarkdown(),
         deviceId,
         folderId,
-      });
+      }));
       setDocuments((current) => upsertDocument(current, created));
       setMessages([]);
       setSelectedText("");
@@ -754,11 +826,11 @@ function WorkspaceClientContent() {
     return null;
   };
 
-  const uploadFolderAsset = async (folderId: string | null, file: File) => {
+  const uploadFolderAsset = async (folderId: string | null, file: File, options?: { insertIntoNote?: boolean }) => {
     const kind = inferAssetKind(file);
     if (!kind) {
       pushError("Only image, audio, and video files are supported.");
-      return;
+      return null;
     }
     setUploading(true);
     try {
@@ -767,20 +839,25 @@ function WorkspaceClientContent() {
       if (assetPickerFolderId === folderId && assetPickerKind === kind) {
         setAssetPickerKind(kind);
       }
+      if (options?.insertIntoNote) {
+        editorRef.current?.insertAsset(asset, "cursor");
+      }
+      return asset;
     } catch (error) {
       pushError(error instanceof Error ? error.message : "Media upload failed");
+      return null;
     } finally {
       setUploading(false);
     }
   };
 
-  const pickFolderUpload = (folderId: string | null) => {
+  const pickFolderUpload = (folderId: string | null, options?: { accept?: string; insertIntoNote?: boolean }) => {
     const input = window.document.createElement("input");
     input.type = "file";
-    input.accept = "image/*,audio/*,video/*";
+    input.accept = options?.accept ?? "image/*,audio/*,video/*";
     input.onchange = async () => {
       const file = input.files?.[0];
-      if (file) await uploadFolderAsset(folderId, file);
+      if (file) await uploadFolderAsset(folderId, file, options);
     };
     input.click();
   };
@@ -796,15 +873,66 @@ function WorkspaceClientContent() {
     setActiveWindow("create");
   };
 
+  const uploadAndInsertEditorAsset = (kind: FolderAsset["kind"]) => {
+    if (!isEditing) {
+      pushError("Click the edit button on the note to enter edit mode.");
+      return;
+    }
+
+    const acceptByKind: Record<FolderAsset["kind"], string> = {
+      image: "image/*",
+      audio: "audio/*",
+      video: "video/*",
+    };
+
+    pickFolderUpload(selectedFolderId, {
+      accept: acceptByKind[kind],
+      insertIntoNote: true,
+    });
+  };
+
+  const addNoteMediaToAi = (attachment: PendingAiAttachment) => {
+    setPendingAiAttachment(attachment);
+    setActiveWindow("ai");
+  };
+
+  const addAiAttachmentToNote = (attachment: AIMessageAttachment) => {
+    if (attachment.kind !== "image" || !attachment.url) {
+      pushError("Only generated images can be inserted into the note.");
+      return;
+    }
+
+    const asset: FolderAsset = {
+      id: attachment.id,
+      folderId: selectedFolderId,
+      kind: "image",
+      url: attachment.url,
+      mimeType: attachment.mimeType,
+      fileName: attachment.fileName,
+      sizeBytes: 0,
+      createdAt: new Date().toISOString(),
+    };
+
+    if (!isEditing) {
+      setPendingEditorInsertAsset(asset);
+      setIsEditing(true);
+      return;
+    }
+
+    editorRef.current?.insertAsset(asset, "cursor");
+  };
+
   const askAi = async ({
     prompt,
     attachments,
     messageAttachments,
+    mode,
     prompts,
   }: {
     prompt: string;
     attachments: AIRequestAttachment[];
     messageAttachments: AIMessage["attachments"];
+    mode: "chat" | "image";
     prompts: AIMessagePrompt[];
   }) => {
     setThinking(true);
@@ -836,7 +964,8 @@ function WorkspaceClientContent() {
       await apiClient.askAiStream({
         prompt,
         title: document.title,
-        bodyHtml: document.bodyHtml,
+        bodyMarkdown: document.bodyMarkdown,
+        mode,
         selection: selectedText.trim() || undefined,
         attachments,
       }, {
@@ -852,7 +981,36 @@ function WorkspaceClientContent() {
             ),
           );
         },
-        onDone: (reply) => {
+        onDone: async (reply) => {
+          const generatedAttachments: AIMessageAttachment[] = [];
+          for (const attachment of reply.attachments ?? []) {
+            if (attachment.kind !== "image") continue;
+            const file = base64ToFile(attachment.dataBase64, attachment.fileName, attachment.mimeType);
+            try {
+              const savedAsset = await uploadFolderAsset(selectedFolderId, file);
+              if (savedAsset) {
+                generatedAttachments.push({
+                  id: savedAsset.id,
+                  kind: "image",
+                  fileName: savedAsset.fileName,
+                  mimeType: savedAsset.mimeType,
+                  origin: "generated",
+                  url: savedAsset.url,
+                });
+                continue;
+              }
+            } catch {}
+
+            generatedAttachments.push({
+              id: crypto.randomUUID(),
+              kind: "image",
+              fileName: attachment.fileName,
+              mimeType: attachment.mimeType,
+              origin: "generated",
+              url: URL.createObjectURL(file),
+            });
+          }
+
           setMessages((current) =>
             current.map((message) =>
               message.id === assistantMessageId
@@ -860,6 +1018,7 @@ function WorkspaceClientContent() {
                     ...message,
                     content: reply.answer,
                     substitutions: reply.substitutions,
+                    attachments: generatedAttachments.length > 0 ? generatedAttachments : message.attachments,
                   }
                 : message,
             ),
@@ -1609,21 +1768,70 @@ function WorkspaceClientContent() {
 
           <RichEditor
             ref={editorRef}
-            bodyHtml={document.bodyHtml}
+            bodyMarkdown={document.bodyMarkdown}
             editable={isEditing}
+            inlineNotice={
+              pendingAiEditPreview ? (
+                <div className="rounded-[20px] border border-ink/10 bg-[#fff7e8] p-4 shadow-[0_12px_28px_rgba(15,23,42,0.08)]">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">AI edit preview</div>
+                      <div className="mt-1 text-sm text-ink">
+                        {pendingAiEditPreview.stepCount} change{pendingAiEditPreview.stepCount === 1 ? "" : "s"} ready.
+                        {pendingAiEditPreview.skippedCount > 0
+                          ? ` ${pendingAiEditPreview.skippedCount} suggestion${pendingAiEditPreview.skippedCount === 1 ? "" : "s"} could not be matched.`
+                          : ""}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="rounded-full border border-ink/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-ink transition hover:border-ink/20 hover:bg-white"
+                        onClick={() => setPendingAiEditPreview(null)}
+                        type="button"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="rounded-full border border-ink bg-ink px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-ink/90"
+                        onClick={confirmAiEdits}
+                        type="button"
+                      >
+                        Apply changes
+                      </button>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                    <div className="rounded-[14px] border border-ink/10 bg-white px-3 py-2">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Find</div>
+                      <div className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-ink">
+                        {pendingAiEditPreview.firstStep.find}
+                      </div>
+                    </div>
+                    <div className="rounded-[14px] border border-ink/10 bg-white px-3 py-2">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Replace</div>
+                      <div className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-ink">
+                        {pendingAiEditPreview.firstStep.replace}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : null
+            }
+            onAddMediaToAi={addNoteMediaToAi}
             onSelectionChange={setSelectedText}
             onRequestEdit={enterEditMode}
             overlay={
               activeWindow === "ai" ? (
-                <div className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-center sm:p-4">
-                  <div className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[500px] sm:rounded-[4px]">
+                <div className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4">
+                  <div className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[600px] sm:rounded-[4px]">
                     <AIChatPanel
                       busy={thinking}
                       currentFolderFiles={aiCurrentFolderFiles}
                       currentFolderName={selectedFolderName}
-                      currentNoteBodyHtml={document.bodyHtml}
+                      currentNoteBodyMarkdown={document.bodyMarkdown}
                       currentNoteTitle={document.title}
                       messages={messages}
+                      onAddAttachmentToNote={addAiAttachmentToNote}
                       onApply={applyAiEdits}
                       onAsk={askAi}
                       onCreatePrompt={async (value) => {
@@ -1641,19 +1849,84 @@ function WorkspaceClientContent() {
                         return updated;
                       }}
                       onError={pushError}
+                      onPendingExternalAttachmentHandled={() => setPendingAiAttachment(null)}
+                      pendingExternalAttachment={pendingAiAttachment}
                       prompts={promptTemplates}
                       provider={settings.provider}
                       providerSettings={settings}
                       selectedText={selectedText}
+                      storedPanelHeight={loadAiPanelHeight()}
+                      onPanelHeightChange={saveAiPanelHeight}
                     />
                   </div>
                 </div>
               ) : null
             }
-            onBodyChange={(bodyHtml) => updateDocument({ bodyHtml })}
+            onBodyChange={(bodyMarkdown) => updateDocument({ bodyMarkdown })}
             onTitleChange={(title) => updateDocument({ title })}
             title={document.title}
-            topRight={null}
+            topRight={
+              isEditing ? (
+                <>
+                  <IconActionButton
+                    disabled={uploading}
+                    label="Upload and insert image"
+                    onClick={() => uploadAndInsertEditorAsset("image")}
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path
+                        d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5v-11Z"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.5"
+                      />
+                      <path
+                        d="M8 11.5a1.25 1.25 0 1 0 0-2.5a1.25 1.25 0 0 0 0 2.5Zm-3.5 5L9 11l3.5 4 2-2 4 3.5"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.5"
+                      />
+                    </svg>
+                  </IconActionButton>
+                  <IconActionButton
+                    disabled={uploading}
+                    label="Upload and insert audio"
+                    onClick={() => uploadAndInsertEditorAsset("audio")}
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                      <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                      <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                    </svg>
+                  </IconActionButton>
+                  <IconActionButton
+                    disabled={uploading}
+                    label="Upload and insert video"
+                    onClick={() => uploadAndInsertEditorAsset("video")}
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path
+                        d="M4 8.5A1.5 1.5 0 0 1 5.5 7h9A1.5 1.5 0 0 1 16 8.5v7A1.5 1.5 0 0 1 14.5 17h-9A1.5 1.5 0 0 1 4 15.5v-7Z"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.5"
+                      />
+                      <path d="M16 10l4-2v8l-4-2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
+                    </svg>
+                  </IconActionButton>
+                  <button
+                    className="rounded-full border border-ink bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
+                    onClick={exitEditMode}
+                    type="button"
+                  >
+                    Done
+                  </button>
+                </>
+              ) : null
+            }
           />
 
           <div className="fixed bottom-4 right-4 z-40 rounded-full bg-ink px-4 py-2 text-xs font-medium uppercase tracking-[0.18em] text-white shadow-[0_14px_32px_rgba(15,23,42,0.2)]">

@@ -13,7 +13,7 @@ import { providerDefaults } from "../../lib/providers/defaults";
 type DB = D1Database;
 
 const defaultGeminiLiveModel = "gemini-3.1-flash-live-preview";
-const defaultGeminiImageModel = "gemini-2.5-flash-image";
+const defaultGeminiImageModel = "gemini-3.1-flash-image-preview";
 const deprecatedGeminiLiveModels = new Set([
   "gemini-2.5-flash-native-audio-preview-12-2025",
   "gemini-live-2.5-flash-preview",
@@ -27,7 +27,7 @@ function mapDocument(row: Record<string, unknown>, assets: DocumentAsset[]): Doc
   return {
     id: String(row.id),
     title: String(row.title),
-    bodyHtml: String(row.body_html),
+    bodyMarkdown: String(row.body_html),
     folderId: row.folder_id ? String(row.folder_id) : null,
     revision: Number(row.revision),
     deviceId: String(row.device_id),
@@ -110,7 +110,7 @@ export async function listDocuments(db: DB, userId: string) {
 export async function createDocument(
   db: DB,
   userId: string,
-  payload: { title: string; bodyHtml: string; deviceId: string; folderId?: string | null },
+  payload: { title: string; bodyMarkdown: string; deviceId: string; folderId?: string | null },
 ) {
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -118,7 +118,7 @@ export async function createDocument(
     .prepare(
       "INSERT INTO documents (id, user_id, folder_id, title, body_html, revision, device_id, updated_at, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
-    .bind(id, userId, payload.folderId ?? null, payload.title, payload.bodyHtml, payload.deviceId, now, now)
+    .bind(id, userId, payload.folderId ?? null, payload.title, payload.bodyMarkdown, payload.deviceId, now, now)
     .run();
   return getDocument(db, id, userId);
 }
@@ -187,7 +187,7 @@ export async function syncDocument(
   db: DB,
   userId: string,
   id: string,
-  payload: { title: string; bodyHtml: string; baseRevision: number; deviceId: string },
+  payload: { title: string; bodyMarkdown: string; baseRevision: number; deviceId: string },
 ): Promise<SyncResult | null> {
   const current = await getDocument(db, id, userId);
   if (!current) return null;
@@ -204,7 +204,7 @@ export async function syncDocument(
   const now = new Date().toISOString();
   await db
     .prepare("UPDATE documents SET title = ?, body_html = ?, revision = ?, device_id = ?, updated_at = ? WHERE id = ? AND user_id = ?")
-    .bind(payload.title, payload.bodyHtml, nextRevision, payload.deviceId, now, id, userId)
+    .bind(payload.title, payload.bodyMarkdown, nextRevision, payload.deviceId, now, id, userId)
     .run();
   await db
     .prepare(

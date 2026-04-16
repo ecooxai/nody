@@ -64,7 +64,7 @@ export default {
         return json(await listDocuments(env.DB, userId));
       }
       if (request.method === "POST" && parts[0] === "documents" && parts.length === 1) {
-        const payload = await request.json() as { title: string; bodyHtml: string; deviceId: string; folderId?: string | null };
+        const payload = await request.json() as { title: string; bodyMarkdown: string; deviceId: string; folderId?: string | null };
         return json(await createDocument(env.DB, userId, payload), { status: 201 });
       }
       if (request.method === "GET" && parts[0] === "folders" && parts.length === 1) {
@@ -110,7 +110,7 @@ export default {
         return json(asset, { status: 201 });
       }
       if (request.method === "POST" && parts[0] === "documents" && parts[2] === "sync") {
-        const payload = await request.json() as { title: string; bodyHtml: string; baseRevision: number; deviceId: string };
+        const payload = await request.json() as { title: string; bodyMarkdown: string; baseRevision: number; deviceId: string };
         const result = await syncDocument(env.DB, userId, parts[1], payload);
         return result ? json(result, { status: result.conflict ? 409 : 200 }) : json({ error: "Not found" }, { status: 404 });
       }

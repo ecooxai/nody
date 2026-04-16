@@ -10,12 +10,67 @@ body {
   @apply bg-white text-ink font-body;
 }
 
-.prose .media-card {
-  @apply my-4 overflow-hidden rounded-[24px] border border-ink/10 bg-white p-3;
+.hide-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
 
-.prose .media-card img,
-.prose .media-card video,
-.prose .media-card audio {
-  @apply w-full rounded-2xl;
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.markdown-preview {
+  @apply text-[15px] leading-7 text-ink;
+}
+
+.markdown-preview > * + * {
+  @apply mt-[5px];
+}
+
+.markdown-preview h1 {
+  @apply font-display text-4xl leading-tight;
+}
+
+.markdown-preview h2 {
+  @apply font-display text-3xl leading-tight;
+}
+
+.markdown-preview p,
+.markdown-preview li,
+.markdown-preview blockquote {
+  @apply text-[15px] leading-7 text-ink;
+}
+
+.markdown-preview ul {
+  @apply ml-5 list-disc space-y-2;
+}
+
+.markdown-preview blockquote {
+  @apply rounded-[20px] border-l-4 border-ink/15 bg-mist/70 px-4 py-3;
+}
+
+.markdown-preview a {
+  @apply underline decoration-ink/30 underline-offset-4;
+}
+
+.markdown-preview code {
+  @apply rounded-md bg-black/[0.05] px-1.5 py-0.5 font-mono text-[0.95em];
+}
+
+.markdown-preview .note-embedded-media,
+.markdown-preview .markdown-inline-image {
+  @apply my-[5px] block;
+}
+
+.markdown-preview .note-embedded-image,
+.markdown-preview .markdown-inline-image {
+  @apply max-h-[200px] max-w-[200px] rounded-xl object-cover;
+}
+
+.markdown-preview .note-embedded-video {
+  @apply max-h-[200px] max-w-[200px] rounded-xl bg-black;
+}
+
+.markdown-preview .note-embedded-audio {
+  @apply max-w-[200px];
 }

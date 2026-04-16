@@ -93,8 +93,12 @@ export function ProviderSettingsForm({
               <input
                 className="rounded-2xl border border-ink/10 px-3 py-2"
                 onChange={(event) => setValue({ ...value, imageModel: event.target.value })}
+                placeholder="gemini-3.1-flash-image-preview"
                 value={value.imageModel}
               />
+              <span className="text-xs text-ink/55">
+                Gemini image generation is wired to this field. Examples: `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`.
+              </span>
             </label>
           </>
         ) : null}

@@ -1,4 +1,10 @@
-import type { AIRequest, AIRequestAttachment, AIResponse, ProviderSettings } from "../../shared/types";
+import type {
+  AIRequest,
+  AIRequestAttachment,
+  AIResponse,
+  AIResponseAttachment,
+  ProviderSettings,
+} from "../../shared/types";
 import { safeJsonParse } from "../../shared/substitutions";
 import type { Env } from "./env";
 
@@ -22,12 +28,28 @@ export async function askProvider(env: Env, userId: string, settings: ProviderSe
   if (!settings.apiKey) {
     throw new Error("Missing API key. Save provider settings first.");
   }
+  if (request.mode === "image") {
+    if (settings.provider !== "gemini") {
+      throw new Error("Image generation is currently supported only with the Gemini provider.");
+    }
+    return askGeminiImage(env, userId, settings, request);
+  }
   return settings.provider === "gemini" ? askGemini(env, userId, settings, request) : askOpenAI(settings, request);
 }
 
 export async function streamProvider(env: Env, userId: string, settings: ProviderSettings, request: AIRequest): Promise<Response> {
   if (!settings.apiKey) {
     throw new Error("Missing API key. Save provider settings first.");
+  }
+  if (request.mode === "image") {
+    const response = await askProvider(env, userId, settings, request);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`event: done\ndata: ${JSON.stringify(response)}\n\n`));
+        controller.close();
+      },
+    });
+    return new Response(stream, { headers: streamHeaders });
   }
 
   const upstream =
@@ -131,6 +153,54 @@ async function askGemini(env: Env, userId: string, settings: ProviderSettings, r
   return normalizeAiResponse(safeJsonParse<AIResponse>(text, { answer: "No answer", substitutions: [] }));
 }
 
+async function askGeminiImage(env: Env, userId: string, settings: ProviderSettings, request: AIRequest) {
+  const response = await fetch(buildGeminiImageUrl(settings), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(await buildGeminiImagePayload(env, userId, request)),
+  });
+  if (!response.ok) {
+    throw new Error(await readProviderError(response, "Gemini image generation failed"));
+  }
+  const data = await response.json() as {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{
+          text?: string;
+          inlineData?: { data?: string; mimeType?: string };
+        }>;
+      };
+    }>;
+  };
+  const parts = data.candidates?.[0]?.content?.parts ?? [];
+  const attachments = parts
+    .flatMap((part, index): AIResponseAttachment[] => {
+      const inlineData = part.inlineData;
+      if (!inlineData?.data) return [];
+      const mimeType = inlineData.mimeType?.trim() || "image/png";
+      if (!mimeType.startsWith("image/")) return [];
+      const extension = imageExtensionForMimeType(mimeType);
+      return [
+        {
+          kind: "image",
+          fileName: `generated-image-${index + 1}.${extension}`,
+          mimeType,
+          dataBase64: inlineData.data,
+        },
+      ];
+    });
+  const answer = parts
+    .map((part) => part.text?.trim() ?? "")
+    .filter(Boolean)
+    .join("\n\n");
+
+  return normalizeAiResponse({
+    answer: answer || (attachments.length > 0 ? "Generated image." : "No answer"),
+    substitutions: [],
+    attachments,
+  });
+}
+
 async function askGeminiStream(env: Env, userId: string, settings: ProviderSettings, request: AIRequest) {
   return fetch(buildGeminiUrl(settings, true), {
     method: "POST",
@@ -159,6 +229,22 @@ async function buildGeminiPayload(env: Env, userId: string, request: AIRequest) 
       temperature: 0.4,
       responseMimeType: "application/json",
     },
+  };
+}
+
+async function buildGeminiImagePayload(env: Env, userId: string, request: AIRequest) {
+  return {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: buildImagePromptText(request),
+          },
+          ...(await buildGeminiAttachmentParts(env, userId, request.attachments ?? [])),
+        ],
+      },
+    ],
   };
 }
 
@@ -328,6 +414,23 @@ function normalizeAiResponse(response: AIResponse): AIResponse {
             all: Boolean(edit.all),
           }))
       : [],
+    attachments: Array.isArray(response.attachments)
+      ? response.attachments
+          .filter(
+            (attachment) =>
+              typeof attachment?.dataBase64 === "string" &&
+              Boolean(attachment.dataBase64.trim()) &&
+              typeof attachment?.fileName === "string" &&
+              typeof attachment?.mimeType === "string" &&
+              attachment.kind === "image",
+          )
+          .map((attachment) => ({
+            kind: "image",
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType,
+            dataBase64: attachment.dataBase64,
+          }))
+      : [],
   };
 }
 
@@ -337,7 +440,17 @@ async function readProviderError(response: Response, fallback: string) {
 }
 
 function buildPromptText(request: AIRequest) {
-  return `Title: ${request.title}\n\nDocument HTML:\n${request.bodyHtml}\n\nSelection:\n${request.selection ?? ""}\n\nPrompt:\n${request.prompt}`;
+  return `Title: ${request.title}\n\nDocument Markdown:\n${request.bodyMarkdown}\n\nSelection:\n${request.selection ?? ""}\n\nPrompt:\n${request.prompt}`;
+}
+
+function buildImagePromptText(request: AIRequest) {
+  return [
+    request.prompt.trim(),
+    request.selection?.trim() ? `Selected note text:\n${request.selection.trim()}` : "",
+    request.title.trim() ? `Note title:\n${request.title.trim()}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function buildGeminiUrl(settings: ProviderSettings, stream = false) {
@@ -346,6 +459,20 @@ function buildGeminiUrl(settings: ProviderSettings, stream = false) {
   return stream
     ? `${base}/v1beta/models/${settings.model}:streamGenerateContent?alt=sse&key=${key}`
     : `${base}/v1beta/models/${settings.model}:generateContent?key=${key}`;
+}
+
+function buildGeminiImageUrl(settings: ProviderSettings) {
+  const base = settings.apiUrl.replace(/\/$/, "");
+  const key = encodeURIComponent(settings.apiKey);
+  const model = encodeURIComponent(settings.imageModel || "gemini-3.1-flash-image-preview");
+  return `${base}/v1beta/models/${model}:generateContent?key=${key}`;
+}
+
+function imageExtensionForMimeType(mimeType: string) {
+  if (mimeType.includes("png")) return "png";
+  if (mimeType.includes("webp")) return "webp";
+  if (mimeType.includes("gif")) return "gif";
+  return "jpg";
 }
 
 function extractMediaKey(url: string, userId: string) {

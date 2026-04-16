@@ -1,17 +1,13 @@
 import type { DocumentAsset } from "@/shared/types";
+import { escapeAttribute } from "@/lib/editor/markdown";
 
-function escapeAttribute(value: string) {
-  return value.replaceAll('"', "&quot;");
-}
-
-export function assetToMarkup(asset: DocumentAsset) {
+export function assetToMarkdown(asset: DocumentAsset) {
   const safeUrl = escapeAttribute(asset.url);
-  const safeName = escapeAttribute(asset.fileName);
   if (asset.kind === "image") {
-    return `<figure class="media-card"><img src="${safeUrl}" alt="${safeName}" /><figcaption>${safeName}</figcaption></figure>`;
+    return `<img class="note-embedded-media note-embedded-image" src="${safeUrl}" />`;
   }
   if (asset.kind === "audio") {
-    return `<figure class="media-card"><audio controls src="${safeUrl}"></audio><figcaption>${safeName}</figcaption></figure>`;
+    return `<audio class="note-embedded-media note-embedded-audio" controls src="${safeUrl}"></audio>`;
   }
-  return `<figure class="media-card"><video controls src="${safeUrl}"></video><figcaption>${safeName}</figcaption></figure>`;
+  return `<video class="note-embedded-media note-embedded-video" controls src="${safeUrl}"></video>`;
 }

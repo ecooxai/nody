@@ -13,7 +13,7 @@ import type {
 
 type AIStreamHandlers = {
   onDelta: (delta: string) => void;
-  onDone: (response: AIResponse) => void;
+  onDone: (response: AIResponse) => Promise<void> | void;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -74,7 +74,7 @@ export const apiClient = {
       body: JSON.stringify(payload),
     }),
   listDocuments: () => request<DocumentRecord[]>("/documents"),
-  createDocument: (payload: Pick<DocumentRecord, "title" | "bodyHtml" | "deviceId" | "folderId">) =>
+  createDocument: (payload: Pick<DocumentRecord, "title" | "bodyMarkdown" | "deviceId" | "folderId">) =>
     request<DocumentRecord>("/documents", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -108,6 +108,12 @@ export const apiClient = {
   saveSettings: (payload: ProviderSettings) =>
     request<ProviderSettings>("/settings", {
       method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  askAi: (payload: AIRequest) =>
+    request<AIResponse>("/ai/ask", {
+      method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     }),
@@ -159,7 +165,7 @@ export const apiClient = {
         }
         if (event === "done") {
           donePayload = JSON.parse(data) as AIResponse;
-          handlers.onDone(donePayload);
+          await handlers.onDone(donePayload);
           continue;
         }
         if (event === "error") {
