@@ -38,7 +38,7 @@ describe("markdownToHtml", () => {
 
   it("renders blank markdown lines as visible line breaks in view mode", () => {
     expect(markdownToHtml("First line\n\nSecond line\n\n\nThird line")).toBe(
-      "<p>First line</p>\n<br />\n<br />\n<p>Second line</p>\n<br />\n<br />\n<br />\n<p>Third line</p>",
+      "<p>First line</p>\n<br />\n<p>Second line</p>\n<br />\n<br />\n<p>Third line</p>",
     );
   });
 });

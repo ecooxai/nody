@@ -183,7 +183,7 @@ function renderBlock(block: string) {
 }
 
 function renderNewlineSeparator(separator: string) {
-  return Array.from({ length: separator.length }, () => "<br />").join("\n");
+  return Array.from({ length: Math.max(separator.length - 1, 0) }, () => "<br />").join("\n");
 }
 
 export function markdownToHtml(value: string) {
