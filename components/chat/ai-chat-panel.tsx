@@ -295,6 +295,7 @@ export function AIChatPanel({
   selectedText,
   storedPanelHeight,
   onPanelHeightChange,
+  onUploadImageToCurrentFolder,
 }: {
   messages: AIMessage[];
   busy: boolean;
@@ -322,7 +323,11 @@ export function AIChatPanel({
   selectedText?: string;
   storedPanelHeight?: number | null;
   onPanelHeightChange?: (height: number) => void;
+  onUploadImageToCurrentFolder: (attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<void>;
 }) {
+  const supportsMedia = provider === "gemini";
+  const supportsLive = provider === "gemini" && Boolean(providerSettings.apiKey) && Boolean(providerSettings.liveModel || providerSettings.model);
+  const availablePrompts = [...builtInPrompts, ...prompts];
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
   const [previewAttachment, setPreviewAttachment] = useState<PreviewAttachment | null>(null);
@@ -344,7 +349,8 @@ export function AIChatPanel({
   const [preparingRecording, setPreparingRecording] = useState(false);
   const [cameraPreparing, setCameraPreparing] = useState(false);
   const [cameraRecording, setCameraRecording] = useState(false);
-  const [activeTab, setActiveTab] = useState<"chat" | "live">("chat");
+  const [activeTab, setActiveTab] = useState<"chat" | "live">(() => (supportsLive ? "live" : "chat"));
+  const [liveConnectionRequested, setLiveConnectionRequested] = useState(() => supportsLive);
   const [liveSessionState, setLiveSessionState] = useState<LiveSessionState>({
     connecting: false,
     ready: false,
@@ -387,9 +393,6 @@ export function AIChatPanel({
   const resizePointerIdRef = useRef<number | null>(null);
   const resizeStartYRef = useRef(0);
   const resizeStartHeightRef = useRef(460);
-  const supportsMedia = provider === "gemini";
-  const supportsLive = provider === "gemini" && Boolean(providerSettings.apiKey) && Boolean(providerSettings.liveModel || providerSettings.model);
-  const availablePrompts = [...builtInPrompts, ...prompts];
   const latestAssistantMessageId = [...messages].reverse().find((message) => message.role === "assistant")?.id ?? null;
 
   useEffect(() => {
@@ -882,31 +885,15 @@ export function AIChatPanel({
 
   const handleComposerSubmit = async () => {
     if (activeTab === "live") {
-      const mode: AIRequestMode =
-        provider === "gemini" && providerSettings.imageModel.trim() && shouldUseImageGeneration(prompt, selectedPrompts, attachments)
-          ? "image"
-          : "chat";
-      if (mode === "image") {
-        setActiveTab("chat");
-        await submitPrompt(attachments, [], { mode });
-        return;
-      }
-
-      const supportedLiveAttachments = attachments.filter((attachment) => attachment.kind === "image" || attachment.kind === "video");
+      const supportedLiveAttachments = attachments.filter(
+        (attachment) => attachment.kind === "image" || attachment.kind === "video" || attachment.kind === "audio",
+      );
       const summaryText = composeLivePrompt(prompt, selectedPrompts, attachments);
 
       if (!summaryText && supportedLiveAttachments.length === 0) return;
       if (!liveSendHandle) {
         onError(liveSessionState.status);
         return;
-      }
-
-      if (summaryText) {
-        const sent = liveSendHandle.sendText(summaryText);
-        if (!sent) {
-          onError(liveSessionState.status);
-          return;
-        }
       }
 
       try {
@@ -920,6 +907,13 @@ export function AIChatPanel({
           } satisfies LiveSendAttachment);
           if (!sent) {
             onError(`Couldn't send ${attachment.fileName} to live talk.`);
+            return;
+          }
+        }
+        if (summaryText) {
+          const sent = liveSendHandle.sendText(summaryText);
+          if (!sent) {
+            onError(liveSessionState.status);
             return;
           }
         }
@@ -1037,14 +1031,14 @@ export function AIChatPanel({
   const renderGeneratedImageCard = (attachment: AIMessageAttachment) => (
     <div className="group relative overflow-hidden rounded-[16px] border border-ink/10 bg-white shadow-[0_12px_28px_rgba(15,23,42,0.08)]" key={attachment.id}>
       <button
-        className="block w-full bg-[#f7f1e6]"
+        className="flex w-full items-center justify-center bg-[#f7f1e6] p-3"
         onClick={() => {
           const preview = toPreviewAttachment(attachment);
           if (preview) setPreviewAttachment(preview);
         }}
         type="button"
       >
-        <img alt={attachment.fileName} className="h-[150px] w-full object-cover" src={attachment.url} />
+        <img alt={attachment.fileName} className="max-h-[220px] w-auto max-w-full object-contain" src={attachment.url} />
       </button>
       <div className="flex items-center justify-between gap-2 px-3 py-2">
         <div className="min-w-0">
@@ -1488,28 +1482,43 @@ export function AIChatPanel({
               </button>
             </div>
         </div>
-        <button
-          className="flex h-9 w-11 cursor-ns-resize touch-none items-center justify-center rounded-full bg-white text-ink/45 transition hover:bg-mist"
-          onPointerDown={(event) => {
-            resizePointerIdRef.current = event.pointerId;
-            resizeStartYRef.current = event.clientY;
-            resizeStartHeightRef.current = panelHeight;
-            event.currentTarget.setPointerCapture(event.pointerId);
-          }}
-          title="Resize panel"
-          type="button"
-        >
-          <svg aria-hidden="true" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24">
-            <path
-              d="M12 4V20M8.5 7.5L12 4l3.5 3.5M8.5 16.5L12 20l3.5-3.5"
-              stroke="currentColor"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="1.7"
-            />
-            <path d="M7 12H17" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
-          </svg>
-        </button>
+        <div className="flex items-center gap-2">
+          {activeTab === "live" && supportsLive ? (
+            <button
+              className={`rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] transition ${
+                liveConnectionRequested
+                  ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78] hover:border-[#1f6f78]/80 hover:bg-[#d8eef1]"
+                  : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
+              }`}
+              onClick={() => setLiveConnectionRequested((current) => !current)}
+              type="button"
+            >
+              {liveConnectionRequested ? "Disconnect" : "Connect"}
+            </button>
+          ) : null}
+          <button
+            className="flex h-9 w-11 cursor-ns-resize touch-none items-center justify-center rounded-full bg-white text-ink/45 transition hover:bg-mist"
+            onPointerDown={(event) => {
+              resizePointerIdRef.current = event.pointerId;
+              resizeStartYRef.current = event.clientY;
+              resizeStartHeightRef.current = panelHeight;
+              event.currentTarget.setPointerCapture(event.pointerId);
+            }}
+            title="Resize panel"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24">
+              <path
+                d="M12 4V20M8.5 7.5L12 4l3.5 3.5M8.5 16.5L12 20l3.5-3.5"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.7"
+              />
+              <path d="M7 12H17" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {provider === "gemini" ? (
@@ -2179,7 +2188,7 @@ export function AIChatPanel({
 
       <div className="mt-4 min-h-0 flex-1">
         <div
-          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 pb-3 pl-3 pr-0 pt-3"
+          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 pb-0 pl-3 pr-0 pt-3"
           hidden={activeTab !== "chat"}
           onClick={() => {
             if (!promptExpanded) {
@@ -2204,7 +2213,7 @@ export function AIChatPanel({
                   className={`max-w-[92%] rounded-[4px] px-3 py-2 text-sm ${message.role === "assistant" ? "bg-white" : "self-end bg-ink text-white"}`}
                   key={message.id}
                   ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
-                  style={message.role === "user" ? { minWidth: "min(300px, 92%)" } : undefined}
+                  style={message.role === "user" ? { minWidth: "min(400px, 92%)" } : undefined}
                 >
                   {message.prompts?.length || compactAttachments.length ? (
                     <div className="flex gap-2 overflow-x-auto overscroll-contain pb-1">
@@ -2280,30 +2289,29 @@ export function AIChatPanel({
                     {message.content}
                   </div>
                   {message.role === "assistant" && edits.length > 0 ? (
-                    <div className="mt-3 flex justify-end">
-                      <button
-                        aria-label="Preview AI edits"
-                        className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-mist text-ink transition hover:border-ink/25 hover:bg-[#efe5d3]"
-                        onClick={() => onApply(edits)}
-                        title="Preview AI edits"
-                        type="button"
-                      >
-                        <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                          <path
-                            d="M7 12.5l3.2 3.2L17 9"
-                            stroke="currentColor"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth="1.8"
-                          />
-                        </svg>
-                      </button>
+                    <div className="mt-3 grid gap-2">
+                      {edits.map((edit, index) => (
+                        <div className="rounded-[14px] border border-ink/10 bg-[#fff7e8] px-3 py-3" key={`${message.id}:edit:${index}`}>
+                          <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Suggested replace</div>
+                          <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#8c5c54] line-through">{edit.find}</div>
+                          <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#1f6f78]">{edit.replace}</div>
+                        </div>
+                      ))}
+                      <div className="flex justify-end">
+                        <button
+                          className="rounded-full border border-ink/10 bg-mist px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/25 hover:bg-[#efe5d3]"
+                          onClick={() => onApply(edits)}
+                          type="button"
+                        >
+                          Review in editor
+                        </button>
+                      </div>
                     </div>
                   ) : null}
                 </div>
               );
             })}
-            <div aria-hidden="true" className="shrink-0" style={{ height: Math.max(panelHeight * 0.45, 120) }} />
+            <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 300 }} />
           </div>
         </div>
 
@@ -2315,11 +2323,14 @@ export function AIChatPanel({
             microphoneDeviceId={selectedMicrophoneId}
             microphoneEnabled={liveMicrophoneEnabled}
             onError={onError}
+            onApplyEdits={onApply}
             onRegisterSend={setLiveSendHandle}
             onRegisterVideoControls={setLiveVideoControls}
             onSessionStateChange={setLiveSessionState}
             onVideoShareStateChange={handleLiveVideoShareStateChange}
+            onUploadImageToCurrentFolder={onUploadImageToCurrentFolder}
             providerSettings={providerSettings}
+            sessionRequested={supportsLive && liveConnectionRequested}
           />
         </div>
       </div>
@@ -2351,6 +2362,17 @@ export function AIChatPanel({
                 <audio autoPlay className="w-full" controls src={previewAttachment.previewUrl} />
               )}
             </div>
+            {previewAttachment.kind === "image" ? (
+              <div className="mt-3 flex justify-end">
+                <button
+                  className="rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                  onClick={() => void onUploadImageToCurrentFolder(previewAttachment)}
+                  type="button"
+                >
+                  Upload to folder
+                </button>
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

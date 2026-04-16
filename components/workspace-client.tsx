@@ -352,9 +352,11 @@ function WorkspaceClientContent() {
   const [selectedText, setSelectedText] = useState("");
   const [recentOpen, setRecentOpen] = useState(true);
   const [showAllRecent, setShowAllRecent] = useState(false);
+  const [editButtonVisible, setEditButtonVisible] = useState(false);
   const previewFrameRef = useRef<HTMLDivElement>(null);
   const folderCreateInputRef = useRef<HTMLInputElement>(null);
   const copyResetTimerRef = useRef<number | null>(null);
+  const editButtonTimerRef = useRef<number | null>(null);
   const idleTimerRef = useRef<number | null>(null);
   const wasIdleRef = useRef(false);
   const syncInFlightRef = useRef(false);
@@ -536,6 +538,7 @@ function WorkspaceClientContent() {
     documentStateRef.current = next;
     setDocument(next);
     setIsEditing(false);
+    setEditButtonVisible(false);
     setPendingAiEditPreview(null);
     setSelectedFolderId(next.folderId);
     setSelectedFolderAsset(null);
@@ -551,6 +554,11 @@ function WorkspaceClientContent() {
   };
 
   const enterEditMode = () => {
+    if (editButtonTimerRef.current) {
+      window.clearTimeout(editButtonTimerRef.current);
+      editButtonTimerRef.current = null;
+    }
+    setEditButtonVisible(false);
     setIsEditing(true);
   };
 
@@ -567,6 +575,28 @@ function WorkspaceClientContent() {
     }
     editorRef.current?.runCommand(command);
   };
+
+  const revealEditButton = () => {
+    if (isEditing) return;
+    setEditButtonVisible(true);
+    if (editButtonTimerRef.current) {
+      window.clearTimeout(editButtonTimerRef.current);
+    }
+    editButtonTimerRef.current = window.setTimeout(() => {
+      setEditButtonVisible(false);
+      editButtonTimerRef.current = null;
+    }, 3000);
+  };
+
+  useEffect(
+    () => () => {
+      if (editButtonTimerRef.current) {
+        window.clearTimeout(editButtonTimerRef.current);
+        editButtonTimerRef.current = null;
+      }
+    },
+    [],
+  );
 
   refreshDocumentsFromServerRef.current = async (statusWhenFresh = "Live") => {
     if (syncInFlightRef.current) return;
@@ -848,6 +878,23 @@ function WorkspaceClientContent() {
       return null;
     } finally {
       setUploading(false);
+    }
+  };
+
+  const uploadAiImageToCurrentFolder = async (attachment: { fileName: string; mimeType: string; previewUrl: string }) => {
+    try {
+      const response = await fetch(attachment.previewUrl);
+      if (!response.ok) {
+        throw new Error(`Failed to load ${attachment.fileName}.`);
+      }
+      const blob = await response.blob();
+      const file = new File([blob], attachment.fileName, {
+        type: attachment.mimeType || blob.type || "image/png",
+        lastModified: Date.now(),
+      });
+      await uploadFolderAsset(selectedFolderId, file);
+    } catch (error) {
+      pushError(error instanceof Error ? error.message : "Failed to upload image to the current folder");
     }
   };
 
@@ -1290,6 +1337,26 @@ function WorkspaceClientContent() {
                   )}
                 </MenuTriggerButton>
                 <div className="ml-auto flex items-center gap-2">
+                  {!isEditing && editButtonVisible ? (
+                    <button
+                      aria-label="Edit note"
+                      className="flex h-10 w-10 items-center justify-center rounded-full border border-ink bg-ink text-white transition hover:bg-ink/90"
+                      onClick={enterEditMode}
+                      title="Edit note"
+                      type="button"
+                    >
+                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <path
+                          d="M4 20h4l10-10-4-4L4 16v4Z"
+                          stroke="currentColor"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="1.7"
+                        />
+                        <path d="m12.5 7.5 4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+                      </svg>
+                    </button>
+                  ) : null}
                   <div className="hidden rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60 sm:block">{selectedFolderName}</div>
                   {clerkClientConfigured ? <UserButton /> : <div className="rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60">Local mode</div>}
                 </div>
@@ -1777,6 +1844,8 @@ function WorkspaceClientContent() {
                     <div className="min-w-0 flex-1">
                       <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">AI edit preview</div>
                       <div className="mt-1 text-sm text-ink">
+                        Review the proposed replace edit in the note editor, then apply it.
+                        {" "}
                         {pendingAiEditPreview.stepCount} change{pendingAiEditPreview.stepCount === 1 ? "" : "s"} ready.
                         {pendingAiEditPreview.skippedCount > 0
                           ? ` ${pendingAiEditPreview.skippedCount} suggestion${pendingAiEditPreview.skippedCount === 1 ? "" : "s"} could not be matched.`
@@ -1800,18 +1869,13 @@ function WorkspaceClientContent() {
                       </button>
                     </div>
                   </div>
-                  <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                    <div className="rounded-[14px] border border-ink/10 bg-white px-3 py-2">
-                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Find</div>
-                      <div className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-ink">
-                        {pendingAiEditPreview.firstStep.find}
-                      </div>
+                  <div className="mt-3 rounded-[14px] border border-ink/10 bg-white px-3 py-3">
+                    <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Replace preview</div>
+                    <div className="mt-2 whitespace-pre-wrap break-words font-mono text-xs text-[#8c5c54] line-through">
+                      {pendingAiEditPreview.firstStep.find}
                     </div>
-                    <div className="rounded-[14px] border border-ink/10 bg-white px-3 py-2">
-                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Replace</div>
-                      <div className="mt-1 whitespace-pre-wrap break-words font-mono text-xs text-ink">
-                        {pendingAiEditPreview.firstStep.replace}
-                      </div>
+                    <div className="mt-2 whitespace-pre-wrap break-words font-mono text-xs text-[#1f6f78]">
+                      {pendingAiEditPreview.firstStep.replace}
                     </div>
                   </div>
                 </div>
@@ -1820,6 +1884,7 @@ function WorkspaceClientContent() {
             onAddMediaToAi={addNoteMediaToAi}
             onSelectionChange={setSelectedText}
             onRequestEdit={enterEditMode}
+            onRevealEditButton={revealEditButton}
             overlay={
               activeWindow === "ai" ? (
                 <div className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4">
@@ -1857,6 +1922,7 @@ function WorkspaceClientContent() {
                       selectedText={selectedText}
                       storedPanelHeight={loadAiPanelHeight()}
                       onPanelHeightChange={saveAiPanelHeight}
+                      onUploadImageToCurrentFolder={uploadAiImageToCurrentFolder}
                     />
                   </div>
                 </div>

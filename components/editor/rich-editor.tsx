@@ -4,6 +4,7 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -31,6 +32,7 @@ type RichEditorProps = {
   onBodyChange: (value: string) => void;
   onSelectionChange?: (selectedText: string) => void;
   onRequestEdit?: () => void;
+  onRevealEditButton?: () => void;
   onAddMediaToAi?: (media: {
     id: string;
     kind: AIMediaKind;
@@ -122,29 +124,101 @@ type EmbeddedMedia = {
 };
 
 type MediaTagPreview = {
+  endIndex: number;
   kind: "image" | "video";
+  matchIndex: number;
   tagText: string;
   src: string;
 };
+
+const EDITOR_PREVIEW_VERTICAL_GAP_PX = 8;
+const EDITOR_PREVIEW_SIZE_PX = 200;
 
 function extractMediaTagPreviews(value: string) {
   const previews: MediaTagPreview[] = [];
   const tagPattern = /<(img|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/video>)/gi;
 
   for (const match of value.matchAll(tagPattern)) {
-    const rawTag = match[0]?.trim() ?? "";
+    const rawTag = match[0] ?? "";
+    const tagText = rawTag.trim();
     const srcMatch = rawTag.match(/\ssrc=(?:"([^"]+)"|'([^']+)')/i);
     const src = srcMatch?.[1] || srcMatch?.[2] || "";
-    const kind = rawTag.startsWith("<video") ? "video" : "image";
+    const kind = /^<video\b/i.test(rawTag) ? "video" : "image";
     if (!src) continue;
+    const matchIndex = match.index ?? 0;
     previews.push({
+      endIndex: matchIndex + rawTag.length,
       kind,
-      tagText: rawTag,
+      matchIndex,
+      tagText,
       src,
     });
   }
 
   return previews;
+}
+
+function measureMediaPreviewTops(textarea: HTMLTextAreaElement, value: string, previews: MediaTagPreview[]) {
+  const computed = window.getComputedStyle(textarea);
+  const mirror = document.createElement("div");
+  const markers: Array<{ matchIndex: number; element: HTMLSpanElement }> = [];
+
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.pointerEvents = "none";
+  mirror.style.left = "-9999px";
+  mirror.style.top = "0";
+  mirror.style.width = `${textarea.clientWidth}px`;
+  mirror.style.boxSizing = computed.boxSizing;
+  mirror.style.paddingTop = computed.paddingTop;
+  mirror.style.paddingRight = computed.paddingRight;
+  mirror.style.paddingBottom = computed.paddingBottom;
+  mirror.style.paddingLeft = computed.paddingLeft;
+  mirror.style.borderTopWidth = computed.borderTopWidth;
+  mirror.style.borderRightWidth = computed.borderRightWidth;
+  mirror.style.borderBottomWidth = computed.borderBottomWidth;
+  mirror.style.borderLeftWidth = computed.borderLeftWidth;
+  mirror.style.fontFamily = computed.fontFamily;
+  mirror.style.fontSize = computed.fontSize;
+  mirror.style.fontStyle = computed.fontStyle;
+  mirror.style.fontVariant = computed.fontVariant;
+  mirror.style.fontWeight = computed.fontWeight;
+  mirror.style.letterSpacing = computed.letterSpacing;
+  mirror.style.lineHeight = computed.lineHeight;
+  mirror.style.textAlign = computed.textAlign;
+  mirror.style.textIndent = computed.textIndent;
+  mirror.style.textTransform = computed.textTransform;
+  mirror.style.whiteSpace = "pre-wrap";
+  mirror.style.overflowWrap = "break-word";
+  mirror.style.wordBreak = computed.wordBreak;
+  mirror.style.wordSpacing = computed.wordSpacing;
+  mirror.style.tabSize = computed.tabSize;
+
+  let cursor = 0;
+  for (const preview of previews) {
+    mirror.appendChild(document.createTextNode(value.slice(cursor, preview.matchIndex)));
+    const marker = document.createElement("span");
+    marker.textContent = "\u200b";
+    mirror.appendChild(marker);
+    markers.push({ matchIndex: preview.matchIndex, element: marker });
+    cursor = preview.matchIndex;
+  }
+  mirror.appendChild(document.createTextNode(value.slice(cursor)));
+
+  document.body.appendChild(mirror);
+  const slotsByLine = new Map<number, number>();
+  const tops: Record<number, number> = {};
+
+  for (const marker of markers) {
+    const top = marker.element.offsetTop;
+    const lineKey = Math.round(top / (Number.parseFloat(computed.lineHeight || "28") || 28));
+    const slot = slotsByLine.get(lineKey) ?? 0;
+    slotsByLine.set(lineKey, slot + 1);
+    tops[marker.matchIndex] = top + slot * (EDITOR_PREVIEW_SIZE_PX + EDITOR_PREVIEW_VERTICAL_GAP_PX);
+  }
+
+  mirror.remove();
+  return tops;
 }
 
 function fileNameFromUrl(url: string) {
@@ -210,6 +284,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   onBodyChange,
   onSelectionChange,
   onRequestEdit,
+  onRevealEditButton,
   onAddMediaToAi,
   inlineNotice,
   overlay,
@@ -219,25 +294,18 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
-  const editButtonTimerRef = useRef<number | null>(null);
   const activeMediaHideTimerRef = useRef<number | null>(null);
   const lineTapRef = useRef<{ key: string | null; count: number; startedAt: number }>({
     key: null,
     count: 0,
     startedAt: 0,
   });
-  const [editButtonVisible, setEditButtonVisible] = useState(false);
   const [activeMedia, setActiveMedia] = useState<(EmbeddedMedia & { x: number; y: number }) | null>(null);
+  const [textareaScrollTop, setTextareaScrollTop] = useState(0);
+  const [mediaPreviewTops, setMediaPreviewTops] = useState<Record<number, number>>({});
   const [viewerMedia, setViewerMedia] = useState<EmbeddedMedia | null>(null);
   const previewHtml = useMemo(() => markdownToHtml(bodyMarkdown), [bodyMarkdown]);
   const mediaTagPreviews = useMemo(() => extractMediaTagPreviews(bodyMarkdown), [bodyMarkdown]);
-
-  const clearEditButtonTimer = () => {
-    if (editButtonTimerRef.current) {
-      window.clearTimeout(editButtonTimerRef.current);
-      editButtonTimerRef.current = null;
-    }
-  };
 
   const clearActiveMediaHideTimer = () => {
     if (activeMediaHideTimerRef.current) {
@@ -256,17 +324,11 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
 
   const revealEditButton = () => {
     if (editable || typeof window === "undefined") return;
-    setEditButtonVisible(true);
-    clearEditButtonTimer();
-    editButtonTimerRef.current = window.setTimeout(() => {
-      setEditButtonVisible(false);
-      editButtonTimerRef.current = null;
-    }, 3000);
+    onRevealEditButton?.();
   };
 
   useEffect(
     () => () => {
-      clearEditButtonTimer();
       clearActiveMediaHideTimer();
     },
     [],
@@ -277,13 +339,37 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       selectionRef.current = { start: 0, end: 0 };
       return;
     }
-    setEditButtonVisible(false);
     clearActiveMediaHideTimer();
     setActiveMedia(null);
     window.requestAnimationFrame(() => {
-      textareaRef.current?.focus();
+      const textarea = textareaRef.current;
+      textarea?.focus();
+      setTextareaScrollTop(textarea?.scrollTop ?? 0);
     });
   }, [editable]);
+
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (!editable || !textarea || mediaTagPreviews.length === 0) {
+      setMediaPreviewTops({});
+      return;
+    }
+
+    const updatePreviewTops = () => {
+      setMediaPreviewTops(measureMediaPreviewTops(textarea, bodyMarkdown, mediaTagPreviews));
+      setTextareaScrollTop(textarea.scrollTop);
+    };
+
+    updatePreviewTops();
+    const resizeObserver = new ResizeObserver(updatePreviewTops);
+    resizeObserver.observe(textarea);
+    window.addEventListener("resize", updatePreviewTops);
+
+    return () => {
+      resizeObserver.disconnect();
+      window.removeEventListener("resize", updatePreviewTops);
+    };
+  }, [bodyMarkdown, editable, mediaTagPreviews]);
 
   useEffect(() => {
     if (!activeMedia) return;
@@ -354,6 +440,21 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     });
   };
 
+  const updateMediaTagText = (preview: MediaTagPreview, nextTagText: string) => {
+    const nextValue = `${bodyMarkdown.slice(0, preview.matchIndex)}${nextTagText}${bodyMarkdown.slice(preview.endIndex)}`;
+    const caret = preview.matchIndex + nextTagText.length;
+    onBodyChange(nextValue);
+    selectionRef.current = { start: caret, end: caret };
+  };
+
+  const syncMediaTagSelection = (preview: MediaTagPreview, target: HTMLTextAreaElement) => {
+    selectionRef.current = {
+      start: preview.matchIndex + (target.selectionStart ?? 0),
+      end: preview.matchIndex + (target.selectionEnd ?? 0),
+    };
+    onSelectionChange?.(target.value.slice(target.selectionStart ?? 0, target.selectionEnd ?? 0).trim());
+  };
+
   const focusTextareaRange = (start: number, end: number) => {
     const textarea = textareaRef.current;
     if (!textarea) return;
@@ -363,7 +464,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     const linesBefore = textarea.value.slice(0, clampedStart).split("\n").length - 1;
     textarea.focus();
     textarea.setSelectionRange(clampedStart, clampedEnd);
-    textarea.scrollTop = Math.max(linesBefore * lineHeight - lineHeight * 2, 0);
+    textarea.scrollTop = Math.max(linesBefore * lineHeight, 0);
+    setTextareaScrollTop(textarea.scrollTop);
   };
 
   const handlePreviewClick = (event: ReactMouseEvent<HTMLElement>) => {
@@ -474,12 +576,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       <section className="overflow-visible bg-transparent">
         <div className="flex items-start justify-between gap-3 px-[5px] py-[5px]">
           <div className="min-w-0 flex-1">
-            <div className="text-[10px] font-semibold uppercase tracking-[0.24em] text-ink/45">
-              {editable ? "Markdown editor" : "Rendered note"}
-            </div>
             {editable ? (
               <input
-                className="mt-2 w-full bg-transparent font-display text-3xl text-ink outline-none sm:text-4xl"
+                className="w-full bg-transparent font-display text-3xl text-ink outline-none sm:text-4xl"
                 onChange={(event) => onTitleChange(event.target.value)}
                 placeholder="Untitled note"
                 ref={titleInputRef}
@@ -487,7 +586,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               />
             ) : (
               <button
-                className="mt-2 block w-full truncate bg-transparent text-left font-display text-3xl text-ink outline-none sm:text-4xl"
+                className="block w-full truncate bg-transparent text-left font-display text-3xl text-ink outline-none sm:text-4xl"
                 onClick={handlePreviewClick}
                 type="button"
               >
@@ -495,7 +594,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               </button>
             )}
           </div>
-          <div className="flex shrink-0 items-center gap-2">{topRight}</div>
+          <div className="flex shrink-0 items-center gap-2">
+            {topRight}
+          </div>
         </div>
 
         {overlay ? <div className="bg-[#fffbf3]">{overlay}</div> : null}
@@ -504,29 +605,46 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         <div className="px-[5px] py-[5px]">
           {editable ? (
             <div className="grid gap-3">
-              <div className={`grid gap-3 ${mediaTagPreviews.length > 0 ? "lg:grid-cols-[minmax(0,1fr)_minmax(220px,30%)]" : ""}`}>
+              <div className="relative">
                 <textarea
-                  className="min-h-[34rem] w-full resize-none bg-transparent px-[5px] py-[5px] font-mono text-[15px] leading-7 text-ink outline-none"
+                  className="min-h-[34rem] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
                   onChange={(event) => onBodyChange(event.target.value)}
                   onKeyUp={syncTextareaSelection}
                   onMouseUp={syncTextareaSelection}
+                  onScroll={(event) => setTextareaScrollTop(event.currentTarget.scrollTop)}
                   onSelect={syncTextareaSelection}
                   placeholder="Write in markdown..."
                   ref={textareaRef}
                   value={bodyMarkdown}
                 />
                 {mediaTagPreviews.length > 0 ? (
-                  <div className="grid content-start gap-3">
+                  <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-label="Media tag previews">
                     {mediaTagPreviews.map((preview) => (
-                      <div className="flex items-start justify-between gap-3 rounded-[16px] border border-ink/10 bg-white/80 p-3" key={`${preview.kind}:${preview.src}:${preview.tagText}`}>
-                        <code className="w-1/2 break-all font-mono text-[11px] leading-5 text-ink/70">{preview.tagText}</code>
-                        <div className="w-[30%] min-w-[90px] overflow-hidden rounded-[12px] border border-ink/10 bg-mist/60">
+                      <div
+                        className="pointer-events-auto absolute left-[5px] right-[5px] grid min-h-[200px] grid-cols-[200px_minmax(0,1fr)] items-start gap-3 bg-[#fffbf4]"
+                        key={`${preview.kind}:${preview.src}:${preview.matchIndex}`}
+                        style={{
+                          top: (mediaPreviewTops[preview.matchIndex] ?? 0) - textareaScrollTop,
+                        }}
+                        title={preview.tagText}
+                      >
+                        <div className="flex h-[200px] w-[200px] items-start justify-start overflow-hidden">
                           {preview.kind === "image" ? (
-                            <img alt="" className="h-20 w-full object-cover" src={preview.src} />
+                            <img alt="" className="max-h-[200px] max-w-[200px] rounded-xl object-cover" src={preview.src} />
                           ) : (
-                            <video className="h-20 w-full object-cover" controls muted playsInline src={preview.src} />
+                            <video className="max-h-[200px] max-w-[200px] rounded-xl bg-black" controls muted playsInline src={preview.src} />
                           )}
                         </div>
+                        <textarea
+                          aria-label="Media tag"
+                          className="min-h-[200px] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                          onChange={(event) => updateMediaTagText(preview, event.target.value)}
+                          onKeyUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                          onMouseUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                          onSelect={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                          spellCheck={false}
+                          value={preview.tagText}
+                        />
                       </div>
                     ))}
                   </div>
@@ -589,15 +707,6 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
           )}
         </div>
       </section>
-      {!editable && editButtonVisible ? (
-        <button
-          className="fixed right-4 top-4 z-40 rounded-full border border-ink bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
-          onClick={() => onRequestEdit?.()}
-          type="button"
-        >
-          Edit
-        </button>
-      ) : null}
       {viewerMedia ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="relative max-h-[90vh] w-full max-w-5xl overflow-hidden rounded-[20px] bg-[#fffdf8] p-4">

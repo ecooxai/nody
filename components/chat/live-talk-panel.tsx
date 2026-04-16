@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { apiClient } from "@/lib/api/client";
 import { stripMarkdown } from "@/lib/editor/markdown";
-import type { AIMediaKind, ProviderSettings } from "@/shared/types";
+import type { AIMediaKind, ProviderSettings, TextSubstitution } from "@/shared/types";
 
 type LiveGeneratedImage = {
   id: string;
@@ -20,6 +20,8 @@ type LiveTurn = {
   content: string;
   audioUrl?: string;
   images?: LiveGeneratedImage[];
+  substitutions?: TextSubstitution[];
+  videoStream?: MediaStream | null;
 };
 
 type LiveMessage =
@@ -97,6 +99,29 @@ type LiveImageContext = {
   source: "upload" | "folder";
   dataBase64: string;
 };
+
+function LiveStreamPreview({
+  className,
+  stream,
+}: {
+  className?: string;
+  stream: MediaStream;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    const element = videoRef.current;
+    if (!element) return;
+    element.srcObject = stream;
+    void element.play().catch(() => undefined);
+    return () => {
+      element.pause();
+      element.srcObject = null;
+    };
+  }, [stream]);
+
+  return <video autoPlay className={className} muted playsInline ref={videoRef} />;
+}
 
 function base64ToUint8Array(base64: string) {
   const binary = atob(base64);
@@ -263,11 +288,18 @@ function buildNoteContext(title: string, bodyMarkdown: string) {
     "Use the current note as the active context for the conversation.",
     "Keep responses concise, conversational, and helpful.",
     "If the user asks you to create, generate, draw, design, render, or edit an image, call the generate_image tool instead of claiming you cannot generate images.",
+    "If the user asks you to rewrite, edit, fix, shorten, expand, or transform the note text, call suggest_note_edits.",
     "If the user wants to change an uploaded image or a previously generated image, you must call generate_image with the edit request.",
     "Do not answer that you will only describe the current image or combine text instructions manually.",
     "The app keeps the most recent uploaded or generated image as the current source image and automatically uploads it to the image API when you call generate_image for an edit.",
     "When the user says modify, change, edit, restyle, remove something from, add something to, or make variations of the current image, treat that as an image edit request and call the tool.",
     "After the tool returns, briefly describe what was generated and mention any notable constraints or variations.",
+    "If the user asks you to look through their camera, inspect a physical object, read a page in front of the device, or watch something in the room, call start_camera_share.",
+    "If the user asks you to see their screen, browser tab, desktop, app, code editor, or UI, call start_screen_share.",
+    "If you need a specific camera, call list_available_cameras first.",
+    "If the user asks to stop sharing video, call stop_video_share.",
+    "Do not tell the user to press the camera or screen-share UI if a tool call can do it. Use the tool call so the browser can prompt for permission.",
+    "If it is unclear whether the user means camera or screen, ask a short clarifying question.",
     "When the note content is shared, respond with a spoken-style answer that helps the user explore it.",
     "",
     "Current note:",
@@ -293,6 +325,67 @@ const generateImageFunctionDeclaration = {
       },
     },
     required: ["prompt"],
+  },
+};
+
+const suggestNoteEditsFunctionDeclaration = {
+  name: "suggest_note_edits",
+  description:
+    "Suggest precise replace-based note edits for the current note. Use this when the user asks to rewrite, fix, shorten, expand, or change the note text itself.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      prompt: {
+        type: "STRING",
+        description:
+          "The user's requested note edit instruction. Include what to change, rewrite, fix, or replace in the note.",
+      },
+    },
+    required: ["prompt"],
+  },
+};
+
+const listAvailableCamerasFunctionDeclaration = {
+  name: "list_available_cameras",
+  description:
+    "List the cameras that the browser can share with the live session. Use this when the user asks what cameras are available or when you need to choose a specific camera.",
+  parameters: {
+    type: "OBJECT",
+    properties: {},
+  },
+};
+
+const startCameraShareFunctionDeclaration = {
+  name: "start_camera_share",
+  description:
+    "Start camera sharing so Gemini can see the user's camera feed in the live session. Use this when the user wants to show something in front of the camera.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      device_id: {
+        type: "STRING",
+        description: "Optional camera device id returned by list_available_cameras.",
+      },
+    },
+  },
+};
+
+const startScreenShareFunctionDeclaration = {
+  name: "start_screen_share",
+  description:
+    "Start screen sharing so Gemini can see the user's screen in the live session. Use this when the user wants to show a screen, app, or UI.",
+  parameters: {
+    type: "OBJECT",
+    properties: {},
+  },
+};
+
+const stopVideoShareFunctionDeclaration = {
+  name: "stop_video_share",
+  description: "Stop the current camera or screen share in the live session.",
+  parameters: {
+    type: "OBJECT",
+    properties: {},
   },
 };
 
@@ -418,31 +511,37 @@ export function LiveTalkPanel({
   currentNoteTitle,
   microphoneDeviceId,
   microphoneEnabled,
+  onApplyEdits,
   onError,
   onRegisterSend,
   onRegisterVideoControls,
   onSessionStateChange,
   onVideoShareStateChange,
+  onUploadImageToCurrentFolder,
   providerSettings,
+  sessionRequested,
 }: {
   active: boolean;
   currentNoteBodyMarkdown: string;
   currentNoteTitle: string;
   microphoneDeviceId?: string | null;
   microphoneEnabled?: boolean;
+  onApplyEdits?: (edits: TextSubstitution[]) => void;
   onError: (message: string) => void;
   onRegisterSend?: ((send: LiveSendHandle | null) => void) | undefined;
   onRegisterVideoControls?: ((controls: LiveVideoControls | null) => void) | undefined;
   onSessionStateChange?: ((state: LiveSessionState) => void) | undefined;
   onVideoShareStateChange?: ((state: LiveVideoShareState) => void) | undefined;
+  onUploadImageToCurrentFolder?: ((attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<void>) | undefined;
   providerSettings: ProviderSettings;
+  sessionRequested: boolean;
 }) {
-  const [sessionRequested, setSessionRequested] = useState(active);
   const [connecting, setConnecting] = useState(false);
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState("Open the Live tab to start a session.");
   const [turns, setTurns] = useState<LiveTurn[]>([]);
   const [previewImage, setPreviewImage] = useState<LiveGeneratedImage | null>(null);
+  const [connectionRevision, setConnectionRevision] = useState(0);
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
@@ -482,6 +581,9 @@ export function LiveTalkPanel({
   const videoShareIntervalRef = useRef<number | null>(null);
   const videoShareModeRef = useRef<"camera" | "screen" | null>(null);
   const cancelledToolCallIdsRef = useRef<Set<string>>(new Set());
+  const finalizeUserAudioRef = useRef(() => {});
+  const appliedNoteContextRef = useRef(noteContext);
+  const noteReconnectTimerRef = useRef<number | null>(null);
   useEffect(() => {
     readyRef.current = ready;
   }, [ready]);
@@ -492,13 +594,47 @@ export function LiveTalkPanel({
     noteBodyMarkdownRef.current = currentNoteBodyMarkdown;
   }, [noteContext]);
 
+  useEffect(
+    () => () => {
+      if (noteReconnectTimerRef.current) {
+        window.clearTimeout(noteReconnectTimerRef.current);
+        noteReconnectTimerRef.current = null;
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!sessionRequested || !ready || noteContext === appliedNoteContextRef.current) {
+      if (noteReconnectTimerRef.current) {
+        window.clearTimeout(noteReconnectTimerRef.current);
+        noteReconnectTimerRef.current = null;
+      }
+      return;
+    }
+
+    if (noteReconnectTimerRef.current) {
+      window.clearTimeout(noteReconnectTimerRef.current);
+    }
+
+    noteReconnectTimerRef.current = window.setTimeout(() => {
+      noteReconnectTimerRef.current = null;
+      setStatus("Reconnecting live talk with the updated note...");
+      setConnectionRevision((current) => current + 1);
+    }, 3000);
+
+    return () => {
+      if (noteReconnectTimerRef.current) {
+        window.clearTimeout(noteReconnectTimerRef.current);
+        noteReconnectTimerRef.current = null;
+      }
+    };
+  }, [noteContext, ready, sessionRequested]);
+
   useEffect(() => {
     preferredMicrophoneDeviceIdRef.current = microphoneDeviceId ?? null;
     const shouldCapture = active && (microphoneEnabled ?? true);
     microphoneCaptureEnabledRef.current = shouldCapture;
-    if (active) {
-      setSessionRequested(true);
-    }
     if (!shouldCapture) {
       resetMicrophoneRef.current();
       return;
@@ -537,7 +673,7 @@ export function LiveTalkPanel({
     if (!sessionRequested) {
       setConnecting(false);
       setReady(false);
-      setStatus("Open the Live tab to start a session.");
+      setStatus("Live talk disconnected.");
       return;
     }
 
@@ -658,8 +794,12 @@ export function LiveTalkPanel({
             userAudioTrailingSilenceMsRef.current += chunkDurationMs;
             userAudioChunksRef.current.push(base64ToUint8Array(encodedAudio));
           } else if (userAudioActiveRef.current) {
-            userAudioActiveRef.current = false;
-            userAudioTrailingSilenceMsRef.current = 0;
+            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
+            if (userAudioTrailingSilenceMsRef.current >= 2200) {
+              userAudioActiveRef.current = false;
+              userAudioTrailingSilenceMsRef.current = 0;
+              finalizeUserAudioRef.current();
+            }
           }
 
           socketConnection.send(
@@ -711,6 +851,18 @@ export function LiveTalkPanel({
       );
     };
 
+    const appendVideoShareTurn = (stream: MediaStream, mode: "camera" | "screen") => {
+      setTurns((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          content: mode === "camera" ? "Shared camera with Gemini." : "Shared screen with Gemini.",
+          videoStream: stream,
+        },
+      ]);
+    };
+
     const finalizeUserAudio = () => {
       const userTurnId = userTurnIdRef.current;
       if (!userTurnId) {
@@ -731,6 +883,7 @@ export function LiveTalkPanel({
       userAudioActiveRef.current = false;
       userAudioTrailingSilenceMsRef.current = 0;
     };
+    finalizeUserAudioRef.current = finalizeUserAudio;
 
     const createAssistantTurn = () => {
       const existingId = liveAssistantTurnIdRef.current;
@@ -774,6 +927,34 @@ export function LiveTalkPanel({
       });
     };
 
+    const appendEditsToAssistantTurn = (substitutions: TextSubstitution[], message?: string) => {
+      if (substitutions.length === 0 && !message?.trim()) return;
+      const existingId = liveAssistantTurnIdRef.current ?? createAssistantTurn();
+      setTurns((current) => {
+        let updated = false;
+        const next = current.map((turn) => {
+          if (turn.id !== existingId) return turn;
+          updated = true;
+          return {
+            ...turn,
+            content: message?.trim() ? `${turn.content}${turn.content ? "\n\n" : ""}${message.trim()}` : turn.content,
+            substitutions: substitutions.length > 0 ? [...(turn.substitutions ?? []), ...substitutions] : turn.substitutions,
+          };
+        });
+        return updated
+          ? next
+          : [
+              ...current,
+              {
+                id: existingId,
+                role: "assistant",
+                content: message?.trim() ?? "",
+                substitutions,
+              },
+            ];
+      });
+    };
+
     const finalizeAssistantAudio = () => {
       const assistantTurnId = liveAssistantTurnIdRef.current;
       if (!assistantTurnId) {
@@ -812,6 +993,7 @@ export function LiveTalkPanel({
     };
 
     const sendSetup = () => {
+      appliedNoteContextRef.current = noteContextRef.current;
       socket.send(
         JSON.stringify({
           setup: {
@@ -835,7 +1017,14 @@ export function LiveTalkPanel({
             },
             tools: [
               {
-                functionDeclarations: [generateImageFunctionDeclaration],
+                functionDeclarations: [
+                  generateImageFunctionDeclaration,
+                  suggestNoteEditsFunctionDeclaration,
+                  listAvailableCamerasFunctionDeclaration,
+                  startCameraShareFunctionDeclaration,
+                  startScreenShareFunctionDeclaration,
+                  stopVideoShareFunctionDeclaration,
+                ],
               },
             ],
           },
@@ -929,6 +1118,7 @@ export function LiveTalkPanel({
       sendVideoFrame();
       videoShareIntervalRef.current = window.setInterval(sendVideoFrame, 900);
       updateVideoShareState(mode);
+      appendVideoShareTurn(stream, mode);
       setStatus(mode === "camera" ? "Sharing camera with Gemini." : "Sharing your screen with Gemini.");
     };
 
@@ -1171,31 +1361,154 @@ export function LiveTalkPanel({
       };
     };
 
+    const runSuggestNoteEditsTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const callId = typeof call.id === "string" ? call.id : "";
+      const prompt = typeof call.args?.prompt === "string" ? call.args.prompt.trim() : "";
+
+      if (!prompt) {
+        return {
+          id: callId,
+          name: call.name ?? "suggest_note_edits",
+          response: {
+            ok: false,
+            error: "Missing prompt.",
+          },
+        };
+      }
+
+      const response = await apiClient.askAi({
+        prompt,
+        title: noteTitleRef.current,
+        bodyMarkdown: noteBodyMarkdownRef.current,
+        mode: "chat",
+      });
+
+      if (cancelledToolCallIdsRef.current.has(callId)) {
+        return {
+          id: callId,
+          name: call.name ?? "suggest_note_edits",
+          response: {
+            ok: false,
+            cancelled: true,
+          },
+        };
+      }
+
+      appendEditsToAssistantTurn(response.substitutions, response.answer);
+      setStatus(response.substitutions.length > 0 ? "Prepared note edits from live tool." : "Live edit tool returned no replaceable text.");
+
+      return {
+        id: callId,
+        name: call.name ?? "suggest_note_edits",
+        response: {
+          ok: response.substitutions.length > 0,
+          message: response.answer,
+          substitution_count: response.substitutions.length,
+          substitutions: response.substitutions.map((edit) => ({
+            find: edit.find,
+            replace: edit.replace,
+            all: Boolean(edit.all),
+          })),
+        },
+      };
+    };
+
+    const runListAvailableCamerasTool = async (call: { id?: string; name?: string }) => {
+      const cameras = await listSources();
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "list_available_cameras",
+        response: {
+          ok: true,
+          active_share: videoShareModeRef.current,
+          cameras: cameras.map((camera) => ({
+            device_id: camera.deviceId,
+            label: camera.label,
+          })),
+        },
+      };
+    };
+
+    const runStartCameraShareTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const deviceId = typeof call.args?.device_id === "string" && call.args.device_id.trim() ? call.args.device_id.trim() : undefined;
+      const started = await startCameraShare(deviceId);
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "start_camera_share",
+        response: {
+          ok: started,
+          mode: started ? "camera" : null,
+          device_id: deviceId ?? null,
+          message: started ? "Camera sharing started." : "Camera sharing was not started.",
+        },
+      };
+    };
+
+    const runStartScreenShareTool = async (call: { id?: string; name?: string }) => {
+      const started = await startScreenShare();
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "start_screen_share",
+        response: {
+          ok: started,
+          mode: started ? "screen" : null,
+          message: started ? "Screen sharing started." : "Screen sharing was not started.",
+        },
+      };
+    };
+
+    const runStopVideoShareTool = async (call: { id?: string; name?: string }) => {
+      const previousMode = videoShareModeRef.current;
+      stopVideoShare();
+      setStatus("Video share stopped.");
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "stop_video_share",
+        response: {
+          ok: true,
+          stopped: previousMode !== null,
+          previous_mode: previousMode,
+        },
+      };
+    };
+
     const handleToolCall = async (toolCall: NonNullable<Extract<LiveMessage, { toolCall?: unknown }>["toolCall"]>) => {
       const functionCalls = toolCall.functionCalls ?? [];
       if (functionCalls.length === 0) {
         return;
       }
 
-      setStatus("Gemini requested a tool. Generating image...");
+      setStatus("Gemini requested a live tool.");
       const functionResponses = await Promise.all(
         functionCalls.map(async (call) => {
           try {
-            if (call.name !== "generate_image") {
-              return {
-                id: call.id ?? "",
-                name: call.name ?? "unknown_tool",
-                response: {
-                  ok: false,
-                  error: `Unsupported tool: ${call.name ?? "unknown"}.`,
-                },
-              };
+            switch (call.name) {
+              case "generate_image":
+                return await runGenerateImageTool(call);
+              case "suggest_note_edits":
+                return await runSuggestNoteEditsTool(call);
+              case "list_available_cameras":
+                return await runListAvailableCamerasTool(call);
+              case "start_camera_share":
+                return await runStartCameraShareTool(call);
+              case "start_screen_share":
+                return await runStartScreenShareTool(call);
+              case "stop_video_share":
+                return await runStopVideoShareTool(call);
+              default:
+                return {
+                  id: call.id ?? "",
+                  name: call.name ?? "unknown_tool",
+                  response: {
+                    ok: false,
+                    error: `Unsupported tool: ${call.name ?? "unknown"}.`,
+                  },
+                };
             }
-            return await runGenerateImageTool(call);
           } catch (error) {
             return {
               id: call.id ?? "",
-              name: call.name ?? "generate_image",
+              name: call.name ?? "unknown_tool",
               response: {
                 ok: false,
                 error: error instanceof Error ? error.message : "Tool execution failed.",
@@ -1374,6 +1687,7 @@ export function LiveTalkPanel({
       onRegisterVideoControls?.(null);
     };
   }, [
+    connectionRevision,
     onError,
     onRegisterSend,
     onRegisterVideoControls,
@@ -1409,22 +1723,50 @@ export function LiveTalkPanel({
             <div
               className={`rounded-[4px] px-3 py-2 text-sm ${
                 turn.role === "assistant" ? "bg-white" : turn.role === "user" ? "self-end bg-ink text-white" : "bg-mist text-ink/60"
-              } ${turn.role === "user" ? "max-w-[80%]" : "max-w-[92%]"}`}
+              } ${turn.role === "user" ? "max-w-[92%]" : "max-w-[92%]"}`}
               key={turn.id}
+              style={turn.role === "user" ? { minWidth: "min(400px, 92%)" } : undefined}
             >
               {turn.content ? <div className="whitespace-pre-wrap break-words">{turn.content}</div> : null}
+              {turn.videoStream ? (
+                <div className="mt-2 overflow-hidden rounded-[12px] border border-white/10 bg-black/20">
+                  <LiveStreamPreview className="max-h-[240px] w-full object-cover" stream={turn.videoStream} />
+                </div>
+              ) : null}
               {turn.images?.length ? (
                 <div className="mt-2 grid gap-2">
                   {turn.images.map((image) => (
                     <button
-                      className="block overflow-hidden rounded-[10px] border border-ink/10 bg-[#f7f1e6] text-left"
+                      className="flex overflow-hidden rounded-[10px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
                       key={image.id}
                       onClick={() => setPreviewImage(image)}
                       type="button"
                     >
-                      <img alt={image.fileName} className="h-[150px] w-full object-cover" src={image.url} />
+                      <img alt={image.fileName} className="max-h-[240px] w-auto max-w-full object-contain" src={image.url} />
                     </button>
                   ))}
+                </div>
+              ) : null}
+              {turn.role === "assistant" && turn.substitutions?.length ? (
+                <div className="mt-3 grid gap-2">
+                  {turn.substitutions.map((edit, index) => (
+                    <div className="rounded-[14px] border border-ink/10 bg-[#fff7e8] px-3 py-3" key={`${turn.id}:edit:${index}`}>
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Suggested replace</div>
+                      <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#8c5c54] line-through">{edit.find}</div>
+                      <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#1f6f78]">{edit.replace}</div>
+                    </div>
+                  ))}
+                  {onApplyEdits ? (
+                    <div className="flex justify-end">
+                      <button
+                        className="rounded-full border border-ink/10 bg-mist px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-[#efe5d3]"
+                        onClick={() => onApplyEdits(turn.substitutions ?? [])}
+                        type="button"
+                      >
+                        Review in editor
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
               {turn.audioUrl ? (
@@ -1437,6 +1779,7 @@ export function LiveTalkPanel({
               ) : null}
             </div>
           ))}
+          <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 300 }} />
         </div>
       </div>
 
@@ -1461,6 +1804,23 @@ export function LiveTalkPanel({
             <div className="mt-3 overflow-hidden rounded-[12px] border border-ink/10 bg-black/5 p-2">
               <img alt={previewImage.fileName} className="max-h-[80vh] w-full object-contain" src={previewImage.url} />
             </div>
+            {onUploadImageToCurrentFolder ? (
+              <div className="mt-3 flex justify-end">
+                <button
+                  className="rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                  onClick={() =>
+                    void onUploadImageToCurrentFolder({
+                      fileName: previewImage.fileName,
+                      mimeType: previewImage.mimeType,
+                      previewUrl: previewImage.url,
+                    })
+                  }
+                  type="button"
+                >
+                  Upload to folder
+                </button>
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}

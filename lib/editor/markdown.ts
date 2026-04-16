@@ -202,10 +202,11 @@ export function stripMarkdown(value: string) {
 }
 
 export function normalizeStoredMarkdown(value: string) {
-  const normalized = normalizeNewlines(value ?? "").trim();
-  if (!normalized) return "";
-  if (!/<[a-z][\s\S]*>/i.test(normalized)) return normalized;
-  return htmlToMarkdown(normalized);
+  const normalized = normalizeNewlines(value ?? "");
+  const trimmed = normalized.trim();
+  if (!trimmed) return "";
+  if (!/<[a-z][\s\S]*>/i.test(trimmed)) return normalized;
+  return htmlToMarkdown(trimmed);
 }
 
 export function createStarterMarkdown() {
