@@ -344,6 +344,8 @@ function WorkspaceClientContent() {
   const [folderCreateParentId, setFolderCreateParentId] = useState<string | null>(null);
   const [folderCreateName, setFolderCreateName] = useState("");
   const [activeWindow, setActiveWindow] = useState<WorkspaceWindow>(null);
+  const [aiPanelMounted, setAiPanelMounted] = useState(false);
+  const [aiPanelCompact, setAiPanelCompact] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [pendingAiAttachment, setPendingAiAttachment] = useState<PendingAiAttachment | null>(null);
@@ -354,6 +356,7 @@ function WorkspaceClientContent() {
   const [showAllRecent, setShowAllRecent] = useState(false);
   const [editButtonVisible, setEditButtonVisible] = useState(false);
   const previewFrameRef = useRef<HTMLDivElement>(null);
+  const editorShellRef = useRef<HTMLDivElement>(null);
   const folderCreateInputRef = useRef<HTMLInputElement>(null);
   const copyResetTimerRef = useRef<number | null>(null);
   const editButtonTimerRef = useRef<number | null>(null);
@@ -373,6 +376,7 @@ function WorkspaceClientContent() {
 
   useEffect(() => {
     if (!isEditing || !pendingAiEditPreview) return;
+    editorShellRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
     editorRef.current?.focusRange(pendingAiEditPreview.firstStep.start, pendingAiEditPreview.firstStep.end);
   }, [isEditing, pendingAiEditPreview]);
 
@@ -550,8 +554,20 @@ function WorkspaceClientContent() {
   };
 
   const toggleWindow = (windowName: WorkspaceWindow) => {
-    setActiveWindow((current) => (current === windowName ? null : windowName));
+    setActiveWindow((current) => {
+      const nextWindow = current === windowName ? null : windowName;
+      if (nextWindow === "ai") {
+        setAiPanelCompact(false);
+      }
+      return nextWindow;
+    });
   };
+
+  useEffect(() => {
+    if (activeWindow === "ai") {
+      setAiPanelMounted(true);
+    }
+  }, [activeWindow]);
 
   const enterEditMode = () => {
     if (editButtonTimerRef.current) {
@@ -560,6 +576,16 @@ function WorkspaceClientContent() {
     }
     setEditButtonVisible(false);
     setIsEditing(true);
+  };
+
+  const compactAiPanelForNote = () => {
+    if (activeWindow === "ai") {
+      setAiPanelCompact(true);
+    }
+  };
+
+  const expandAiPanelToUserHeight = () => {
+    setAiPanelCompact(false);
   };
 
   const exitEditMode = () => {
@@ -1070,6 +1096,9 @@ function WorkspaceClientContent() {
                 : message,
             ),
           );
+          if (reply.substitutions.length > 0) {
+            applyAiEdits(reply.substitutions);
+          }
         },
       });
       return true;
@@ -1833,26 +1862,33 @@ function WorkspaceClientContent() {
             </div>
           </div>
 
-          <RichEditor
-            ref={editorRef}
-            bodyMarkdown={document.bodyMarkdown}
-            editable={isEditing}
-            inlineNotice={
-              pendingAiEditPreview ? (
-                <div className="rounded-[20px] border border-ink/10 bg-[#fff7e8] p-4 shadow-[0_12px_28px_rgba(15,23,42,0.08)]">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0 flex-1">
-                      <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">AI edit preview</div>
-                      <div className="mt-1 text-sm text-ink">
-                        Review the proposed replace edit in the note editor, then apply it.
-                        {" "}
-                        {pendingAiEditPreview.stepCount} change{pendingAiEditPreview.stepCount === 1 ? "" : "s"} ready.
-                        {pendingAiEditPreview.skippedCount > 0
-                          ? ` ${pendingAiEditPreview.skippedCount} suggestion${pendingAiEditPreview.skippedCount === 1 ? "" : "s"} could not be matched.`
-                          : ""}
+          <div ref={editorShellRef}>
+            <RichEditor
+              ref={editorRef}
+              bodyMarkdown={document.bodyMarkdown}
+              editable={isEditing}
+              inlineNotice={
+                pendingAiEditPreview ? (
+                  <div className="overflow-hidden rounded-[8px] border border-ink/10 bg-[#fff7e8] shadow-[0_16px_36px_rgba(15,23,42,0.14)]">
+                    <div className="grid max-h-[40vh] gap-2 overflow-auto px-3 py-3">
+                      <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Suggested replace</div>
+                      <div className="whitespace-pre-wrap break-words text-sm text-[#8c5c54] line-through">
+                        {pendingAiEditPreview.firstStep.find}
                       </div>
+                      <div className="whitespace-pre-wrap break-words text-sm text-[#1f6f78]">
+                        {pendingAiEditPreview.firstStep.replace}
+                      </div>
+                      {pendingAiEditPreview.stepCount > 1 || pendingAiEditPreview.skippedCount > 0 ? (
+                        <div className="text-xs text-ink/50">
+                          {pendingAiEditPreview.stepCount} replacement{pendingAiEditPreview.stepCount === 1 ? "" : "s"} ready
+                          {pendingAiEditPreview.skippedCount > 0
+                            ? `, ${pendingAiEditPreview.skippedCount} not found`
+                            : ""}
+                          .
+                        </div>
+                      ) : null}
                     </div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex justify-end gap-2 border-t border-ink/10 px-3 py-2">
                       <button
                         className="rounded-full border border-ink/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-ink transition hover:border-ink/20 hover:bg-white"
                         onClick={() => setPendingAiEditPreview(null)}
@@ -1865,32 +1901,34 @@ function WorkspaceClientContent() {
                         onClick={confirmAiEdits}
                         type="button"
                       >
-                        Apply changes
+                        Apply
                       </button>
                     </div>
                   </div>
-                  <div className="mt-3 rounded-[14px] border border-ink/10 bg-white px-3 py-3">
-                    <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Replace preview</div>
-                    <div className="mt-2 whitespace-pre-wrap break-words font-mono text-xs text-[#8c5c54] line-through">
-                      {pendingAiEditPreview.firstStep.find}
-                    </div>
-                    <div className="mt-2 whitespace-pre-wrap break-words font-mono text-xs text-[#1f6f78]">
-                      {pendingAiEditPreview.firstStep.replace}
-                    </div>
-                  </div>
-                </div>
-              ) : null
-            }
+                ) : null
+              }
             onAddMediaToAi={addNoteMediaToAi}
+            onNoteInteract={compactAiPanelForNote}
             onSelectionChange={setSelectedText}
             onRequestEdit={enterEditMode}
             onRevealEditButton={revealEditButton}
             overlay={
-              activeWindow === "ai" ? (
-                <div className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4">
-                  <div className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[600px] sm:rounded-[4px]">
+              aiPanelMounted ? (
+                <div
+                  aria-hidden={activeWindow !== "ai"}
+                  className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4"
+                  hidden={activeWindow !== "ai"}
+                  style={activeWindow !== "ai" ? { display: "none" } : undefined}
+                >
+                  <div
+                    className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[600px] sm:rounded-[4px]"
+                    data-ai-panel="true"
+                    onFocusCapture={expandAiPanelToUserHeight}
+                    onPointerDownCapture={expandAiPanelToUserHeight}
+                  >
                     <AIChatPanel
                       busy={thinking}
+                      compact={activeWindow === "ai" && aiPanelCompact}
                       currentFolderFiles={aiCurrentFolderFiles}
                       currentFolderName={selectedFolderName}
                       currentNoteBodyMarkdown={document.bodyMarkdown}
@@ -1994,6 +2032,7 @@ function WorkspaceClientContent() {
               ) : null
             }
           />
+          </div>
 
           <div className="fixed bottom-4 right-4 z-40 rounded-full bg-ink px-4 py-2 text-xs font-medium uppercase tracking-[0.18em] text-white shadow-[0_14px_32px_rgba(15,23,42,0.2)]">
             {syncStatus}

@@ -10,6 +10,17 @@ body {
   @apply bg-white text-ink font-body;
 }
 
+html,
+body {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  display: none;
+}
+
 .hide-scrollbar {
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -21,6 +32,12 @@ body {
 
 .markdown-preview {
   @apply text-[15px] leading-7 text-ink;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.markdown-preview::-webkit-scrollbar {
+  display: none;
 }
 
 .markdown-preview > * + * {

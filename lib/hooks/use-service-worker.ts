@@ -4,7 +4,6 @@ import { useEffect } from "react";
 
 export function useServiceWorker() {
   useEffect(() => {
-    if (process.env.NODE_ENV !== "production") return;
     if (!("serviceWorker" in navigator)) return;
     void (async () => {
       const registrations = await navigator.serviceWorker.getRegistrations();

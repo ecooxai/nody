@@ -90,6 +90,8 @@ const builtInPrompts: PromptTemplate[] = [
   },
 ];
 
+const COMPACT_PANEL_HEIGHT = 200;
+
 function inferMediaKind(mimeType: string): AIMediaKind | null {
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType.startsWith("audio/")) return "audio";
@@ -294,6 +296,7 @@ export function AIChatPanel({
   currentNoteTitle,
   selectedText,
   storedPanelHeight,
+  compact,
   onPanelHeightChange,
   onUploadImageToCurrentFolder,
 }: {
@@ -322,6 +325,7 @@ export function AIChatPanel({
   currentNoteTitle: string;
   selectedText?: string;
   storedPanelHeight?: number | null;
+  compact?: boolean;
   onPanelHeightChange?: (height: number) => void;
   onUploadImageToCurrentFolder: (attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<void>;
 }) {
@@ -394,6 +398,7 @@ export function AIChatPanel({
   const resizeStartYRef = useRef(0);
   const resizeStartHeightRef = useRef(460);
   const latestAssistantMessageId = [...messages].reverse().find((message) => message.role === "assistant")?.id ?? null;
+  const displayedPanelHeight = compact ? COMPACT_PANEL_HEIGHT : panelHeight;
 
   useEffect(() => {
     if (provider !== "gemini" && activeTab === "live") {
@@ -969,6 +974,16 @@ export function AIChatPanel({
     }
   };
 
+  const switchLiveCameraShare = async () => {
+    if (!liveVideoControls) return;
+    try {
+      await liveVideoControls.switchCameraShare();
+      void refreshLiveVideoSources();
+    } catch (error) {
+      onError(error instanceof Error ? error.message : "Failed to switch cameras.");
+    }
+  };
+
   const startLiveScreenShare = async () => {
     if (!liveVideoControls) return;
     try {
@@ -1027,6 +1042,12 @@ export function AIChatPanel({
   const handleLiveVideoShareStateChange = useCallback((state: LiveVideoShareState) => {
     setLiveVideoShareMode((current) => (current === state.mode ? current : state.mode));
   }, []);
+
+  const confirmUploadPreviewImage = () => {
+    if (!previewAttachment || previewAttachment.kind !== "image") return;
+    if (!window.confirm("Upload this image to the current folder?")) return;
+    void onUploadImageToCurrentFolder(previewAttachment);
+  };
 
   const renderGeneratedImageCard = (attachment: AIMessageAttachment) => (
     <div className="group relative overflow-hidden rounded-[16px] border border-ink/10 bg-white shadow-[0_12px_28px_rgba(15,23,42,0.08)]" key={attachment.id}>
@@ -1453,7 +1474,10 @@ export function AIChatPanel({
   };
 
   return (
-    <Panel className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-[5px] shadow-none" style={{ height: panelHeight }}>
+    <Panel
+      className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-[5px] shadow-none transition-[height] duration-200 ease-out"
+      style={{ height: displayedPanelHeight }}
+    >
       <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-7 rounded-full bg-ink/20 blur-xl" />
       <div className="flex items-center justify-between gap-3 px-0 py-1.5">
         <div className="flex min-w-0 items-center gap-3">
@@ -1895,6 +1919,17 @@ export function AIChatPanel({
                   </div>
                   <button
                     className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => void switchLiveCameraShare()}
+                    type="button"
+                  >
+                    <span>Switch camera</span>
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path d="M6.5 8.5A6 6 0 0 1 17 6.2M17.5 15.5A6 6 0 0 1 7 17.8" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+                      <path d="M17 3.5v2.8h-2.8M7 20.5v-2.8h2.8" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" />
+                    </svg>
+                  </button>
+                  <button
+                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
                     onClick={() => void startLiveScreenShare()}
                     type="button"
                   >
@@ -2297,15 +2332,6 @@ export function AIChatPanel({
                           <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#1f6f78]">{edit.replace}</div>
                         </div>
                       ))}
-                      <div className="flex justify-end">
-                        <button
-                          className="rounded-full border border-ink/10 bg-mist px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/25 hover:bg-[#efe5d3]"
-                          onClick={() => onApply(edits)}
-                          type="button"
-                        >
-                          Review in editor
-                        </button>
-                      </div>
                     </div>
                   ) : null}
                 </div>
@@ -2337,42 +2363,47 @@ export function AIChatPanel({
 
       {previewAttachment ? (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/45 p-4">
-          <div className="w-full max-w-md rounded-[16px] border border-white/10 bg-[#fff9ef] p-4 shadow-[0_20px_42px_rgba(15,23,42,0.24)]">
+          <div className="max-h-[92vh] w-full max-w-[90vw] overflow-auto rounded-[16px] border border-white/10 bg-[#fff9ef] p-4 shadow-[0_20px_42px_rgba(15,23,42,0.24)]">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">{attachmentBadge(previewAttachment.kind)}</div>
                 <div className="truncate text-sm font-medium text-ink">{previewAttachment.fileName}</div>
               </div>
-              <button
-                className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
-                onClick={() => setPreviewAttachment(null)}
-                type="button"
-              >
-                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-                </svg>
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                {previewAttachment.kind === "image" ? (
+                  <button
+                    aria-label="Upload image to current folder"
+                    className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={confirmUploadPreviewImage}
+                    title="Upload to current folder"
+                    type="button"
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path d="M12 16V5M8 9l4-4 4 4M5 19h14" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+                    </svg>
+                  </button>
+                ) : null}
+                <button
+                  aria-label="Close preview"
+                  className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                  onClick={() => setPreviewAttachment(null)}
+                  type="button"
+                >
+                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                    <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                  </svg>
+                </button>
+              </div>
             </div>
-            <div className="mt-3 overflow-hidden rounded-[12px] border border-ink/10 bg-black/5 p-2">
+            <div className="mt-3 flex justify-center overflow-auto rounded-[12px] border border-ink/10 bg-black/5 p-2">
               {previewAttachment.kind === "image" ? (
-                <img alt={previewAttachment.fileName} className="max-h-[320px] w-full object-contain" src={previewAttachment.previewUrl} />
+                <img alt={previewAttachment.fileName} className="h-auto max-w-[90%] object-contain" src={previewAttachment.previewUrl} />
               ) : previewAttachment.kind === "video" ? (
                 <video autoPlay className="max-h-[320px] w-full rounded-[8px]" controls playsInline src={previewAttachment.previewUrl} />
               ) : (
                 <audio autoPlay className="w-full" controls src={previewAttachment.previewUrl} />
               )}
             </div>
-            {previewAttachment.kind === "image" ? (
-              <div className="mt-3 flex justify-end">
-                <button
-                  className="rounded-full border border-ink/10 bg-white px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
-                  onClick={() => void onUploadImageToCurrentFolder(previewAttachment)}
-                  type="button"
-                >
-                  Upload to folder
-                </button>
-              </div>
-            ) : null}
           </div>
         </div>
       ) : null}
@@ -2401,12 +2432,11 @@ export function AIChatPanel({
         </div>
       ) : null}
       <div
-        className={`pointer-events-none absolute left-3 top-3 z-20 overflow-hidden rounded-[12px] border border-white/20 bg-black shadow-[0_14px_32px_rgba(0,0,0,0.28)] transition-opacity ${
+        className={`pointer-events-none absolute left-3 top-3 z-20 inline-flex max-w-[calc(100%_-_24px)] overflow-hidden rounded-[8px] border border-white/20 bg-black shadow-[0_14px_32px_rgba(0,0,0,0.28)] transition-opacity ${
           cameraPreviewVisible ? "opacity-100" : "opacity-0"
         }`}
-        style={{ width: 200 }}
       >
-        <video className="aspect-[4/3] w-full object-cover" muted playsInline ref={cameraVideoRef} />
+        <video className="h-[150px] w-auto max-w-full object-contain" muted playsInline ref={cameraVideoRef} />
       </div>
       </>
       ) : (

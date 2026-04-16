@@ -6,6 +6,8 @@ RUN_WORKER=1
 WORKER_MODE="auto"
 WORKER_URL="http://127.0.0.1:8787/v1/health"
 export WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
+PROJECT_LOCK_ID="$(pwd | sha256sum | awk '{print $1}')"
+LOCK_DIR="${TMPDIR:-/tmp}/nody-dev-${PROJECT_LOCK_ID}.lock"
 
 usage() {
   cat <<'EOF'
@@ -70,18 +72,45 @@ if [[ ! -x ./node_modules/.bin/next || ! -x ./node_modules/.bin/wrangler ]]; the
   exit 1
 fi
 
-if (( RUN_CHECKS )); then
-  ./test.sh
-fi
-
 WORKER_PID=""
+NEXT_PID=""
+
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  LOCK_PID=""
+  if [[ -f "${LOCK_DIR}/pid" ]]; then
+    LOCK_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "${LOCK_PID}" ]] && kill -0 "${LOCK_PID}" 2>/dev/null; then
+    echo "A dev server for this project is already running with PID ${LOCK_PID}." >&2
+    exit 1
+  fi
+
+  rm -rf "${LOCK_DIR}"
+  if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+    echo "Could not acquire dev server lock at ${LOCK_DIR}." >&2
+    exit 1
+  fi
+fi
+printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+
 cleanup() {
+  if [[ -n "${NEXT_PID}" ]]; then
+    kill "${NEXT_PID}" 2>/dev/null || true
+    wait "${NEXT_PID}" 2>/dev/null || true
+  fi
   if [[ -n "${WORKER_PID}" ]]; then
     kill "${WORKER_PID}" 2>/dev/null || true
     wait "${WORKER_PID}" 2>/dev/null || true
   fi
+  rm -rf "${LOCK_DIR}"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT TERM
+
+if (( RUN_CHECKS )); then
+  ./test.sh
+fi
 
 wait_for_worker() {
   local attempts=0
@@ -121,4 +150,10 @@ if (( RUN_WORKER )); then
   wait_for_worker
 fi
 
-exec ./node_modules/.bin/next dev --disable-source-maps
+rm -rf .next
+NEXT_STATUS=0
+./node_modules/.bin/next dev --disable-source-maps &
+NEXT_PID=$!
+wait "${NEXT_PID}" || NEXT_STATUS=$?
+NEXT_PID=""
+exit "${NEXT_STATUS}"

@@ -5,6 +5,10 @@ function normalizeNewlines(value: string) {
   return value.replace(/\r\n?/g, "\n");
 }
 
+function shouldConvertLegacyHtml(value: string) {
+  return /^<(?:h[1-6]|p|div|blockquote|ul|ol)\b/i.test(value);
+}
+
 function decodeHtmlEntities(value: string) {
   return value
     .replace(/&nbsp;/g, " ")
@@ -178,12 +182,16 @@ function renderBlock(block: string) {
   return `<p>${inlineMarkdownToHtml(trimmed).replace(/\n/g, "<br />")}</p>`;
 }
 
+function renderNewlineSeparator(separator: string) {
+  return Array.from({ length: separator.length }, () => "<br />").join("\n");
+}
+
 export function markdownToHtml(value: string) {
   const normalized = normalizeStoredMarkdown(value);
   const { text, blocks } = preserveMediaBlocks(normalized);
   const html = text
-    .split(/\n{2,}/)
-    .map((block) => renderBlock(block))
+    .split(/(\n{2,})/)
+    .map((part) => (/^\n+$/.test(part) ? renderNewlineSeparator(part) : renderBlock(part)))
     .filter(Boolean)
     .join("\n");
 
@@ -205,7 +213,7 @@ export function normalizeStoredMarkdown(value: string) {
   const normalized = normalizeNewlines(value ?? "");
   const trimmed = normalized.trim();
   if (!trimmed) return "";
-  if (!/<[a-z][\s\S]*>/i.test(trimmed)) return normalized;
+  if (!shouldConvertLegacyHtml(trimmed)) return normalized;
   return htmlToMarkdown(trimmed);
 }
 

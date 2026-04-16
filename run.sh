@@ -143,6 +143,7 @@ if (( RUN_WORKER )); then
   wait_for_worker
 fi
 
+rm -rf .next
 ./node_modules/.bin/next build
 
 if [[ -f .next/standalone/server.js ]]; then

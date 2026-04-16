@@ -33,6 +33,7 @@ type RichEditorProps = {
   onSelectionChange?: (selectedText: string) => void;
   onRequestEdit?: () => void;
   onRevealEditButton?: () => void;
+  onNoteInteract?: () => void;
   onAddMediaToAi?: (media: {
     id: string;
     kind: AIMediaKind;
@@ -285,6 +286,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   onSelectionChange,
   onRequestEdit,
   onRevealEditButton,
+  onNoteInteract,
   onAddMediaToAi,
   inlineNotice,
   overlay,
@@ -295,6 +297,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const previewRef = useRef<HTMLDivElement>(null);
   const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
   const activeMediaHideTimerRef = useRef<number | null>(null);
+  const previewSelectionTimerRef = useRef<number | null>(null);
+  const previewPointerSelectingRef = useRef(false);
+  const lastPreviewSelectionRef = useRef("");
   const lineTapRef = useRef<{ key: string | null; count: number; startedAt: number }>({
     key: null,
     count: 0,
@@ -322,6 +327,37 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     }, 2000);
   };
 
+  const clearPreviewSelectionTimer = () => {
+    if (previewSelectionTimerRef.current) {
+      window.clearTimeout(previewSelectionTimerRef.current);
+      previewSelectionTimerRef.current = null;
+    }
+  };
+
+  const readPreviewSelection = () => {
+    const preview = previewRef.current;
+    const selection = window.getSelection();
+    if (!preview || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return "";
+    }
+
+    const anchorNode = selection.anchorNode;
+    const focusNode = selection.focusNode;
+    if (!anchorNode || !focusNode || !preview.contains(anchorNode) || !preview.contains(focusNode)) {
+      return "";
+    }
+
+    return selection.toString().trim();
+  };
+
+  const publishPreviewSelection = () => {
+    if (!onSelectionChange || editable) return;
+    const nextSelection = readPreviewSelection();
+    if (nextSelection === lastPreviewSelectionRef.current) return;
+    lastPreviewSelectionRef.current = nextSelection;
+    onSelectionChange(nextSelection);
+  };
+
   const revealEditButton = () => {
     if (editable || typeof window === "undefined") return;
     onRevealEditButton?.();
@@ -330,11 +366,16 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   useEffect(
     () => () => {
       clearActiveMediaHideTimer();
+      clearPreviewSelectionTimer();
     },
     [],
   );
 
   useEffect(() => {
+    lastPreviewSelectionRef.current = "";
+    previewPointerSelectingRef.current = false;
+    clearPreviewSelectionTimer();
+
     if (!editable) {
       selectionRef.current = { start: 0, end: 0 };
       return;
@@ -399,25 +440,39 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     const handleSelectionChange = () => {
       if (!onSelectionChange || editable) return;
 
-      const preview = previewRef.current;
-      const selection = window.getSelection();
-      if (!preview || !selection || selection.rangeCount === 0) {
-        onSelectionChange("");
+      if (previewPointerSelectingRef.current) {
         return;
       }
 
-      const anchorNode = selection.anchorNode;
-      if (!anchorNode || !preview.contains(anchorNode)) {
-        onSelectionChange("");
-        return;
-      }
+      clearPreviewSelectionTimer();
+      previewSelectionTimerRef.current = window.setTimeout(() => {
+        previewSelectionTimerRef.current = null;
+        publishPreviewSelection();
+      }, 80);
+    };
 
-      onSelectionChange(selection.toString().trim());
+    const handlePointerUp = () => {
+      if (!previewPointerSelectingRef.current) return;
+      previewPointerSelectingRef.current = false;
+      clearPreviewSelectionTimer();
+      publishPreviewSelection();
     };
 
     document.addEventListener("selectionchange", handleSelectionChange);
-    return () => document.removeEventListener("selectionchange", handleSelectionChange);
+    document.addEventListener("pointerup", handlePointerUp, true);
+    document.addEventListener("pointercancel", handlePointerUp, true);
+    return () => {
+      clearPreviewSelectionTimer();
+      document.removeEventListener("selectionchange", handleSelectionChange);
+      document.removeEventListener("pointerup", handlePointerUp, true);
+      document.removeEventListener("pointercancel", handlePointerUp, true);
+    };
   }, [editable, onSelectionChange]);
+
+  const handlePreviewPointerDown = () => {
+    if (editable) return;
+    previewPointerSelectingRef.current = true;
+  };
 
   const syncTextareaSelection = () => {
     const textarea = textareaRef.current;
@@ -470,6 +525,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
 
   const handlePreviewClick = (event: ReactMouseEvent<HTMLElement>) => {
     if (editable) return;
+    onNoteInteract?.();
     revealEditButton();
 
     const media = extractEmbeddedMedia(event.target);
@@ -580,6 +636,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               <input
                 className="w-full bg-transparent font-display text-3xl text-ink outline-none sm:text-4xl"
                 onChange={(event) => onTitleChange(event.target.value)}
+                onFocus={onNoteInteract}
+                onPointerDown={onNoteInteract}
                 placeholder="Untitled note"
                 ref={titleInputRef}
                 value={title}
@@ -588,6 +646,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               <button
                 className="block w-full truncate bg-transparent text-left font-display text-3xl text-ink outline-none sm:text-4xl"
                 onClick={handlePreviewClick}
+                onFocus={onNoteInteract}
                 type="button"
               >
                 {title || "Untitled note"}
@@ -600,17 +659,23 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         </div>
 
         {overlay ? <div className="bg-[#fffbf3]">{overlay}</div> : null}
-        {inlineNotice ? <div className="px-[5px] py-[5px]">{inlineNotice}</div> : null}
+        {inlineNotice ? (
+          <div className="pointer-events-none fixed inset-x-0 bottom-4 z-50 flex justify-center px-3 sm:bottom-6">
+            <div className="pointer-events-auto w-full max-w-[34rem]">{inlineNotice}</div>
+          </div>
+        ) : null}
 
         <div className="px-[5px] py-[5px]">
           {editable ? (
             <div className="grid gap-3">
               <div className="relative">
                 <textarea
-                  className="min-h-[34rem] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                  className="hide-scrollbar min-h-[34rem] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
                   onChange={(event) => onBodyChange(event.target.value)}
+                  onFocus={onNoteInteract}
                   onKeyUp={syncTextareaSelection}
                   onMouseUp={syncTextareaSelection}
+                  onPointerDown={onNoteInteract}
                   onScroll={(event) => setTextareaScrollTop(event.currentTarget.scrollTop)}
                   onSelect={syncTextareaSelection}
                   placeholder="Write in markdown..."
@@ -637,10 +702,12 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                         </div>
                         <textarea
                           aria-label="Media tag"
-                          className="min-h-[200px] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                          className="hide-scrollbar min-h-[200px] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
                           onChange={(event) => updateMediaTagText(preview, event.target.value)}
+                          onFocus={onNoteInteract}
                           onKeyUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
                           onMouseUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                          onPointerDown={onNoteInteract}
                           onSelect={(event) => syncMediaTagSelection(preview, event.currentTarget)}
                           spellCheck={false}
                           value={preview.tagText}
@@ -661,6 +728,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 className="markdown-preview min-h-[34rem] cursor-text"
                 dangerouslySetInnerHTML={{ __html: previewHtml }}
                 onClick={handlePreviewClick}
+                onPointerDown={handlePreviewPointerDown}
                 onPlay={handlePreviewPlay}
                 ref={previewRef}
               />
