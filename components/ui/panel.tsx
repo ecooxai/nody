@@ -8,7 +8,7 @@ export function Panel({
   style?: React.CSSProperties;
 }) {
   return (
-    <section className={`rounded-[4px] border border-ink/10 bg-white/90 p-5 text-ink shadow-panel ${className}`} style={style}>
+    <section className={`rounded-[4px] bg-white/90 p-5 text-ink shadow-panel ${className}`} style={style}>
       {children}
     </section>
   );

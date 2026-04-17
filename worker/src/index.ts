@@ -95,7 +95,7 @@ export default {
         if (!(file instanceof File)) return json({ error: "Missing file" }, { status: 400 });
         const folderId = parts[1] === "root" ? null : parts[1];
         const assetId = crypto.randomUUID();
-        const key = `${userId}/folders/${folderId ?? "root"}/${assetId}-${file.name}`;
+        const key = `${userId}/folders/${folderId ?? "root"}/upload/${assetId}-${file.name}`;
         await env.MEDIA_BUCKET.put(key, file.stream(), {
           httpMetadata: { contentType: file.type },
         });
@@ -120,7 +120,7 @@ export default {
         const kind = String(formData.get("kind"));
         if (!(file instanceof File)) return json({ error: "Missing file" }, { status: 400 });
         const assetId = crypto.randomUUID();
-        const key = `${userId}/${parts[1]}/${assetId}-${file.name}`;
+        const key = `${userId}/${parts[1]}/upload/${assetId}-${file.name}`;
         await env.MEDIA_BUCKET.put(key, file.stream(), {
           httpMetadata: { contentType: file.type },
         });

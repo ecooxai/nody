@@ -13,6 +13,7 @@ Current feature set:
 - Service worker registration for offline-first HTML/CSS/JS caching plus delayed update refresh.
 - Bottom error notifications with copyable error codes.
 - Typecheck, test, production build, and Worker config validation scripts.
+- Cloudflare frontend deployment through OpenNext plus a separate Worker API deployment.
 
 Runtime note:
 - If Clerk environment variables are missing, the app falls back to a build-safe setup mode and shows auth configuration guidance instead of mounting live Clerk UI.
@@ -25,7 +26,7 @@ Runtime note:
 - `shared/`: Shared types plus substitution and sync helpers used by both frontend and Worker code.
 - `worker/`: Cloudflare Worker source, Wrangler config, and D1 schema migration.
 - `tests/`: Vitest coverage for shared substitution and sync logic.
-- `doc/`: Task log, overview, common mistakes, and the user-owned vibetask file.
+- `doc/`: Deployment notes, task log, overview, common mistakes, and the user-owned vibetask file.
 
 ## File Tree
 
@@ -58,6 +59,7 @@ Runtime note:
 ├── run.sh                                          # Production-mode runner with file watching and automatic restart
 ├── doc
 │   ├── common_mistakes.md                          # Guardrails for future edits
+│   ├── deploy.md                                   # Cloudflare deployment steps and resource notes
 │   ├── overview.md                                 # Project overview and file tree
 │   ├── update.md                                   # Task history with timing and verification
 │   └── vibetask.md                                 # User-owned task prompt file
@@ -74,6 +76,7 @@ Runtime note:
 ├── middleware.ts                                   # Clerk route protection
 ├── next-env.d.ts                                   # Next.js type shim
 ├── next.config.ts                                  # Next.js config
+├── open-next.config.ts                             # OpenNext Cloudflare adapter config
 ├── package-lock.json                               # Locked dependencies
 ├── package.json                                    # Scripts and dependencies
 ├── postcss.config.js                               # PostCSS config
@@ -89,6 +92,7 @@ Runtime note:
 │   └── substitutions.test.ts                       # Shared logic tests
 ├── tsconfig.json                                   # TypeScript config
 ├── vitest.config.ts                                # Vitest config with alias mapping
+├── wrangler.jsonc                                  # Frontend Cloudflare Worker config for OpenNext
 └── worker
     ├── migrations/0001_initial.sql                 # D1 schema for documents, assets, settings, sync events
     ├── src/ai.ts                                   # OpenAI and Gemini provider adapter

@@ -11,7 +11,7 @@ import { Panel } from "@/components/ui/panel";
 import { apiClient } from "@/lib/api/client";
 import type { EditorCommand } from "@/lib/editor/commands";
 import { clerkClientConfigured } from "@/lib/auth/config";
-import { createStarterMarkdown, normalizeStoredMarkdown } from "@/lib/editor/markdown";
+import { createStarterMarkdown, ensureTrailingNewlines, normalizeStoredMarkdown } from "@/lib/editor/markdown";
 import { useServiceWorker } from "@/lib/hooks/use-service-worker";
 import { createDefaultSettings } from "@/lib/providers/defaults";
 import { getDeviceId } from "@/lib/storage/device";
@@ -217,20 +217,20 @@ function upsertDocument(documents: DocumentRecord[], next: DocumentRecord) {
 
 function menuButtonClass(active: boolean) {
   return active
-    ? "border-ink bg-ink text-white shadow-[0_10px_25px_rgba(15,23,42,0.14)]"
-    : "border-transparent bg-transparent text-ink hover:border-ink/10 hover:bg-black/[0.04]";
+    ? "bg-ink text-white shadow-[0_10px_25px_rgba(15,23,42,0.14)]"
+    : "bg-transparent text-ink hover:bg-black/[0.04]";
 }
 
 function noteButtonClass(active: boolean) {
   return active
-    ? "border-ink/20 bg-mist text-ink"
-    : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist";
+    ? "bg-mist text-ink"
+    : "bg-white text-ink hover:bg-mist";
 }
 
 function actionButtonClass(active: boolean) {
   return active
-    ? "border-ink bg-ink text-white shadow-[0_8px_18px_rgba(15,23,42,0.16)]"
-    : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist";
+    ? "bg-ink text-white shadow-[0_8px_18px_rgba(15,23,42,0.16)]"
+    : "bg-white text-ink hover:bg-mist";
 }
 
 function IconActionButton({
@@ -249,7 +249,7 @@ function IconActionButton({
   return (
     <button
       aria-label={label}
-      className={`flex h-8 w-8 items-center justify-center rounded-full border text-ink transition ${actionButtonClass(active)}`}
+      className={`flex h-8 w-8 items-center justify-center rounded-full text-ink transition ${actionButtonClass(active)}`}
       disabled={disabled}
       onClick={onClick}
       title={label}
@@ -275,7 +275,7 @@ function MenuTriggerButton({
   return (
     <button
       aria-label={label}
-      className={`flex h-10 w-10 items-center justify-center rounded-xl border text-sm font-medium transition ${menuButtonClass(active)}`}
+      className={`flex h-10 w-10 items-center justify-center rounded-xl text-sm font-medium transition ${menuButtonClass(active)}`}
       onClick={onClick}
       title={label}
       type="button"
@@ -296,12 +296,12 @@ function MenuDropdown({
   onClose: () => void;
 }) {
   return (
-    <Panel className="absolute left-0 right-0 top-full z-40 mt-2 border-transparent bg-[#fffdf8]/96 p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)] backdrop-blur">
-      <div className="flex items-center justify-between gap-3 border-b border-ink/10 px-4 py-3">
+    <Panel className="absolute left-0 right-0 top-full z-40 mt-2 bg-[#fffdf8]/96 p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)] backdrop-blur">
+      <div className="flex items-center justify-between gap-3 px-4 py-3">
         <h2 className="text-xs font-semibold uppercase tracking-[0.24em] text-ink/55">{title}</h2>
         <button
           aria-label={`Close ${title}`}
-          className={`flex h-8 w-8 items-center justify-center rounded-full border text-ink transition ${actionButtonClass(false)}`}
+          className={`flex h-8 w-8 items-center justify-center rounded-full text-ink transition ${actionButtonClass(false)}`}
           onClick={onClose}
           type="button"
         >
@@ -411,13 +411,6 @@ function WorkspaceClientContent() {
     return grouped;
   }, [folderAssets]);
   const currentFolder = selectedFolderId ? folderById.get(selectedFolderId) ?? null : null;
-  const aiCurrentFolderFiles = useMemo(
-    () =>
-      folderAssets
-        .filter((asset) => asset.folderId === selectedFolderId)
-        .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()),
-    [folderAssets, selectedFolderId],
-  );
   const recentDocuments = useMemo(
     () => recentDocumentIds.map((id) => documents.find((item) => item.id === id)).filter((item): item is DocumentRecord => Boolean(item)),
     [documents, recentDocumentIds],
@@ -472,6 +465,13 @@ function WorkspaceClientContent() {
     }
     return branch;
   }, [currentFolder, foldersByParent]);
+  const aiCurrentFolderFiles = useMemo(
+    () =>
+      folderAssets
+        .filter((asset) => (currentFolder ? asset.folderId !== null && currentFolderBranchIds.has(asset.folderId) : true))
+        .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime()),
+    [currentFolder, currentFolderBranchIds, folderAssets],
+  );
   const currentFolderStorageBytes = currentFolder ? folderStorageBytesById.get(currentFolder.id) ?? 0 : workspaceStorageBytes;
   const currentFolderAssetCount = useMemo(() => {
     if (!currentFolder) return folderAssets.length;
@@ -573,6 +573,11 @@ function WorkspaceClientContent() {
     if (editButtonTimerRef.current) {
       window.clearTimeout(editButtonTimerRef.current);
       editButtonTimerRef.current = null;
+    }
+    const currentDocument = documentStateRef.current;
+    const paddedBodyMarkdown = ensureTrailingNewlines(currentDocument.bodyMarkdown);
+    if (paddedBodyMarkdown !== currentDocument.bodyMarkdown) {
+      updateDocument({ bodyMarkdown: paddedBodyMarkdown });
     }
     setEditButtonVisible(false);
     setIsEditing(true);
@@ -796,13 +801,13 @@ function WorkspaceClientContent() {
       firstStep: replay.steps[0],
       skippedCount: replay.unapplied.length,
     });
-    setIsEditing(true);
+    enterEditMode();
   };
 
   const confirmAiEdits = () => {
     if (!pendingAiEditPreview) return;
     const { firstStep, nextBodyMarkdown } = pendingAiEditPreview;
-    updateDocument({ bodyMarkdown: nextBodyMarkdown });
+    updateDocument({ bodyMarkdown: ensureTrailingNewlines(nextBodyMarkdown) });
     setPendingAiEditPreview(null);
     window.requestAnimationFrame(() => {
       editorRef.current?.focusRange(firstStep.start, firstStep.start + firstStep.replace.length);
@@ -853,6 +858,34 @@ function WorkspaceClientContent() {
     await createFolder(folderCreateParentId, folderCreateName.trim());
   };
 
+  const expandUploadFolderPath = (uploadFolder: FolderRecord) => {
+    setExpandedFolderIds((current) => {
+      const next = new Set(current);
+      next.add(uploadFolder.id);
+
+      let cursor = uploadFolder.parentFolderId;
+      while (cursor) {
+        next.add(cursor);
+        cursor = folderById.get(cursor)?.parentFolderId ?? null;
+      }
+
+      return Array.from(next);
+    });
+  };
+
+  const ensureUploadFolder = async (parentFolderId: string | null) => {
+    const existing = (foldersByParent.get(parentFolderId) ?? []).find((folder) => folder.name.toLowerCase() === "upload");
+    if (existing) {
+      expandFolderPath(existing.id);
+      return existing;
+    }
+
+    const created = await apiClient.createFolder({ name: "upload", parentFolderId });
+    setFolders((current) => sortFolders([...current, created]));
+    expandUploadFolderPath(created);
+    return created;
+  };
+
   const createNote = async (folderId: string | null) => {
     setCreatingNote(true);
     try {
@@ -890,9 +923,10 @@ function WorkspaceClientContent() {
     }
     setUploading(true);
     try {
-      const asset = await apiClient.uploadFolderAsset(folderId, file, kind);
+      const uploadFolder = await ensureUploadFolder(folderId);
+      const asset = await apiClient.uploadFolderAsset(uploadFolder.id, file, kind);
       setFolderAssets((current) => [asset, ...current]);
-      if (assetPickerFolderId === folderId && assetPickerKind === kind) {
+      if (assetPickerKind === kind && (assetPickerFolderId === folderId || assetPickerFolderId === uploadFolder.id)) {
         setAssetPickerKind(kind);
       }
       if (options?.insertIntoNote) {
@@ -988,7 +1022,7 @@ function WorkspaceClientContent() {
 
     if (!isEditing) {
       setPendingEditorInsertAsset(asset);
-      setIsEditing(true);
+      enterEditMode();
       return;
     }
 
@@ -1121,7 +1155,7 @@ function WorkspaceClientContent() {
     const active = document.id === item.id;
     return (
       <button
-        className={`flex items-center gap-2 rounded-2xl border px-3 py-2 text-left text-sm transition ${noteButtonClass(active)}`}
+        className={`flex items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm transition ${noteButtonClass(active)}`}
         key={item.id}
         onClick={() => selectDocument(item)}
         style={{ paddingLeft: `${12 + depth * 14}px` }}
@@ -1190,8 +1224,8 @@ function WorkspaceClientContent() {
     return (
       <button
         key={asset.id}
-        className={`grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl border px-3 py-2 text-left text-sm transition ${
-          active ? "border-ink bg-ink/5" : "border-ink/10 bg-white hover:border-ink/25 hover:bg-mist"
+        className={`grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl px-3 py-2 text-left text-sm transition ${
+          active ? "bg-ink/5" : "bg-white hover:bg-mist"
         }`}
         style={{ paddingLeft: `${12 + depth * 14}px` }}
         type="button"
@@ -1228,8 +1262,8 @@ function WorkspaceClientContent() {
       <div key={folder.id} className="grid gap-1">
         <div className="flex items-center gap-1">
           <button
-            className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl border px-3 py-2 text-left text-sm transition ${
-              selectedFolderId === folder.id ? "border-sky-200 bg-sky-50 text-sky-950" : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
+            className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition ${
+              selectedFolderId === folder.id ? "bg-sky-50 text-sky-950" : "bg-white text-ink hover:bg-mist"
             }`}
             onClick={() => toggleAndSelectFolder(folder.id)}
             style={{ paddingLeft: `${12 + depth * 12}px` }}
@@ -1369,7 +1403,7 @@ function WorkspaceClientContent() {
                   {!isEditing && editButtonVisible ? (
                     <button
                       aria-label="Edit note"
-                      className="flex h-10 w-10 items-center justify-center rounded-full border border-ink bg-ink text-white transition hover:bg-ink/90"
+                      className="flex h-10 w-10 items-center justify-center rounded-full bg-ink text-white transition hover:bg-ink/90"
                       onClick={enterEditMode}
                       title="Edit note"
                       type="button"
@@ -1393,10 +1427,9 @@ function WorkspaceClientContent() {
 
               {activeWindow === "library" ? (
                 <Panel className="absolute left-3 right-3 top-full z-40 mt-2 max-h-[calc(100vh-5.5rem)] overflow-hidden !bg-white !p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)]">
-                  <div className="flex items-center justify-between gap-3 border-b border-ink/10 px-4 py-3">
+                  <div className="flex items-center justify-between gap-3 px-4 py-3">
                     <div>
                       <h2 className="text-xs font-semibold uppercase tracking-[0.24em] text-ink/55">Library</h2>
-                      <p className="mt-1 text-sm text-ink/55">Browse folders and recent notes.</p>
                     </div>
                     <div className="flex items-center gap-2">
                       <IconActionButton label="New note in workspace root" onClick={() => void createNote(null)}>
@@ -1424,14 +1457,14 @@ function WorkspaceClientContent() {
                   </div>
                   <div className="grid max-h-[calc(100vh-9.5rem)] gap-3 overflow-y-auto p-3">
                     {folderCreateOpen ? (
-                      <section className="rounded-[20px] border border-ink/10 bg-white p-3">
+                      <section className="rounded-[20px] bg-white p-3">
                         <div className="mb-2 text-xs font-semibold uppercase tracking-[0.24em] text-ink/45">
                           New folder {folderCreateParentId ? `in ${folderById.get(folderCreateParentId)?.name ?? "folder"}` : "in workspace root"}
                         </div>
                         <div className="flex items-center gap-2">
                           <input
                             ref={folderCreateInputRef}
-                            className="min-w-0 flex-1 rounded-2xl border border-ink/10 bg-white px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:border-ink/30"
+                            className="min-w-0 flex-1 rounded-2xl bg-black/[0.04] px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:bg-white"
                             disabled={creatingFolder}
                             onChange={(event) => setFolderCreateName(event.target.value)}
                             onKeyDown={(event) => {
@@ -1447,7 +1480,7 @@ function WorkspaceClientContent() {
                             value={folderCreateName}
                           />
                           <button
-                            className="rounded-2xl border border-ink/10 bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-60"
+                            className="rounded-2xl bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-60"
                             disabled={creatingFolder || !folderCreateName.trim()}
                             onClick={() => void submitFolderCreate()}
                             type="button"
@@ -1455,7 +1488,7 @@ function WorkspaceClientContent() {
                             OK
                           </button>
                           <button
-                            className="rounded-2xl border border-ink/10 bg-white px-3 py-2 text-sm font-semibold text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-60"
+                            className="rounded-2xl bg-white px-3 py-2 text-sm font-semibold text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-60"
                             disabled={creatingFolder}
                             onClick={cancelFolderCreate}
                             type="button"
@@ -1466,7 +1499,7 @@ function WorkspaceClientContent() {
                       </section>
                     ) : null}
                     {selectedFolderAsset ? (
-                      <section className="fixed left-1/2 top-3 z-50 w-[600px] max-w-[100vw] -translate-x-1/2 rounded-[24px] border border-ink/10 bg-white p-3 shadow-[0_18px_42px_rgba(15,23,42,0.16)]">
+                      <section className="fixed left-1/2 top-3 z-50 w-[600px] max-w-[100vw] -translate-x-1/2 rounded-[24px] bg-white p-3 shadow-[0_18px_42px_rgba(15,23,42,0.16)]">
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
                             <div className="text-xs font-semibold uppercase tracking-[0.24em] text-ink/45">Preview</div>
@@ -1521,7 +1554,7 @@ function WorkspaceClientContent() {
                         </div>
                         <div
                           ref={previewFrameRef}
-                          className="mt-3 overflow-hidden rounded-[20px] border border-ink/10 bg-black/5"
+                          className="mt-3 overflow-hidden rounded-[20px] bg-black/5"
                           style={{ height: "500px", maxWidth: "100vw", width: "600px" }}
                         >
                           <iframe
@@ -1535,7 +1568,7 @@ function WorkspaceClientContent() {
                       </section>
                     ) : null}
 
-                    <section className="rounded-[24px] border border-ink/10 bg-white p-3">
+                    <section className="rounded-[24px] bg-white p-3">
                       <div className="flex items-center justify-between gap-2">
                         <button
                           className="flex min-w-0 items-center gap-2 text-left text-xs font-semibold uppercase tracking-[0.24em] text-ink/45 transition hover:text-ink/70"
@@ -1599,7 +1632,7 @@ function WorkspaceClientContent() {
                       {recentOpen ? (
                         <div className="mt-2 grid gap-1">
                           {visibleRecentDocuments.length === 0 ? (
-                            <div className="rounded-2xl border border-dashed border-ink/10 px-3 py-2 text-sm text-ink/45">
+                            <div className="rounded-2xl bg-black/[0.03] px-3 py-2 text-sm text-ink/45">
                               No recent notes.
                             </div>
                           ) : (
@@ -1609,7 +1642,7 @@ function WorkspaceClientContent() {
                       ) : null}
                     </section>
 
-                    <section className="rounded-[24px] border border-ink/10 bg-white p-3">
+                    <section className="rounded-[24px] bg-white p-3">
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-ink/45">
                           <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -1635,7 +1668,7 @@ function WorkspaceClientContent() {
                       <div className="mt-3 max-h-[52vh] overflow-y-auto pr-1">
                         <div className="grid gap-1">
                           {libraryFolders.length === 0 ? (
-                            <div className="rounded-2xl border border-dashed border-ink/10 px-3 py-2 text-sm text-ink/45">
+                            <div className="rounded-2xl bg-black/[0.03] px-3 py-2 text-sm text-ink/45">
                               No folders yet.
                             </div>
                           ) : (
@@ -1654,7 +1687,7 @@ function WorkspaceClientContent() {
                     {formatCommands.map((item) => (
                       <button
                         key={item.command}
-                        className="flex h-12 w-12 items-center justify-center rounded-2xl border border-ink/10 bg-white text-ink transition hover:border-ink/25 hover:bg-mist"
+                        className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white text-ink transition hover:bg-mist"
                         onClick={() => runEditorCommand(item.command)}
                         aria-label={item.label}
                         title={item.label}
@@ -1673,7 +1706,7 @@ function WorkspaceClientContent() {
                   <div className="grid gap-3">
                     <div className="flex flex-wrap items-center gap-3">
                       <button
-                        className="flex h-12 w-12 items-center justify-center rounded-2xl border border-ink/10 bg-white text-ink transition hover:border-ink/25 hover:bg-mist disabled:cursor-not-allowed disabled:opacity-60"
+                        className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-60"
                         disabled={uploading}
                         onClick={() => pickFolderUpload(assetPickerFolderId ?? selectedFolderId)}
                         title="Upload to folder"
@@ -1686,7 +1719,7 @@ function WorkspaceClientContent() {
                         <span className="sr-only">Upload to folder</span>
                       </button>
                       <button
-                        className="flex h-12 w-12 items-center justify-center rounded-2xl border border-ink/10 bg-white text-ink transition hover:border-ink/25 hover:bg-mist"
+                        className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white text-ink transition hover:bg-mist"
                         onClick={() => openAssetPicker("image")}
                         title="Insert image"
                         type="button"
@@ -1710,7 +1743,7 @@ function WorkspaceClientContent() {
                         <span className="sr-only">Insert image</span>
                       </button>
                       <button
-                        className="flex h-12 w-12 items-center justify-center rounded-2xl border border-ink/10 bg-white text-ink transition hover:border-ink/25 hover:bg-mist"
+                        className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white text-ink transition hover:bg-mist"
                         onClick={() => openAssetPicker("audio")}
                         title="Insert audio"
                         type="button"
@@ -1723,7 +1756,7 @@ function WorkspaceClientContent() {
                         <span className="sr-only">Insert audio</span>
                       </button>
                       <button
-                        className="flex h-12 w-12 items-center justify-center rounded-2xl border border-ink/10 bg-white text-ink transition hover:border-ink/25 hover:bg-mist"
+                        className="flex h-12 w-12 items-center justify-center rounded-2xl bg-white text-ink transition hover:bg-mist"
                         onClick={() => openAssetPicker("video")}
                         title="Insert video"
                         type="button"
@@ -1762,10 +1795,10 @@ function WorkspaceClientContent() {
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <button
-                            className={`rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] transition ${
+                            className={`rounded-full px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] transition ${
                               assetInsertionPlacement === "cursor"
-                                ? "border-ink bg-ink text-white"
-                                : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
+                                ? "bg-ink text-white"
+                                : "bg-white text-ink hover:bg-mist"
                             }`}
                             onClick={() => setAssetInsertionPlacement("cursor")}
                             type="button"
@@ -1773,10 +1806,10 @@ function WorkspaceClientContent() {
                             Last cursor
                           </button>
                           <button
-                            className={`rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] transition ${
+                            className={`rounded-full px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] transition ${
                               assetInsertionPlacement === "top"
-                                ? "border-ink bg-ink text-white"
-                                : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
+                                ? "bg-ink text-white"
+                                : "bg-white text-ink hover:bg-mist"
                             }`}
                             onClick={() => setAssetInsertionPlacement("top")}
                             type="button"
@@ -1786,13 +1819,13 @@ function WorkspaceClientContent() {
                         </div>
                         <div className="grid gap-1">
                           {assetPickerAssets.length === 0 ? (
-                            <div className="rounded-2xl border border-dashed border-ink/10 px-3 py-2 text-sm text-ink/45">
+                            <div className="rounded-2xl bg-black/[0.03] px-3 py-2 text-sm text-ink/45">
                               No files yet.
                             </div>
                           ) : (
                             assetPickerAssets.map((asset) => (
                               <button
-                                className="flex items-center justify-between gap-3 rounded-2xl border border-ink/10 bg-white px-4 py-3 text-left transition hover:border-ink/25 hover:bg-mist"
+                                className="flex items-center justify-between gap-3 rounded-2xl bg-white px-4 py-3 text-left transition hover:bg-mist"
                                 key={asset.id}
                                 onClick={() => {
                                   editorRef.current?.insertAsset(asset, assetInsertionPlacement);
@@ -1832,27 +1865,27 @@ function WorkspaceClientContent() {
               {activeWindow === "info" ? (
                 <MenuDropdown onClose={() => setActiveWindow(null)} title="Note info">
                   <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                    <div className="rounded-[20px] border border-ink/10 bg-white px-4 py-3">
+                    <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Title</div>
                       <div className="mt-2 font-medium text-ink">{document.title || "Untitled note"}</div>
                     </div>
-                    <div className="rounded-[20px] border border-ink/10 bg-white px-4 py-3">
+                    <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Folder</div>
                       <div className="mt-2 font-medium text-ink">{selectedFolderName}</div>
                     </div>
-                    <div className="rounded-[20px] border border-ink/10 bg-white px-4 py-3">
+                    <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Revision</div>
                       <div className="mt-2 font-medium text-ink">{document.revision}</div>
                     </div>
-                    <div className="rounded-[20px] border border-ink/10 bg-white px-4 py-3">
+                    <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Files</div>
                       <div className="mt-2 font-medium text-ink">{currentFolderAssetCount}</div>
                     </div>
-                    <div className="rounded-[20px] border border-ink/10 bg-white px-4 py-3">
+                    <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Storage</div>
                       <div className="mt-2 font-medium text-ink">{formatBytes(currentFolderStorageBytes)}</div>
                     </div>
-                    <div className="rounded-[20px] border border-ink/10 bg-white px-4 py-3 sm:col-span-2 lg:col-span-4">
+                    <div className="rounded-[20px] bg-white px-4 py-3 sm:col-span-2 lg:col-span-4">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Updated</div>
                       <div className="mt-2 text-sm font-medium text-ink">{new Date(document.updatedAt).toLocaleString()}</div>
                     </div>
@@ -1869,7 +1902,7 @@ function WorkspaceClientContent() {
               editable={isEditing}
               inlineNotice={
                 pendingAiEditPreview ? (
-                  <div className="overflow-hidden rounded-[8px] border border-ink/10 bg-[#fff7e8] shadow-[0_16px_36px_rgba(15,23,42,0.14)]">
+                  <div className="overflow-hidden rounded-[8px] bg-[#fff7e8] shadow-[0_16px_36px_rgba(15,23,42,0.14)]">
                     <div className="grid max-h-[40vh] gap-2 overflow-auto px-3 py-3">
                       <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Suggested replace</div>
                       <div className="whitespace-pre-wrap break-words text-sm text-[#8c5c54] line-through">
@@ -1888,16 +1921,16 @@ function WorkspaceClientContent() {
                         </div>
                       ) : null}
                     </div>
-                    <div className="flex justify-end gap-2 border-t border-ink/10 px-3 py-2">
+                    <div className="flex justify-end gap-2 px-3 py-2">
                       <button
-                        className="rounded-full border border-ink/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-ink transition hover:border-ink/20 hover:bg-white"
+                        className="rounded-full px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-ink transition hover:bg-white"
                         onClick={() => setPendingAiEditPreview(null)}
                         type="button"
                       >
                         Cancel
                       </button>
                       <button
-                        className="rounded-full border border-ink bg-ink px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-ink/90"
+                        className="rounded-full bg-ink px-3 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-white transition hover:bg-ink/90"
                         onClick={confirmAiEdits}
                         type="button"
                       >
@@ -2022,7 +2055,7 @@ function WorkspaceClientContent() {
                     </svg>
                   </IconActionButton>
                   <button
-                    className="rounded-full border border-ink bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
+                    className="rounded-full bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
                     onClick={exitEditMode}
                     type="button"
                   >

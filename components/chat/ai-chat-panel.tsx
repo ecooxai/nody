@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   LiveTalkPanel,
   type LiveHistoryControls,
+  type LiveHistoryImage,
   type LiveHistoryTargets,
   type LiveSendAttachment,
   type LiveSendHandle,
@@ -52,6 +53,12 @@ type ExternalAttachmentSeed = {
   mimeType: string;
   assetUrl: string;
   previewUrl: string;
+};
+
+type TopbarGeneratedImage = {
+  id: string;
+  fileName: string;
+  url: string;
 };
 
 type LiveSessionState = {
@@ -368,6 +375,8 @@ export function AIChatPanel({
   const [imageGenerationActive, setImageGenerationActive] = useState(false);
   const [chatLatestMessageAvailable, setChatLatestMessageAvailable] = useState(false);
   const [liveLatestMessageAvailable, setLiveLatestMessageAvailable] = useState(false);
+  const [latestMessageShortcutFlashing, setLatestMessageShortcutFlashing] = useState(false);
+  const [generatedImageTrayOpen, setGeneratedImageTrayOpen] = useState(false);
   const [liveVideoSources, setLiveVideoSources] = useState<LiveVideoSource[]>([]);
   const [liveVideoMenuOpen, setLiveVideoMenuOpen] = useState(false);
   const [liveVideoMenuLoading, setLiveVideoMenuLoading] = useState(false);
@@ -376,6 +385,7 @@ export function AIChatPanel({
   const [liveHistoryTargets, setLiveHistoryTargets] = useState<LiveHistoryTargets>({
     hasCamera: false,
     hasGeneratedImage: false,
+    generatedImages: [],
   });
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [composerChromeHeight, setComposerChromeHeight] = useState(0);
@@ -406,6 +416,10 @@ export function AIChatPanel({
   const cameraLongPressTriggeredRef = useRef(false);
   const cameraCaptureHandledRef = useRef(false);
   const pendingComposerScrollRef = useRef(false);
+  const latestMessageFlashTimerRef = useRef<number | null>(null);
+  const generatedImageTrayRef = useRef<HTMLDivElement>(null);
+  const latestGeneratedImageIdRef = useRef<string | null>(null);
+  const generatedImageWatcherReadyRef = useRef(false);
   const microphoneMenuRef = useRef<HTMLDivElement>(null);
   const liveVideoMenuRef = useRef<HTMLDivElement>(null);
   const resizePointerIdRef = useRef<number | null>(null);
@@ -432,6 +446,20 @@ export function AIChatPanel({
         )?.id ?? null;
     }
   }
+  const chatGeneratedImages: TopbarGeneratedImage[] = messages.flatMap((message) =>
+    message.role === "assistant"
+      ? (message.attachments ?? [])
+          .filter((attachment) => attachment.kind === "image" && Boolean(attachment.url))
+          .map((attachment) => ({
+            id: attachment.id,
+            fileName: attachment.fileName,
+            url: attachment.url ?? "",
+          }))
+      : [],
+  );
+  const activeGeneratedImages: TopbarGeneratedImage[] =
+    activeTab === "live" ? liveHistoryTargets.generatedImages.map(({ id, fileName, url }: LiveHistoryImage) => ({ id, fileName, url })) : chatGeneratedImages;
+  const latestGeneratedImage = activeGeneratedImages[activeGeneratedImages.length - 1] ?? null;
   const displayedPanelHeight = compact ? COMPACT_PANEL_HEIGHT : panelHeight;
   const compactComposerChrome = historyExpanded;
   const composerChromeScale = compactComposerChrome ? 0.5 : 1;
@@ -446,6 +474,18 @@ export function AIChatPanel({
       ? liveHistoryTargets.hasCamera
       : cameraPreviewVisible || cameraPreparing || cameraRecording || Boolean(latestChatCameraAttachmentId);
   const liveCameraShortcutFlashing = activeTab === "live" && liveVideoShareMode === "camera" && liveHistoryTargets.hasCamera;
+
+  const triggerLatestMessageShortcutFlash = useCallback(() => {
+    if (typeof window === "undefined") return;
+    if (latestMessageFlashTimerRef.current) {
+      window.clearTimeout(latestMessageFlashTimerRef.current);
+    }
+    setLatestMessageShortcutFlashing(true);
+    latestMessageFlashTimerRef.current = window.setTimeout(() => {
+      latestMessageFlashTimerRef.current = null;
+      setLatestMessageShortcutFlashing(false);
+    }, 2600);
+  }, []);
 
   useEffect(() => {
     if (provider !== "gemini" && activeTab === "live") {
@@ -485,20 +525,22 @@ export function AIChatPanel({
   }, [activeTab, provider]);
 
   useEffect(() => {
-    if (!liveVideoMenuOpen && !microphoneMenuOpen) return;
+    if (!liveVideoMenuOpen && !microphoneMenuOpen && !generatedImageTrayOpen) return;
 
     const handlePointerDown = (event: PointerEvent) => {
       const target = event.target;
       if (!(target instanceof Node)) return;
+      if (generatedImageTrayRef.current?.contains(target)) return;
       if (liveVideoMenuRef.current?.contains(target)) return;
       if (microphoneMenuRef.current?.contains(target)) return;
+      setGeneratedImageTrayOpen(false);
       setLiveVideoMenuOpen(false);
       setMicrophoneMenuOpen(false);
     };
 
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [liveVideoMenuOpen, microphoneMenuOpen]);
+  }, [generatedImageTrayOpen, liveVideoMenuOpen, microphoneMenuOpen]);
 
   const focusHistory = useCallback(() => {
     setHistoryExpanded(true);
@@ -525,13 +567,32 @@ export function AIChatPanel({
     target.scrollIntoView({ behavior: "smooth", block: "start" });
   }, [focusHistory]);
 
-  const scrollToGeneratedImage = useCallback(() => {
+  const scrollToChatGeneratedImage = useCallback((imageId?: string) => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const generatedImages = container.querySelectorAll<HTMLElement>('[data-chat-generated-image="true"]');
+    const target = imageId
+      ? Array.from(generatedImages).find((image) => image.dataset.chatGeneratedImageId === imageId)
+      : generatedImages[generatedImages.length - 1];
+    if (!target) return;
+    focusHistory();
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [focusHistory]);
+
+  const scrollToGeneratedImage = useCallback((imageId?: string) => {
     if (activeTab === "live") {
-      liveHistoryControls?.scrollToGeneratedImage();
+      liveHistoryControls?.scrollToGeneratedImage(imageId);
       return;
     }
-    scrollToChatHistoryTarget('[data-chat-generated-image="true"]');
-  }, [activeTab, liveHistoryControls, scrollToChatHistoryTarget]);
+    scrollToChatGeneratedImage(imageId);
+  }, [activeTab, liveHistoryControls, scrollToChatGeneratedImage]);
+
+  const handleGeneratedImageShortcutClick = useCallback(() => {
+    scrollToGeneratedImage();
+    if (activeGeneratedImages.length > 0) {
+      setGeneratedImageTrayOpen(true);
+    }
+  }, [activeGeneratedImages.length, scrollToGeneratedImage]);
 
   const scrollToCameraTarget = useCallback(() => {
     if (activeTab === "live") {
@@ -558,12 +619,14 @@ export function AIChatPanel({
       container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
     }
     setChatLatestMessageAvailable(false);
+    setLatestMessageShortcutFlashing(false);
   }, [focusHistory]);
 
   const scrollToLatestMessage = useCallback(() => {
     if (activeTab === "live") {
       liveHistoryControls?.scrollToLatest();
       setLiveLatestMessageAvailable(false);
+      setLatestMessageShortcutFlashing(false);
       return;
     }
     scrollToLatestChatMessage();
@@ -578,6 +641,7 @@ export function AIChatPanel({
     const latestMessageInView = latestRect.top >= containerRect.top - 48 && latestRect.top <= containerRect.bottom;
     if (latestMessageInView) {
       setChatLatestMessageAvailable(false);
+      setLatestMessageShortcutFlashing(false);
     }
   }, []);
 
@@ -654,6 +718,26 @@ export function AIChatPanel({
   }, [attachments.length, selectedPrompts.length]);
 
   useEffect(() => {
+    const latestId = latestGeneratedImage?.id ?? null;
+    if (!generatedImageWatcherReadyRef.current) {
+      generatedImageWatcherReadyRef.current = true;
+      latestGeneratedImageIdRef.current = latestId;
+      return;
+    }
+
+    if (latestId && latestGeneratedImageIdRef.current !== latestId) {
+      setGeneratedImageTrayOpen(true);
+    }
+    latestGeneratedImageIdRef.current = latestId;
+  }, [latestGeneratedImage?.id]);
+
+  useEffect(() => {
+    if (activeGeneratedImages.length === 0) {
+      setGeneratedImageTrayOpen(false);
+    }
+  }, [activeGeneratedImages.length]);
+
+  useEffect(() => {
     if (!latestAssistantMessageId) {
       previousLatestAssistantMessageIdRef.current = null;
       setChatLatestMessageAvailable(false);
@@ -667,7 +751,8 @@ export function AIChatPanel({
       setComposerCondensed(true);
     }
     setChatLatestMessageAvailable(true);
-  }, [latestAssistantMessageId, latestChatMessageRole, promptExpanded]);
+    triggerLatestMessageShortcutFlash();
+  }, [latestAssistantMessageId, latestChatMessageRole, promptExpanded, triggerLatestMessageShortcutFlash]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -707,6 +792,9 @@ export function AIChatPanel({
       }
       if (cameraLongPressTimerRef.current) {
         window.clearTimeout(cameraLongPressTimerRef.current);
+      }
+      if (latestMessageFlashTimerRef.current) {
+        window.clearTimeout(latestMessageFlashTimerRef.current);
       }
       cameraRecorderRef.current?.stop?.();
       cameraStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -1208,10 +1296,31 @@ export function AIChatPanel({
   }, []);
 
   const handleLiveHistoryTargetsChange = useCallback((targets: LiveHistoryTargets) => {
-    setLiveHistoryTargets((current) =>
-      current.hasCamera === targets.hasCamera && current.hasGeneratedImage === targets.hasGeneratedImage ? current : targets,
-    );
+    setLiveHistoryTargets((current) => {
+      const sameImages =
+        current.generatedImages.length === targets.generatedImages.length &&
+        current.generatedImages.every((image, index) => {
+          const nextImage = targets.generatedImages[index];
+          return nextImage && image.id === nextImage.id && image.url === nextImage.url && image.fileName === nextImage.fileName;
+        });
+      return current.hasCamera === targets.hasCamera && current.hasGeneratedImage === targets.hasGeneratedImage && sameImages ? current : targets;
+    });
   }, []);
+
+  const handleLiveLatestMessageStateChange = useCallback(
+    (available: boolean) => {
+      if (!available) {
+        setLatestMessageShortcutFlashing(false);
+      }
+      setLiveLatestMessageAvailable((current) => {
+        if (available && !current) {
+          triggerLatestMessageShortcutFlash();
+        }
+        return available;
+      });
+    },
+    [triggerLatestMessageShortcutFlash],
+  );
 
   const confirmUploadPreviewImage = () => {
     if (!previewAttachment || previewAttachment.kind !== "image") return;
@@ -1682,7 +1791,9 @@ export function AIChatPanel({
           {showLatestMessageShortcut ? (
             <button
               aria-label="Scroll to latest message"
-              className="flex h-7 w-7 items-center justify-center rounded-[4px] border border-[#bb3e2d]/25 bg-[#fff7e8] text-[#bb3e2d] transition hover:border-[#bb3e2d]/40 hover:bg-[#ffeacd]"
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] border border-[#bb3e2d]/25 bg-[#fff7e8] text-[#bb3e2d] transition hover:border-[#bb3e2d]/40 hover:bg-[#ffeacd] ${
+                latestMessageShortcutFlashing ? "animate-pulse ring-2 ring-[#bb3e2d]/35" : ""
+              }`}
               onClick={scrollToLatestMessage}
               title="Scroll to latest message"
               type="button"
@@ -1700,29 +1811,69 @@ export function AIChatPanel({
             </button>
           ) : null}
           {showGeneratedImageShortcut ? (
-            <button
-              aria-label={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
-              className={`flex h-7 w-7 items-center justify-center rounded-[4px] border transition ${
-                imageGenerationActive
-                  ? "border-black bg-black text-white hover:border-black hover:bg-black"
-                  : "border-[#1f6f78]/20 bg-[#e5f5f7] text-[#1f6f78] hover:border-[#1f6f78]/35 hover:bg-[#d8eef1]"
-              }`}
-              onClick={scrollToGeneratedImage}
-              title={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
-              type="button"
-            >
-              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
-                <path
-                  d="M5 6.5A1.5 1.5 0 0 1 6.5 5h11A1.5 1.5 0 0 1 19 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 17.5v-11Z"
-                  stroke="currentColor"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="1.7"
-                />
-                <path d="m7.5 16 3.2-3.4 2.3 2.2 2.1-2.8 1.4 4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                <circle cx="9" cy="9" r="1.2" fill="currentColor" />
-              </svg>
-            </button>
+            <div className="relative" ref={generatedImageTrayRef}>
+              <button
+                aria-label={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
+                className={`flex h-7 w-7 items-center justify-center rounded-[4px] border transition ${
+                  imageGenerationActive
+                    ? "border-black bg-black text-white hover:border-black hover:bg-black"
+                    : "border-[#1f6f78]/20 bg-[#e5f5f7] text-[#1f6f78] hover:border-[#1f6f78]/35 hover:bg-[#d8eef1]"
+                }`}
+                onClick={handleGeneratedImageShortcutClick}
+                title={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
+                type="button"
+              >
+                <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                  <path
+                    d="M5 6.5A1.5 1.5 0 0 1 6.5 5h11A1.5 1.5 0 0 1 19 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 17.5v-11Z"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.7"
+                  />
+                  <path d="m7.5 16 3.2-3.4 2.3 2.2 2.1-2.8 1.4 4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                  <circle cx="9" cy="9" r="1.2" fill="currentColor" />
+                </svg>
+              </button>
+              {generatedImageTrayOpen && activeGeneratedImages.length > 0 ? (
+                <div className="absolute right-0 top-[calc(100%+0.5rem)] z-30 w-[232px] rounded-[8px] border border-ink/10 bg-white p-2 shadow-[0_16px_34px_rgba(15,23,42,0.18)] sm:w-[340px]">
+                  <div className="mb-2 flex items-center justify-between gap-2">
+                    <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Generated images</div>
+                    <button
+                      aria-label="Close generated images"
+                      className="flex h-6 w-6 items-center justify-center rounded-[4px] text-ink/45 transition hover:bg-mist hover:text-ink"
+                      onClick={() => setGeneratedImageTrayOpen(false)}
+                      type="button"
+                    >
+                      <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                        <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                      </svg>
+                    </button>
+                  </div>
+                  <div className="flex max-h-[224px] flex-wrap gap-2 overflow-auto overscroll-contain pr-1">
+                    {activeGeneratedImages.map((image) => {
+                      const latest = image.id === latestGeneratedImage?.id;
+                      return (
+                        <button
+                          className={`h-[100px] w-[100px] overflow-hidden rounded-[6px] border bg-[#f7f1e6] transition hover:border-[#1f6f78]/45 ${
+                            latest ? "border-[#1f6f78] ring-2 ring-[#1f6f78]/15" : "border-ink/10"
+                          }`}
+                          key={image.id}
+                          onClick={() => {
+                            scrollToGeneratedImage(image.id);
+                            setGeneratedImageTrayOpen(false);
+                          }}
+                          title={image.fileName}
+                          type="button"
+                        >
+                          <img alt={image.fileName} className="h-full w-full object-cover" src={image.url} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ) : null}
+            </div>
           ) : null}
           {showCameraShortcut ? (
             <button
@@ -2619,7 +2770,7 @@ export function AIChatPanel({
             onHistoryInteract={focusHistory}
             onHistoryTargetsChange={handleLiveHistoryTargetsChange}
             onImageGenerationStateChange={setImageGenerationActive}
-            onLatestMessageStateChange={setLiveLatestMessageAvailable}
+            onLatestMessageStateChange={handleLiveLatestMessageStateChange}
             onRegisterHistoryControls={setLiveHistoryControls}
             onRegisterSend={setLiveSendHandle}
             onRegisterVideoControls={setLiveVideoControls}

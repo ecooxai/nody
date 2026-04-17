@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "nody-db",
-      "database_id": "local-dev-db"
+      "database_id": "381c67c7-23c8-48d4-b41b-57dec0d0608e"
     }
   ],
   "r2_buckets": [

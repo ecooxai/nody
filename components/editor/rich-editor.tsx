@@ -14,7 +14,7 @@ import {
 
 import type { EditorCommand } from "@/lib/editor/commands";
 import { assetToMarkdown } from "@/lib/editor/media";
-import { markdownToHtml } from "@/lib/editor/markdown";
+import { ensureTrailingNewlines, markdownToHtml } from "@/lib/editor/markdown";
 import type { AIMediaKind, DocumentAsset } from "@/shared/types";
 
 export type RichEditorHandle = {
@@ -309,8 +309,16 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const [textareaScrollTop, setTextareaScrollTop] = useState(0);
   const [mediaPreviewTops, setMediaPreviewTops] = useState<Record<number, number>>({});
   const [viewerMedia, setViewerMedia] = useState<EmbeddedMedia | null>(null);
-  const previewHtml = useMemo(() => markdownToHtml(bodyMarkdown), [bodyMarkdown]);
-  const mediaTagPreviews = useMemo(() => extractMediaTagPreviews(bodyMarkdown), [bodyMarkdown]);
+  const noteBodyMarkdown = useMemo(() => ensureTrailingNewlines(bodyMarkdown), [bodyMarkdown]);
+  const previewHtml = useMemo(() => markdownToHtml(noteBodyMarkdown), [noteBodyMarkdown]);
+  const mediaTagPreviews = useMemo(() => extractMediaTagPreviews(noteBodyMarkdown), [noteBodyMarkdown]);
+
+  const resizeTextareaToContent = () => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  };
 
   const clearActiveMediaHideTimer = () => {
     if (activeMediaHideTimerRef.current) {
@@ -384,9 +392,21 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     setActiveMedia(null);
     window.requestAnimationFrame(() => {
       const textarea = textareaRef.current;
+      resizeTextareaToContent();
       textarea?.focus();
       setTextareaScrollTop(textarea?.scrollTop ?? 0);
     });
+  }, [editable]);
+
+  useLayoutEffect(() => {
+    if (!editable) return;
+    resizeTextareaToContent();
+  }, [noteBodyMarkdown, editable]);
+
+  useEffect(() => {
+    if (!editable) return;
+    window.addEventListener("resize", resizeTextareaToContent);
+    return () => window.removeEventListener("resize", resizeTextareaToContent);
   }, [editable]);
 
   useLayoutEffect(() => {
@@ -397,7 +417,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     }
 
     const updatePreviewTops = () => {
-      setMediaPreviewTops(measureMediaPreviewTops(textarea, bodyMarkdown, mediaTagPreviews));
+      setMediaPreviewTops(measureMediaPreviewTops(textarea, noteBodyMarkdown, mediaTagPreviews));
       setTextareaScrollTop(textarea.scrollTop);
     };
 
@@ -410,7 +430,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       resizeObserver.disconnect();
       window.removeEventListener("resize", updatePreviewTops);
     };
-  }, [bodyMarkdown, editable, mediaTagPreviews]);
+  }, [noteBodyMarkdown, editable, mediaTagPreviews]);
 
   useEffect(() => {
     if (!activeMedia) return;
@@ -496,7 +516,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   };
 
   const updateMediaTagText = (preview: MediaTagPreview, nextTagText: string) => {
-    const nextValue = `${bodyMarkdown.slice(0, preview.matchIndex)}${nextTagText}${bodyMarkdown.slice(preview.endIndex)}`;
+    const nextValue = `${noteBodyMarkdown.slice(0, preview.matchIndex)}${nextTagText}${noteBodyMarkdown.slice(preview.endIndex)}`;
     const caret = preview.matchIndex + nextTagText.length;
     onBodyChange(nextValue);
     selectionRef.current = { start: caret, end: caret };
@@ -519,8 +539,12 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     const linesBefore = textarea.value.slice(0, clampedStart).split("\n").length - 1;
     textarea.focus();
     textarea.setSelectionRange(clampedStart, clampedEnd);
-    textarea.scrollTop = Math.max(linesBefore * lineHeight, 0);
-    setTextareaScrollTop(textarea.scrollTop);
+    textarea.scrollTop = 0;
+    setTextareaScrollTop(0);
+    window.scrollTo({
+      top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + linesBefore * lineHeight - 96, 0),
+      behavior: "smooth",
+    });
   };
 
   const handlePreviewClick = (event: ReactMouseEvent<HTMLElement>) => {
@@ -602,9 +626,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       insertAsset: (asset, position = "cursor") => {
         if (!editable) return;
         const snippet = assetToMarkdown(asset);
-        const value = bodyMarkdown;
+        const value = noteBodyMarkdown;
         if (position === "top") {
-          applyTextareaMutation(`${snippet}\n\n${value}`.trim(), { start: 0, end: 0 });
+          applyTextareaMutation(`${snippet}\n\n${value}`, { start: 0, end: 0 });
           return;
         }
 
@@ -620,11 +644,11 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       },
       runCommand: (command) => {
         if (!editable) return;
-        const next = applyCommand(bodyMarkdown, selectionRef.current, command);
+        const next = applyCommand(noteBodyMarkdown, selectionRef.current, command);
         applyTextareaMutation(next.value, next.selection);
       },
     }),
-    [bodyMarkdown, editable],
+    [noteBodyMarkdown, editable],
   );
 
   return (
@@ -670,7 +694,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
             <div className="grid gap-3">
               <div className="relative">
                 <textarea
-                  className="hide-scrollbar min-h-[34rem] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                  className="min-h-[34rem] w-full resize-none overflow-hidden bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
                   onChange={(event) => onBodyChange(event.target.value)}
                   onFocus={onNoteInteract}
                   onKeyUp={syncTextareaSelection}
@@ -680,7 +704,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                   onSelect={syncTextareaSelection}
                   placeholder="Write in markdown..."
                   ref={textareaRef}
-                  value={bodyMarkdown}
+                  value={noteBodyMarkdown}
                 />
                 {mediaTagPreviews.length > 0 ? (
                   <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-label="Media tag previews">
@@ -717,10 +741,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                   </div>
                 ) : null}
               </div>
-              <div className="px-[5px] py-[5px] text-sm text-ink/45">
-                Markdown is saved directly. Images render from markdown syntax or inserted media blocks. Audio and video render as embedded players.
-              </div>
-              <div aria-hidden="true" className="h-[110vh]" />
+              <div aria-hidden="true" className="h-[90vh]" />
             </div>
           ) : (
             <div className="relative">
@@ -732,7 +753,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 onPlay={handlePreviewPlay}
                 ref={previewRef}
               />
-              <div aria-hidden="true" className="h-[110vh]" />
+              <div aria-hidden="true" className="h-[90vh]" />
               {activeMedia ? (
                 <div
                   className="absolute z-20 flex items-center gap-2 rounded-full bg-white/96 px-2 py-1 shadow-[0_12px_28px_rgba(15,23,42,0.14)]"

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { markdownToHtml, normalizeStoredMarkdown } from "@/lib/editor/markdown";
+import { ensureTrailingNewlines, markdownToHtml, normalizeStoredMarkdown } from "@/lib/editor/markdown";
 
 describe("normalizeStoredMarkdown", () => {
   it("preserves trailing markdown newlines", () => {
@@ -40,5 +40,21 @@ describe("markdownToHtml", () => {
     expect(markdownToHtml("First line\n\nSecond line\n\n\nThird line")).toBe(
       "<p>First line</p>\n<br />\n<p>Second line</p>\n<br />\n<br />\n<p>Third line</p>",
     );
+  });
+});
+
+describe("ensureTrailingNewlines", () => {
+  it("adds enough newlines to reach the requested bottom padding", () => {
+    expect(ensureTrailingNewlines("First line")).toBe(`First line${"\n".repeat(10)}`);
+    expect(ensureTrailingNewlines("First line\n\n")).toBe(`First line${"\n".repeat(10)}`);
+  });
+
+  it("leaves content that already has enough trailing newlines unchanged", () => {
+    const value = `First line${"\n".repeat(11)}`;
+    expect(ensureTrailingNewlines(value)).toBe(value);
+  });
+
+  it("normalizes line endings before counting trailing newlines", () => {
+    expect(ensureTrailingNewlines("First line\r\n")).toBe(`First line${"\n".repeat(10)}`);
   });
 });

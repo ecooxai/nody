@@ -217,6 +217,14 @@ export function normalizeStoredMarkdown(value: string) {
   return htmlToMarkdown(trimmed);
 }
 
+export function ensureTrailingNewlines(value: string, count = 10) {
+  const normalized = normalizeNewlines(value ?? "");
+  const targetCount = Math.max(0, count);
+  const existingCount = normalized.match(/\n*$/)?.[0].length ?? 0;
+  if (existingCount >= targetCount) return normalized;
+  return `${normalized}${"\n".repeat(targetCount - existingCount)}`;
+}
+
 export function createStarterMarkdown() {
   return "# Untitled note\n\nStart writing here. Ask AI to summarize, rewrite, or patch selected passages.";
 }

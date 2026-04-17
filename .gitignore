@@ -1,5 +1,7 @@
 node_modules
 .next
+.open-next
+.wrangler
 coverage
 dist
 *.log
@@ -7,5 +9,6 @@ dist
 .env*
 !.env.example
 /tmp
+/.dev.vars
 /worker/.wrangler
 /worker/.dev.vars

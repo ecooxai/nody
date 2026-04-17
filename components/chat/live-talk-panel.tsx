@@ -98,12 +98,19 @@ export type LiveVideoShareState = {
 export type LiveHistoryControls = {
   scrollToLatest: () => void;
   scrollToCamera: () => void;
-  scrollToGeneratedImage: () => void;
+  scrollToGeneratedImage: (imageId?: string) => void;
+};
+
+export type LiveHistoryImage = {
+  id: string;
+  fileName: string;
+  url: string;
 };
 
 export type LiveHistoryTargets = {
   hasCamera: boolean;
   hasGeneratedImage: boolean;
+  generatedImages: LiveHistoryImage[];
 };
 
 type LiveImageContext = {
@@ -781,6 +788,19 @@ export function LiveTalkPanel({
     if (!activeVideoTurn) return turns;
     return [...turns.filter((turn) => turn.id !== activeVideoTurnId), activeVideoTurn];
   }, [activeVideoTurnId, turns]);
+  const generatedHistoryImages = useMemo(
+    () =>
+      orderedTurns.flatMap((turn) =>
+        (turn.images ?? [])
+          .filter((image) => image.origin === "generated")
+          .map((image) => ({
+            id: image.id,
+            fileName: image.fileName,
+            url: image.url,
+          })),
+      ),
+    [orderedTurns],
+  );
 
   const setLatestMessageAvailable = useCallback((available: boolean) => {
     onLatestMessageStateChange?.(available);
@@ -837,14 +857,16 @@ export function LiveTalkPanel({
     setLatestMessageAvailable(false);
   }, [onHistoryInteract, setLatestMessageAvailable]);
 
-  const scrollToLiveGeneratedImage = useCallback(() => {
+  const scrollToLiveGeneratedImage = useCallback((imageId?: string) => {
     const container = liveHistoryRef.current;
     if (!container) return;
     const generatedImages = container.querySelectorAll<HTMLElement>('[data-live-generated-image="true"]');
-    const latestGeneratedImage = generatedImages[generatedImages.length - 1];
-    if (!latestGeneratedImage) return;
+    const target = imageId
+      ? Array.from(generatedImages).find((image) => image.dataset.liveGeneratedImageId === imageId)
+      : generatedImages[generatedImages.length - 1];
+    if (!target) return;
     onHistoryInteract?.();
-    latestGeneratedImage.scrollIntoView({ behavior: "smooth", block: "start" });
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
     wasNearLiveHistoryBottomRef.current = true;
     setLatestMessageAvailable(false);
   }, [onHistoryInteract, setLatestMessageAvailable]);
@@ -862,9 +884,10 @@ export function LiveTalkPanel({
   useEffect(() => {
     onHistoryTargetsChange?.({
       hasCamera: orderedTurns.some((turn) => Boolean(turn.videoStream && turn.videoMode === "camera")),
-      hasGeneratedImage: orderedTurns.some((turn) => Boolean(turn.images?.some((image) => image.origin === "generated"))),
+      hasGeneratedImage: generatedHistoryImages.length > 0,
+      generatedImages: generatedHistoryImages,
     });
-  }, [onHistoryTargetsChange, orderedTurns]);
+  }, [generatedHistoryImages, onHistoryTargetsChange, orderedTurns]);
 
   useEffect(() => {
     if (!onRegisterSend) return;
@@ -2282,6 +2305,7 @@ export function LiveTalkPanel({
                       <button
                         className="flex overflow-hidden rounded-[8px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
                         data-live-generated-image={image.origin === "generated" ? "true" : undefined}
+                        data-live-generated-image-id={image.origin === "generated" ? image.id : undefined}
                         key={image.id}
                         onClick={() => setPreviewImage(image)}
                         type="button"
