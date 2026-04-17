@@ -799,12 +799,14 @@ export function AIChatPanel({
     setPromptContentDraft(template?.content ?? "");
   };
 
-  const clearComposer = () => {
+  const clearComposer = (options?: { preservePrompts?: boolean }) => {
     attachments.forEach(revokeAttachmentPreview);
     setAttachments([]);
     setPreviewAttachment(null);
     setPreviewPrompt(null);
-    setSelectedPrompts([]);
+    if (!options?.preservePrompts) {
+      setSelectedPrompts([]);
+    }
     setPromptPickerOpen(false);
     resetPromptEditor();
     setPrompt("");
@@ -868,7 +870,7 @@ export function AIChatPanel({
 
       if (sent) {
         if (!options?.preserveComposer) {
-          clearComposer();
+          clearComposer({ preservePrompts: true });
         }
         setFolderPickerOpen(false);
       }
@@ -927,7 +929,7 @@ export function AIChatPanel({
         return;
       }
 
-      clearComposer();
+      clearComposer({ preservePrompts: true });
       return;
     }
 
@@ -2053,7 +2055,7 @@ export function AIChatPanel({
             <div className="mb-3 shrink-0 flex items-center justify-between gap-2">
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Prompt Library</div>
-                <div className="text-xs text-ink/55">Built-ins and synced prompts</div>
+                <div className="text-xs text-ink/55">Saved prompts</div>
               </div>
               <div className="flex items-center gap-2">
                 <button
@@ -2127,24 +2129,15 @@ export function AIChatPanel({
                 return (
                   <div className="relative" key={item.id}>
                     <button
-                      className={`flex h-[50px] w-[70px] flex-col justify-between rounded-[12px] border px-2 py-2 text-left transition ${
+                      className={`flex h-[100px] w-[140px] flex-col overflow-hidden rounded-[12px] border px-4 py-4 text-left transition ${
                         selected ? "border-ink bg-mist" : "border-ink/10 bg-[#fffdfa] hover:border-ink/20 hover:bg-mist"
                       }`}
                       onClick={() => addPromptTemplate(item)}
                       type="button"
                     >
-                      <div className="flex items-start justify-between gap-2">
-                        <span className="rounded-full bg-black/[0.04] px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-[0.12em] text-ink/55">
-                          {item.builtin ? "Built-in" : "Cloud"}
-                        </span>
-                        {selected ? (
-                          <span className="rounded-full bg-ink px-1.5 py-0.5 text-[8px] font-semibold uppercase tracking-[0.12em] text-white">
-                            Added
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="min-w-0">
+                      <div className="min-w-0 pr-3">
                         <div className="line-clamp-2 break-words text-[10px] font-semibold leading-4 text-ink">{item.name}</div>
+                        <div className="mt-2 line-clamp-3 break-words text-[9px] leading-3 text-ink/50">{item.content}</div>
                       </div>
                     </button>
                     {!item.builtin ? (
