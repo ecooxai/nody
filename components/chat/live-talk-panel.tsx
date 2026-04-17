@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiClient } from "@/lib/api/client";
 import { stripMarkdown } from "@/lib/editor/markdown";
@@ -10,6 +10,7 @@ type LiveGeneratedImage = {
   id: string;
   fileName: string;
   mimeType: string;
+  origin: "camera" | "generated";
   url: string;
   dataBase64: string;
 };
@@ -92,6 +93,17 @@ export type LiveVideoControls = {
 export type LiveVideoShareState = {
   mode: "camera" | "screen" | null;
   cameraDeviceId?: string | null;
+};
+
+export type LiveHistoryControls = {
+  scrollToLatest: () => void;
+  scrollToCamera: () => void;
+  scrollToGeneratedImage: () => void;
+};
+
+export type LiveHistoryTargets = {
+  hasCamera: boolean;
+  hasGeneratedImage: boolean;
 };
 
 type LiveImageContext = {
@@ -543,6 +555,11 @@ export function LiveTalkPanel({
   onError,
   onRegisterSend,
   onRegisterVideoControls,
+  onRegisterHistoryControls,
+  onHistoryInteract,
+  onHistoryTargetsChange,
+  onImageGenerationStateChange,
+  onLatestMessageStateChange,
   onSessionStateChange,
   onVideoShareStateChange,
   onUploadImageToCurrentFolder,
@@ -558,6 +575,11 @@ export function LiveTalkPanel({
   onError: (message: string) => void;
   onRegisterSend?: ((send: LiveSendHandle | null) => void) | undefined;
   onRegisterVideoControls?: ((controls: LiveVideoControls | null) => void) | undefined;
+  onRegisterHistoryControls?: ((controls: LiveHistoryControls | null) => void) | undefined;
+  onHistoryInteract?: (() => void) | undefined;
+  onHistoryTargetsChange?: ((targets: LiveHistoryTargets) => void) | undefined;
+  onImageGenerationStateChange?: ((generating: boolean) => void) | undefined;
+  onLatestMessageStateChange?: ((available: boolean) => void) | undefined;
   onSessionStateChange?: ((state: LiveSessionState) => void) | undefined;
   onVideoShareStateChange?: ((state: LiveVideoShareState) => void) | undefined;
   onUploadImageToCurrentFolder?: ((attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<void>) | undefined;
@@ -573,9 +595,10 @@ export function LiveTalkPanel({
   const [focusedVideoTurnId, setFocusedVideoTurnId] = useState<string | null>(null);
   const [expandedVideoTurnIds, setExpandedVideoTurnIds] = useState<Set<string>>(() => new Set());
   const [activeVideoTurnId, setActiveVideoTurnId] = useState<string | null>(null);
-  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
+  const [historyNotice, setHistoryNotice] = useState<{ id: string; content: string } | null>(null);
   const liveHistoryRef = useRef<HTMLDivElement>(null);
   const wasNearLiveHistoryBottomRef = useRef(true);
+  const historyNoticeTimerRef = useRef<number | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
@@ -627,6 +650,22 @@ export function LiveTalkPanel({
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const pendingGeneratedImageScrollRef = useRef(false);
+
+  const showHistoryNotice = useCallback((content: string) => {
+    if (historyNoticeTimerRef.current) {
+      window.clearTimeout(historyNoticeTimerRef.current);
+    }
+    setHistoryNotice({
+      id: `notice:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+      content,
+    });
+    wasNearLiveHistoryBottomRef.current = true;
+    historyNoticeTimerRef.current = window.setTimeout(() => {
+      historyNoticeTimerRef.current = null;
+      setHistoryNotice(null);
+    }, 5000);
+  }, []);
+
   useEffect(() => {
     readyRef.current = ready;
   }, [ready]);
@@ -646,6 +685,10 @@ export function LiveTalkPanel({
       if (reconnectTimerRef.current) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
+      }
+      if (historyNoticeTimerRef.current) {
+        window.clearTimeout(historyNoticeTimerRef.current);
+        historyNoticeTimerRef.current = null;
       }
     },
     [],
@@ -739,32 +782,89 @@ export function LiveTalkPanel({
     return [...turns.filter((turn) => turn.id !== activeVideoTurnId), activeVideoTurn];
   }, [activeVideoTurnId, turns]);
 
-  const updateLiveHistoryScrollState = () => {
+  const setLatestMessageAvailable = useCallback((available: boolean) => {
+    onLatestMessageStateChange?.(available);
+  }, [onLatestMessageStateChange]);
+
+  const updateLiveHistoryScrollState = useCallback(() => {
     const container = liveHistoryRef.current;
     if (!container) return;
     const activeVideo = container.querySelector<HTMLElement>('[data-active-live-video="true"]');
+    const liveTurns = container.querySelectorAll<HTMLElement>('[data-live-turn="true"]');
+    const latestTurn = liveTurns[liveTurns.length - 1];
     const containerRect = container.getBoundingClientRect();
     const activeVideoRect = activeVideo?.getBoundingClientRect();
+    const latestTurnRect = latestTurn?.getBoundingClientRect();
     const activeVideoInView = Boolean(
       activeVideoRect && activeVideoRect.bottom <= containerRect.bottom + 48 && activeVideoRect.bottom >= containerRect.top,
     );
-    const nearLatest = container.scrollHeight - container.scrollTop - container.clientHeight < 48 || activeVideoInView;
+    const latestTurnInView = Boolean(
+      latestTurnRect && latestTurnRect.top >= containerRect.top - 48 && latestTurnRect.top <= containerRect.bottom,
+    );
+    const nearLatest = container.scrollHeight - container.scrollTop - container.clientHeight < 48 || activeVideoInView || latestTurnInView;
     wasNearLiveHistoryBottomRef.current = nearLatest;
-    setShowScrollToLatest(!nearLatest);
-  };
+    setLatestMessageAvailable(!nearLatest);
+  }, [setLatestMessageAvailable]);
 
-  const scrollToLiveLatest = () => {
+  const scrollToLiveLatest = useCallback(() => {
+    const container = liveHistoryRef.current;
+    if (!container) return;
+    onHistoryInteract?.();
+    const activeVideo = container.querySelector<HTMLElement>('[data-active-live-video="true"]');
+    if (activeVideo) {
+      activeVideo.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+      const liveTurns = container.querySelectorAll<HTMLElement>('[data-live-turn="true"]');
+      const latestTurn = liveTurns[liveTurns.length - 1];
+      if (latestTurn) {
+        latestTurn.scrollIntoView({ behavior: "smooth", block: "start" });
+      } else {
+        container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+      }
+    }
+    wasNearLiveHistoryBottomRef.current = true;
+    setLatestMessageAvailable(false);
+  }, [onHistoryInteract, setLatestMessageAvailable]);
+
+  const scrollToLiveCamera = useCallback(() => {
     const container = liveHistoryRef.current;
     if (!container) return;
     const activeVideo = container.querySelector<HTMLElement>('[data-active-live-video="true"]');
-    if (activeVideo) {
-      activeVideo.scrollIntoView({ behavior: "smooth", block: "end" });
-    } else {
-      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-    }
+    if (!activeVideo) return;
+    onHistoryInteract?.();
+    activeVideo.scrollIntoView({ behavior: "smooth", block: "start" });
     wasNearLiveHistoryBottomRef.current = true;
-    setShowScrollToLatest(false);
-  };
+    setLatestMessageAvailable(false);
+  }, [onHistoryInteract, setLatestMessageAvailable]);
+
+  const scrollToLiveGeneratedImage = useCallback(() => {
+    const container = liveHistoryRef.current;
+    if (!container) return;
+    const generatedImages = container.querySelectorAll<HTMLElement>('[data-live-generated-image="true"]');
+    const latestGeneratedImage = generatedImages[generatedImages.length - 1];
+    if (!latestGeneratedImage) return;
+    onHistoryInteract?.();
+    latestGeneratedImage.scrollIntoView({ behavior: "smooth", block: "start" });
+    wasNearLiveHistoryBottomRef.current = true;
+    setLatestMessageAvailable(false);
+  }, [onHistoryInteract, setLatestMessageAvailable]);
+
+  useEffect(() => {
+    if (!onRegisterHistoryControls) return;
+    onRegisterHistoryControls({
+      scrollToLatest: scrollToLiveLatest,
+      scrollToCamera: scrollToLiveCamera,
+      scrollToGeneratedImage: scrollToLiveGeneratedImage,
+    });
+    return () => onRegisterHistoryControls(null);
+  }, [onRegisterHistoryControls, scrollToLiveCamera, scrollToLiveGeneratedImage, scrollToLiveLatest]);
+
+  useEffect(() => {
+    onHistoryTargetsChange?.({
+      hasCamera: orderedTurns.some((turn) => Boolean(turn.videoStream && turn.videoMode === "camera")),
+      hasGeneratedImage: orderedTurns.some((turn) => Boolean(turn.images?.some((image) => image.origin === "generated"))),
+    });
+  }, [onHistoryTargetsChange, orderedTurns]);
 
   useEffect(() => {
     if (!onRegisterSend) return;
@@ -1499,6 +1599,7 @@ export function LiveTalkPanel({
         id: crypto.randomUUID(),
         fileName: `camera-shot-${Date.now()}.jpg`,
         mimeType: "image/jpeg",
+        origin: "camera",
         url: base64ToObjectUrl(dataBase64, "image/jpeg"),
         dataBase64,
       };
@@ -1667,71 +1768,77 @@ export function LiveTalkPanel({
       const imageContext = latestImageContextRef.current;
       const attachments = shouldEditWithLiveImage(requestPrompt, Boolean(imageContext)) && imageContext ? [imageContext] : undefined;
       const assistantTurnId = announceImageGenerationStart();
-      const response = await apiClient.askAi({
-        prompt: requestPrompt,
-        title: noteTitleRef.current,
-        bodyMarkdown: noteBodyMarkdownRef.current,
-        mode: "image",
-        attachments,
-      });
+      onImageGenerationStateChange?.(true);
+      try {
+        const response = await apiClient.askAi({
+          prompt: requestPrompt,
+          title: noteTitleRef.current,
+          bodyMarkdown: noteBodyMarkdownRef.current,
+          mode: "image",
+          attachments,
+        });
 
-      if (cancelledToolCallIdsRef.current.has(callId)) {
+        if (cancelledToolCallIdsRef.current.has(callId)) {
+          return {
+            id: callId,
+            name: call.name ?? "generate_image",
+            response: {
+              ok: false,
+              cancelled: true,
+            },
+          };
+        }
+
+        const images: LiveGeneratedImage[] = (response.attachments ?? [])
+          .filter((attachment) => attachment.kind === "image" && attachment.dataBase64.trim())
+          .map((attachment) => {
+            const url = base64ToObjectUrl(attachment.dataBase64, attachment.mimeType);
+            generatedImageUrlsRef.current.push(url);
+            return {
+              id: crypto.randomUUID(),
+              fileName: attachment.fileName,
+              mimeType: attachment.mimeType,
+              origin: "generated",
+              url,
+              dataBase64: attachment.dataBase64,
+            };
+          });
+
+        const latestGeneratedImage = images[images.length - 1];
+        if (latestGeneratedImage) {
+          latestImageContextRef.current = {
+            id: latestGeneratedImage.id,
+            kind: "image",
+            fileName: latestGeneratedImage.fileName,
+            mimeType: latestGeneratedImage.mimeType,
+            source: "folder",
+            dataBase64: latestGeneratedImage.dataBase64,
+          };
+        }
+
+        if (images.length > 0) {
+          pendingGeneratedImageScrollRef.current = true;
+        }
+        appendImagesToAssistantTurn(images, assistantTurnId);
+        setStatus(images.length > 0 ? "Generated image from live tool." : "Live tool returned no image.");
+
         return {
           id: callId,
           name: call.name ?? "generate_image",
           response: {
-            ok: false,
-            cancelled: true,
+            ok: images.length > 0,
+            message: response.answer,
+            image_count: images.length,
+            current_source_image_updated: images.length > 0,
+            images: images.map((image) => ({
+              file_name: image.fileName,
+              mime_type: image.mimeType,
+            })),
           },
         };
+      } finally {
+        onImageGenerationStateChange?.(false);
       }
-
-      const images: LiveGeneratedImage[] = (response.attachments ?? [])
-        .filter((attachment) => attachment.kind === "image" && attachment.dataBase64.trim())
-        .map((attachment) => {
-          const url = base64ToObjectUrl(attachment.dataBase64, attachment.mimeType);
-          generatedImageUrlsRef.current.push(url);
-          return {
-            id: crypto.randomUUID(),
-            fileName: attachment.fileName,
-            mimeType: attachment.mimeType,
-            url,
-            dataBase64: attachment.dataBase64,
-          };
-        });
-
-      const latestGeneratedImage = images[images.length - 1];
-      if (latestGeneratedImage) {
-        latestImageContextRef.current = {
-          id: latestGeneratedImage.id,
-          kind: "image",
-          fileName: latestGeneratedImage.fileName,
-          mimeType: latestGeneratedImage.mimeType,
-          source: "folder",
-          dataBase64: latestGeneratedImage.dataBase64,
-        };
-      }
-
-      if (images.length > 0) {
-        pendingGeneratedImageScrollRef.current = true;
-      }
-      appendImagesToAssistantTurn(images, assistantTurnId);
-      setStatus(images.length > 0 ? "Generated image from live tool." : "Live tool returned no image.");
-
-      return {
-        id: callId,
-        name: call.name ?? "generate_image",
-        response: {
-          ok: images.length > 0,
-          message: response.answer,
-          image_count: images.length,
-          current_source_image_updated: images.length > 0,
-          images: images.map((image) => ({
-            file_name: image.fileName,
-            mime_type: image.mimeType,
-          })),
-        },
-      };
     };
 
     const runSuggestNoteEditsTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
@@ -1939,7 +2046,8 @@ export function LiveTalkPanel({
           },
         }),
       );
-      setStatus("Tool response sent to Gemini.");
+      setStatus("Live talk ready.");
+      showHistoryNotice("Tool response sent to Gemini.");
     };
 
     const liveSendHandle: LiveSendHandle = {
@@ -2101,6 +2209,7 @@ export function LiveTalkPanel({
     };
   }, [
     connectionRevision,
+    onImageGenerationStateChange,
     onError,
     onRegisterSend,
     onRegisterVideoControls,
@@ -2109,6 +2218,7 @@ export function LiveTalkPanel({
     providerSettings.liveModel,
     providerSettings.model,
     sessionRequested,
+    showHistoryNotice,
   ]);
 
   useEffect(() => {
@@ -2117,29 +2227,13 @@ export function LiveTalkPanel({
 
     const frameId = window.requestAnimationFrame(() => {
       if (pendingGeneratedImageScrollRef.current) {
-        const generatedImages = container.querySelectorAll<HTMLElement>('[data-live-generated-image="true"]');
-        const latestGeneratedImage = generatedImages[generatedImages.length - 1];
-        if (latestGeneratedImage) {
-          latestGeneratedImage.scrollIntoView({ behavior: "smooth", block: "end" });
-          pendingGeneratedImageScrollRef.current = false;
-          wasNearLiveHistoryBottomRef.current = true;
-          setShowScrollToLatest(false);
-          return;
-        }
-      }
-      if (wasNearLiveHistoryBottomRef.current) {
-        const activeVideo = container.querySelector<HTMLElement>('[data-active-live-video="true"]');
-        if (activeVideo) {
-          activeVideo.scrollIntoView({ block: "end" });
-        } else {
-          container.scrollTop = container.scrollHeight;
-        }
+        pendingGeneratedImageScrollRef.current = false;
       }
       updateLiveHistoryScrollState();
     });
 
     return () => window.cancelAnimationFrame(frameId);
-  }, [orderedTurns, status]);
+  }, [historyNotice, orderedTurns, status, updateLiveHistoryScrollState]);
 
   const hiddenStatuses = new Set([
     "Open the Live tab to start a session.",
@@ -2150,12 +2244,19 @@ export function LiveTalkPanel({
   const showStatus = !hiddenStatuses.has(status);
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col gap-2 bg-transparent p-[5px]">
+    <div className="relative flex h-full min-h-0 flex-col gap-0 bg-transparent p-0">
       {showStatus ? (
         <div className="bg-mist/40 px-2 py-1 text-sm text-ink/70">{status}</div>
       ) : null}
 
-      <div className="min-h-0 flex-1 overflow-auto bg-transparent p-[5px]" onScroll={updateLiveHistoryScrollState} ref={liveHistoryRef}>
+      <div
+        className="min-h-0 flex-1 overflow-auto bg-transparent p-0"
+        onPointerDown={onHistoryInteract}
+        onScroll={updateLiveHistoryScrollState}
+        onTouchMove={onHistoryInteract}
+        onWheel={onHistoryInteract}
+        ref={liveHistoryRef}
+      >
         <div className="flex flex-col gap-2">
           {orderedTurns.length === 0 ? (
             <div className="px-2 py-3 text-sm text-ink/45">
@@ -2171,9 +2272,25 @@ export function LiveTalkPanel({
                   turn.role === "assistant" ? "bg-white" : turn.role === "user" ? "self-end bg-ink text-white" : "bg-mist text-ink/60"
                 } ${turn.role === "user" ? "max-w-[92%]" : "max-w-[92%]"}`}
                 data-active-live-video={turn.id === activeVideoTurnId && turn.videoStream ? "true" : undefined}
+                data-live-turn="true"
                 key={turn.id}
                 style={turn.role === "user" ? { minWidth: "min(400px, 92%)" } : undefined}
               >
+                {turn.images?.length ? (
+                  <div className={`${turn.content || turn.videoStream ? "mb-2" : ""} grid gap-2`}>
+                    {turn.images.map((image) => (
+                      <button
+                        className="flex overflow-hidden rounded-[8px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
+                        data-live-generated-image={image.origin === "generated" ? "true" : undefined}
+                        key={image.id}
+                        onClick={() => setPreviewImage(image)}
+                        type="button"
+                      >
+                        <img alt={image.fileName} className="max-h-[240px] w-auto max-w-full object-contain" src={image.url} />
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
                 {turn.content ? <div className="whitespace-pre-wrap break-words">{turn.content}</div> : null}
                 {turn.videoStream ? (
                   <div
@@ -2246,21 +2363,6 @@ export function LiveTalkPanel({
                     ) : null}
                   </div>
                 ) : null}
-                {turn.images?.length ? (
-                  <div className="mt-2 grid gap-2">
-                    {turn.images.map((image) => (
-                      <button
-                        className="flex overflow-hidden rounded-[8px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
-                        data-live-generated-image="true"
-                        key={image.id}
-                        onClick={() => setPreviewImage(image)}
-                        type="button"
-                      >
-                        <img alt={image.fileName} className="max-h-[240px] w-auto max-w-full object-contain" src={image.url} />
-                      </button>
-                    ))}
-                  </div>
-                ) : null}
                 {turn.role === "assistant" && turn.substitutions?.length ? (
                   <div className="mt-3 grid gap-2">
                     {turn.substitutions.map((edit, index) => (
@@ -2294,23 +2396,14 @@ export function LiveTalkPanel({
               </div>
             );
           })}
+          {historyNotice ? (
+            <div className="self-center rounded-[4px] bg-mist/80 px-2 py-1 text-xs text-ink/65" key={historyNotice.id}>
+              {historyNotice.content}
+            </div>
+          ) : null}
           <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 300 }} />
         </div>
       </div>
-
-      {showScrollToLatest ? (
-        <button
-          aria-label={activeVideoTurnId ? "Scroll to camera video" : "Scroll to latest message"}
-          className="absolute bottom-4 left-1/2 z-20 flex h-10 w-10 -translate-x-1/2 items-center justify-center rounded-[8px] border border-[#1f6f78]/20 bg-[#1f6f78] text-white shadow-[0_12px_26px_rgba(31,111,120,0.28)] transition hover:bg-[#195d65]"
-          onClick={scrollToLiveLatest}
-          title={activeVideoTurnId ? "Scroll to camera" : "Scroll to latest"}
-          type="button"
-        >
-          <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-            <path d="M12 5v14M6 13l6 6l6-6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
-          </svg>
-        </button>
-      ) : null}
 
       {previewImage ? (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/45 p-4">

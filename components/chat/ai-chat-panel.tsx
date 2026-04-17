@@ -4,6 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   LiveTalkPanel,
+  type LiveHistoryControls,
+  type LiveHistoryTargets,
   type LiveSendAttachment,
   type LiveSendHandle,
   type LiveVideoControls,
@@ -362,10 +364,21 @@ export function AIChatPanel({
   });
   const [liveSendHandle, setLiveSendHandle] = useState<LiveSendHandle | null>(null);
   const [liveVideoControls, setLiveVideoControls] = useState<LiveVideoControls | null>(null);
+  const [liveHistoryControls, setLiveHistoryControls] = useState<LiveHistoryControls | null>(null);
+  const [imageGenerationActive, setImageGenerationActive] = useState(false);
+  const [chatLatestMessageAvailable, setChatLatestMessageAvailable] = useState(false);
+  const [liveLatestMessageAvailable, setLiveLatestMessageAvailable] = useState(false);
   const [liveVideoSources, setLiveVideoSources] = useState<LiveVideoSource[]>([]);
   const [liveVideoMenuOpen, setLiveVideoMenuOpen] = useState(false);
   const [liveVideoMenuLoading, setLiveVideoMenuLoading] = useState(false);
   const [liveVideoShareMode, setLiveVideoShareMode] = useState<LiveVideoShareState["mode"]>(null);
+  const [liveCameraFlashOn, setLiveCameraFlashOn] = useState(true);
+  const [liveHistoryTargets, setLiveHistoryTargets] = useState<LiveHistoryTargets>({
+    hasCamera: false,
+    hasGeneratedImage: false,
+  });
+  const [historyExpanded, setHistoryExpanded] = useState(false);
+  const [composerChromeHeight, setComposerChromeHeight] = useState(0);
   const [liveMicrophoneEnabled, setLiveMicrophoneEnabled] = useState(true);
   const [microphoneSources, setMicrophoneSources] = useState<MicrophoneSource[]>([]);
   const [microphoneMenuOpen, setMicrophoneMenuOpen] = useState(false);
@@ -373,6 +386,7 @@ export function AIChatPanel({
   const [selectedMicrophoneId, setSelectedMicrophoneId] = useState<string | null>(null);
   const attachmentsRef = useRef<LocalAttachment[]>([]);
   const composerItemsRef = useRef<HTMLDivElement>(null);
+  const composerChromeRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const latestAssistantMessageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -398,7 +412,40 @@ export function AIChatPanel({
   const resizeStartYRef = useRef(0);
   const resizeStartHeightRef = useRef(460);
   const latestAssistantMessageId = [...messages].reverse().find((message) => message.role === "assistant")?.id ?? null;
+  const previousLatestAssistantMessageIdRef = useRef<string | null>(null);
+  const latestChatMessageRole = messages[messages.length - 1]?.role ?? null;
+  let latestChatGeneratedImageId: string | null = null;
+  let latestChatCameraAttachmentId: string | null = null;
+  for (let index = messages.length - 1; index >= 0 && (!latestChatGeneratedImageId || !latestChatCameraAttachmentId); index -= 1) {
+    const message = messages[index];
+    const attachmentsReversed = [...(message.attachments ?? [])].reverse();
+    if (!latestChatGeneratedImageId && message.role === "assistant") {
+      latestChatGeneratedImageId =
+        attachmentsReversed.find((attachment) => attachment.kind === "image" && Boolean(attachment.url))?.id ?? null;
+    }
+    if (!latestChatCameraAttachmentId && message.role === "user") {
+      latestChatCameraAttachmentId =
+        attachmentsReversed.find(
+          (attachment) =>
+            Boolean(attachment.url) &&
+            (attachment.fileName.startsWith("photo-") || attachment.fileName.startsWith("video-")),
+        )?.id ?? null;
+    }
+  }
   const displayedPanelHeight = compact ? COMPACT_PANEL_HEIGHT : panelHeight;
+  const compactComposerChrome = historyExpanded;
+  const composerChromeScale = compactComposerChrome ? 0.5 : 1;
+  const composerChromeFrameHeight = composerChromeHeight ? composerChromeHeight * composerChromeScale : undefined;
+  const liveConnectButtonActive = activeTab === "live" && supportsLive && liveConnectionRequested;
+  const liveConnectButtonReady = liveConnectButtonActive && liveSessionState.ready;
+  const showLatestMessageShortcut = activeTab === "live" ? liveLatestMessageAvailable : chatLatestMessageAvailable;
+  const showGeneratedImageShortcut =
+    imageGenerationActive || (activeTab === "live" ? liveHistoryTargets.hasGeneratedImage : Boolean(latestChatGeneratedImageId));
+  const showCameraShortcut =
+    activeTab === "live"
+      ? liveHistoryTargets.hasCamera
+      : cameraPreviewVisible || cameraPreparing || cameraRecording || Boolean(latestChatCameraAttachmentId);
+  const liveCameraShortcutFlashing = activeTab === "live" && liveVideoShareMode === "camera" && liveHistoryTargets.hasCamera;
 
   useEffect(() => {
     if (provider !== "gemini" && activeTab === "live") {
@@ -411,6 +458,31 @@ export function AIChatPanel({
       setLiveVideoMenuOpen(false);
     }
   }, [activeTab]);
+
+  useEffect(() => {
+    if (!liveCameraShortcutFlashing) {
+      setLiveCameraFlashOn(true);
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      setLiveCameraFlashOn((current) => !current);
+    }, 2000);
+    return () => window.clearInterval(intervalId);
+  }, [liveCameraShortcutFlashing]);
+
+  useEffect(() => {
+    const element = composerChromeRef.current;
+    if (!element || typeof ResizeObserver === "undefined") return;
+
+    const updateLiveComposerHeight = () => {
+      setComposerChromeHeight(element.scrollHeight);
+    };
+    updateLiveComposerHeight();
+
+    const observer = new ResizeObserver(updateLiveComposerHeight);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [activeTab, provider]);
 
   useEffect(() => {
     if (!liveVideoMenuOpen && !microphoneMenuOpen) return;
@@ -427,6 +499,87 @@ export function AIChatPanel({
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
   }, [liveVideoMenuOpen, microphoneMenuOpen]);
+
+  const focusHistory = useCallback(() => {
+    setHistoryExpanded(true);
+    setFolderPickerOpen(false);
+    setLiveVideoMenuOpen(false);
+    setMicrophoneMenuOpen(false);
+    setPromptPickerOpen(false);
+    if (!promptExpanded) {
+      setComposerCondensed(true);
+    }
+  }, [promptExpanded]);
+
+  const expandComposerChrome = useCallback(() => {
+    setHistoryExpanded(false);
+  }, []);
+
+  const scrollToChatHistoryTarget = useCallback((selector: string) => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    const targets = container.querySelectorAll<HTMLElement>(selector);
+    const target = targets[targets.length - 1];
+    if (!target) return;
+    focusHistory();
+    target.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [focusHistory]);
+
+  const scrollToGeneratedImage = useCallback(() => {
+    if (activeTab === "live") {
+      liveHistoryControls?.scrollToGeneratedImage();
+      return;
+    }
+    scrollToChatHistoryTarget('[data-chat-generated-image="true"]');
+  }, [activeTab, liveHistoryControls, scrollToChatHistoryTarget]);
+
+  const scrollToCameraTarget = useCallback(() => {
+    if (activeTab === "live") {
+      liveHistoryControls?.scrollToCamera();
+      return;
+    }
+    const cameraPreview = cameraVideoRef.current?.parentElement;
+    if ((cameraPreviewVisible || cameraPreparing || cameraRecording) && cameraPreview) {
+      focusHistory();
+      cameraPreview.scrollIntoView({ behavior: "smooth", block: "start" });
+      return;
+    }
+    scrollToChatHistoryTarget('[data-chat-camera-media="true"]');
+  }, [activeTab, cameraPreparing, cameraPreviewVisible, cameraRecording, focusHistory, liveHistoryControls, scrollToChatHistoryTarget]);
+
+  const scrollToLatestChatMessage = useCallback(() => {
+    const container = messagesContainerRef.current;
+    if (!container) return;
+    focusHistory();
+    const latestAssistantMessage = latestAssistantMessageRef.current;
+    if (latestAssistantMessage) {
+      latestAssistantMessage.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
+    }
+    setChatLatestMessageAvailable(false);
+  }, [focusHistory]);
+
+  const scrollToLatestMessage = useCallback(() => {
+    if (activeTab === "live") {
+      liveHistoryControls?.scrollToLatest();
+      setLiveLatestMessageAvailable(false);
+      return;
+    }
+    scrollToLatestChatMessage();
+  }, [activeTab, liveHistoryControls, scrollToLatestChatMessage]);
+
+  const updateChatHistoryScrollState = useCallback(() => {
+    const container = messagesContainerRef.current;
+    const latestAssistantMessage = latestAssistantMessageRef.current;
+    if (!container || !latestAssistantMessage) return;
+    const containerRect = container.getBoundingClientRect();
+    const latestRect = latestAssistantMessage.getBoundingClientRect();
+    const latestMessageInView = latestRect.top >= containerRect.top - 48 && latestRect.top <= containerRect.bottom;
+    if (latestMessageInView) {
+      setChatLatestMessageAvailable(false);
+    }
+  }, []);
 
   useEffect(() => {
     const trimmedSelection = selectedText?.trim();
@@ -501,20 +654,20 @@ export function AIChatPanel({
   }, [attachments.length, selectedPrompts.length]);
 
   useEffect(() => {
-    const container = messagesContainerRef.current;
-    const latestAssistantMessage = latestAssistantMessageRef.current;
-    if (!container || !latestAssistantMessage) return;
-    if (messages[messages.length - 1]?.role !== "assistant") return;
+    if (!latestAssistantMessageId) {
+      previousLatestAssistantMessageIdRef.current = null;
+      setChatLatestMessageAvailable(false);
+      return;
+    }
+    if (latestChatMessageRole !== "assistant") return;
+    if (previousLatestAssistantMessageIdRef.current === latestAssistantMessageId) return;
 
+    previousLatestAssistantMessageIdRef.current = latestAssistantMessageId;
     if (!promptExpanded) {
       setComposerCondensed(true);
     }
-
-    container.scrollTo({
-      top: Math.max(latestAssistantMessage.offsetTop - container.offsetTop, 0),
-      behavior: "smooth",
-    });
-  }, [latestAssistantMessageId, messages]);
+    setChatLatestMessageAvailable(true);
+  }, [latestAssistantMessageId, latestChatMessageRole, promptExpanded]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -887,7 +1040,16 @@ export function AIChatPanel({
       provider === "gemini" && providerSettings.imageModel.trim() && shouldUseImageGeneration(prompt, selectedPrompts, attachments)
         ? "image"
         : "chat";
-    await submitPrompt(attachments, [], { mode });
+    if (mode === "image") {
+      setImageGenerationActive(true);
+    }
+    try {
+      await submitPrompt(attachments, [], { mode });
+    } finally {
+      if (mode === "image") {
+        setImageGenerationActive(false);
+      }
+    }
   };
 
   const handleComposerSubmit = async () => {
@@ -1045,6 +1207,12 @@ export function AIChatPanel({
     setLiveVideoShareMode((current) => (current === state.mode ? current : state.mode));
   }, []);
 
+  const handleLiveHistoryTargetsChange = useCallback((targets: LiveHistoryTargets) => {
+    setLiveHistoryTargets((current) =>
+      current.hasCamera === targets.hasCamera && current.hasGeneratedImage === targets.hasGeneratedImage ? current : targets,
+    );
+  }, []);
+
   const confirmUploadPreviewImage = () => {
     if (!previewAttachment || previewAttachment.kind !== "image") return;
     if (!window.confirm("Upload this image to the current folder?")) return;
@@ -1055,6 +1223,8 @@ export function AIChatPanel({
     <div className="group relative overflow-hidden rounded-[16px] border border-ink/10 bg-white shadow-[0_12px_28px_rgba(15,23,42,0.08)]" key={attachment.id}>
       <button
         className="flex w-full items-center justify-center bg-[#f7f1e6] p-3"
+        data-chat-generated-image="true"
+        data-chat-generated-image-id={attachment.id}
         onClick={() => {
           const preview = toPreviewAttachment(attachment);
           if (preview) setPreviewAttachment(preview);
@@ -1477,22 +1647,22 @@ export function AIChatPanel({
 
   return (
     <Panel
-      className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-[5px] shadow-none transition-[height] duration-200 ease-out"
+      className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-1 shadow-none transition-[height] duration-200 ease-out"
       style={{ height: displayedPanelHeight }}
     >
       <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-7 rounded-full bg-ink/20 blur-xl" />
-      <div className="flex items-center justify-between gap-3 px-0 py-1.5">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="inline-flex rounded-full bg-white p-1 text-sm shadow-[0_10px_24px_rgba(15,23,42,0.08)]">
+      <div className="flex items-center justify-between gap-2 px-0 py-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="inline-flex rounded-full bg-white p-0.5 text-xs shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
             <button
-              className={`rounded-full px-3 py-1.5 font-medium transition ${activeTab === "chat" ? "bg-ink text-white" : "text-ink/65 hover:bg-mist"}`}
+              className={`rounded-full px-2.5 py-1 font-medium transition ${activeTab === "chat" ? "bg-ink text-white" : "text-ink/65 hover:bg-mist"}`}
               onClick={() => setActiveTab("chat")}
               type="button"
             >
               Chat
             </button>
             <button
-              className={`rounded-full px-3 py-1.5 font-medium transition ${
+              className={`rounded-full px-2.5 py-1 font-medium transition ${
                 activeTab === "live"
                   ? "bg-ink text-white"
                   : supportsLive
@@ -1503,27 +1673,105 @@ export function AIChatPanel({
               onClick={() => setActiveTab("live")}
               title={supportsLive ? "Start live talk" : "Switch to Gemini and save a live model first"}
               type="button"
-              >
-                Live
-              </button>
-            </div>
+            >
+              Live
+            </button>
+          </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5">
+          {showLatestMessageShortcut ? (
+            <button
+              aria-label="Scroll to latest message"
+              className="flex h-7 w-7 items-center justify-center rounded-[4px] border border-[#bb3e2d]/25 bg-[#fff7e8] text-[#bb3e2d] transition hover:border-[#bb3e2d]/40 hover:bg-[#ffeacd]"
+              onClick={scrollToLatestMessage}
+              title="Scroll to latest message"
+              type="button"
+            >
+              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                <path
+                  d="M6 7.5A2.5 2.5 0 0 1 8.5 5h7A2.5 2.5 0 0 1 18 7.5v5A2.5 2.5 0 0 1 15.5 15H11l-4 4v-4.5A2.5 2.5 0 0 1 6 12.5v-5Z"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.7"
+                />
+                <path d="m12 8.5 2.5 2.5L12 13.5M9.5 11h4.8" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+              </svg>
+            </button>
+          ) : null}
+          {showGeneratedImageShortcut ? (
+            <button
+              aria-label={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] border transition ${
+                imageGenerationActive
+                  ? "border-black bg-black text-white hover:border-black hover:bg-black"
+                  : "border-[#1f6f78]/20 bg-[#e5f5f7] text-[#1f6f78] hover:border-[#1f6f78]/35 hover:bg-[#d8eef1]"
+              }`}
+              onClick={scrollToGeneratedImage}
+              title={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
+              type="button"
+            >
+              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                <path
+                  d="M5 6.5A1.5 1.5 0 0 1 6.5 5h11A1.5 1.5 0 0 1 19 6.5v11a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 17.5v-11Z"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.7"
+                />
+                <path d="m7.5 16 3.2-3.4 2.3 2.2 2.1-2.8 1.4 4" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                <circle cx="9" cy="9" r="1.2" fill="currentColor" />
+              </svg>
+            </button>
+          ) : null}
+          {showCameraShortcut ? (
+            <button
+              aria-label="Scroll to camera"
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] border transition ${
+                liveCameraShortcutFlashing
+                  ? liveCameraFlashOn
+                    ? "border-[#15803d] bg-[#15803d] text-white hover:border-[#166534] hover:bg-[#166534]"
+                    : "border-[#86efac] bg-[#dcfce7] text-[#166534] hover:border-[#4ade80] hover:bg-[#bbf7d0]"
+                  : "border-ink/10 bg-white text-ink hover:border-ink/25 hover:bg-mist"
+              }`}
+              onClick={scrollToCameraTarget}
+              title="Scroll to camera"
+              type="button"
+            >
+              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                <path
+                  d="M5.5 8.5A1.5 1.5 0 0 1 7 7h2l1.2-1.5h3.6L15 7h2a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 17 18H7a1.5 1.5 0 0 1-1.5-1.5v-8Z"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.7"
+                />
+                <circle cx="12" cy="12.5" r="3" stroke="currentColor" strokeWidth="1.7" />
+              </svg>
+            </button>
+          ) : null}
           {activeTab === "live" && supportsLive ? (
             <button
-              className={`rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] transition ${
-                liveConnectionRequested
-                  ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78] hover:border-[#1f6f78]/80 hover:bg-[#d8eef1]"
+              aria-label={liveConnectionRequested ? "Disconnect live talk" : "Connect live talk"}
+              className={`flex h-8 w-8 items-center justify-center rounded-[4px] border transition ${
+                liveConnectButtonReady
+                  ? "border-[#bb3e2d] bg-[#bb3e2d] text-white hover:border-[#a93526] hover:bg-[#a93526]"
+                  : liveConnectButtonActive
+                    ? "border-[#1f6f78] bg-[#1f6f78] text-white hover:border-[#195d65] hover:bg-[#195d65]"
                   : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
               }`}
               onClick={() => setLiveConnectionRequested((current) => !current)}
+              title={liveConnectionRequested ? "Disconnect live talk" : "Connect live talk"}
               type="button"
             >
-              {liveConnectionRequested ? "Disconnect" : "Connect"}
+              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                <path d="M12 4.5v7" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                <path d="M8 6.8a7 7 0 1 0 8 0" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+              </svg>
             </button>
           ) : null}
           <button
-            className="flex h-9 w-11 cursor-ns-resize touch-none items-center justify-center rounded-full bg-white text-ink/45 transition hover:bg-mist"
+            className="flex h-8 w-8 cursor-ns-resize touch-none items-center justify-center rounded-[4px] bg-white text-ink/45 transition hover:bg-mist"
             onPointerDown={(event) => {
               resizePointerIdRef.current = event.pointerId;
               resizeStartYRef.current = event.clientY;
@@ -1549,6 +1797,20 @@ export function AIChatPanel({
 
       {provider === "gemini" ? (
         <>
+      <div
+        className="min-h-0 shrink-0 overflow-hidden transition-[height] duration-200 ease-out"
+        style={composerChromeFrameHeight === undefined ? undefined : { height: composerChromeFrameHeight }}
+      >
+        <div
+          className="origin-top-left transition-transform duration-200 ease-out"
+          onFocusCapture={expandComposerChrome}
+          onPointerDownCapture={expandComposerChrome}
+          ref={composerChromeRef}
+          style={{
+            transform: `scale(${composerChromeScale})`,
+            width: compactComposerChrome ? "200%" : "100%",
+          }}
+        >
       <input
         accept="image/*,audio/*,video/*"
         className="hidden"
@@ -2213,16 +2475,23 @@ export function AIChatPanel({
           </div>
         ) : null}
       </div>
+        </div>
+      </div>
 
-      <div className="mt-4 min-h-0 flex-1">
+      <div className={`${compactComposerChrome ? "mt-1" : "mt-4"} min-h-0 flex-1 transition-[margin] duration-200 ease-out`}>
         <div
           className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 pb-0 pl-3 pr-0 pt-3"
           hidden={activeTab !== "chat"}
           onClick={() => {
+            focusHistory();
             if (!promptExpanded) {
               setComposerCondensed(true);
             }
           }}
+          onPointerDown={focusHistory}
+          onScroll={updateChatHistoryScrollState}
+          onTouchMove={focusHistory}
+          onWheel={focusHistory}
           ref={messagesContainerRef}
         >
           <div className="flex flex-col gap-3">
@@ -2267,9 +2536,13 @@ export function AIChatPanel({
                             : "border-white/10 bg-white/10 text-white hover:bg-white/15";
                         const labelTone = message.role === "assistant" ? "text-ink/45" : "text-white/65";
                         const iconTone = message.role === "assistant" ? "bg-white text-ink/70" : "bg-white/10 text-white/80";
+                        const cameraCapture =
+                          message.role === "user" && (attachment.fileName.startsWith("photo-") || attachment.fileName.startsWith("video-"));
                         return (
                           <button
                             className={`flex h-11 w-[172px] shrink-0 items-center gap-2 overflow-hidden rounded-[10px] border px-2 py-2 text-left transition ${cardTone}`}
+                            data-chat-camera-media={cameraCapture ? "true" : undefined}
+                            data-chat-camera-media-id={cameraCapture ? attachment.id : undefined}
                             disabled={!attachment.url}
                             key={attachment.id}
                             onClick={() => {
@@ -2334,7 +2607,7 @@ export function AIChatPanel({
           </div>
         </div>
 
-        <div className="h-full pb-3 pl-3 pr-0 pt-3" hidden={activeTab !== "live"}>
+        <div className="h-full p-0" hidden={activeTab !== "live"}>
           <LiveTalkPanel
             active={activeTab === "live"}
             currentNoteBodyMarkdown={currentNoteBodyMarkdown}
@@ -2343,6 +2616,11 @@ export function AIChatPanel({
             microphoneEnabled={liveMicrophoneEnabled}
             onError={onError}
             onApplyEdits={onApply}
+            onHistoryInteract={focusHistory}
+            onHistoryTargetsChange={handleLiveHistoryTargetsChange}
+            onImageGenerationStateChange={setImageGenerationActive}
+            onLatestMessageStateChange={setLiveLatestMessageAvailable}
+            onRegisterHistoryControls={setLiveHistoryControls}
             onRegisterSend={setLiveSendHandle}
             onRegisterVideoControls={setLiveVideoControls}
             onSessionStateChange={setLiveSessionState}
@@ -2428,6 +2706,7 @@ export function AIChatPanel({
         className={`pointer-events-none absolute left-3 top-3 z-20 inline-flex max-w-[calc(100%_-_24px)] overflow-hidden rounded-[8px] border border-white/20 bg-black shadow-[0_14px_32px_rgba(0,0,0,0.28)] transition-opacity ${
           cameraPreviewVisible ? "opacity-100" : "opacity-0"
         }`}
+        data-chat-camera-preview="true"
       >
         <video className="h-[150px] w-auto max-w-full object-contain" muted playsInline ref={cameraVideoRef} />
       </div>
