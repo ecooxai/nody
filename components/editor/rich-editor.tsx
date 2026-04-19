@@ -9,6 +9,7 @@ import {
   useRef,
   useState,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
 } from "react";
 
@@ -48,6 +49,11 @@ type RichEditorProps = {
 };
 
 type TextSelection = {
+  start: number;
+  end: number;
+};
+
+type PreviewSelectionSnapshot = {
   start: number;
   end: number;
 };
@@ -299,6 +305,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const activeMediaHideTimerRef = useRef<number | null>(null);
   const previewSelectionTimerRef = useRef<number | null>(null);
   const previewPointerSelectingRef = useRef(false);
+  const previewSelectionJustFinishedRef = useRef(false);
+  const previewPointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const lastPreviewSelectionRef = useRef("");
   const lineTapRef = useRef<{ key: string | null; count: number; startedAt: number }>({
     key: null,
@@ -358,12 +366,104 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     return selection.toString().trim();
   };
 
+  const getPreviewTextOffset = (container: Node, offset: number) => {
+    const preview = previewRef.current;
+    if (!preview || !preview.contains(container)) {
+      return null;
+    }
+
+    const range = document.createRange();
+    range.selectNodeContents(preview);
+    try {
+      range.setEnd(container, offset);
+    } catch {
+      range.detach();
+      return null;
+    }
+
+    const textOffset = range.toString().length;
+    range.detach();
+    return textOffset;
+  };
+
+  const findPreviewTextPosition = (targetOffset: number) => {
+    const preview = previewRef.current;
+    if (!preview) return null;
+
+    const walker = document.createTreeWalker(preview, NodeFilter.SHOW_TEXT);
+    let traversed = 0;
+    let node = walker.nextNode();
+    while (node) {
+      const textLength = node.textContent?.length ?? 0;
+      if (traversed + textLength >= targetOffset) {
+        return {
+          node,
+          offset: Math.max(0, Math.min(targetOffset - traversed, textLength)),
+        };
+      }
+      traversed += textLength;
+      node = walker.nextNode();
+    }
+
+    return preview.lastChild ? { node: preview.lastChild, offset: preview.lastChild.textContent?.length ?? 0 } : null;
+  };
+
+  const capturePreviewSelectionSnapshot = (): PreviewSelectionSnapshot | null => {
+    const preview = previewRef.current;
+    const selection = window.getSelection();
+    if (!preview || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+      return null;
+    }
+
+    const range = selection.getRangeAt(0);
+    if (!preview.contains(range.startContainer) || !preview.contains(range.endContainer)) {
+      return null;
+    }
+
+    const start = getPreviewTextOffset(range.startContainer, range.startOffset);
+    const end = getPreviewTextOffset(range.endContainer, range.endOffset);
+    if (start === null || end === null || start === end) {
+      return null;
+    }
+
+    return {
+      start: Math.min(start, end),
+      end: Math.max(start, end),
+    };
+  };
+
+  const restorePreviewSelectionSnapshot = (snapshot: PreviewSelectionSnapshot | null) => {
+    if (!snapshot) return;
+
+    const restore = () => {
+      const preview = previewRef.current;
+      const selection = window.getSelection();
+      if (!preview || !selection) return;
+      const start = findPreviewTextPosition(snapshot.start);
+      const end = findPreviewTextPosition(snapshot.end);
+      if (!start || !end) return;
+
+      const range = document.createRange();
+      range.setStart(start.node, start.offset);
+      range.setEnd(end.node, end.offset);
+      selection.removeAllRanges();
+      selection.addRange(range);
+    };
+
+    window.requestAnimationFrame(() => {
+      restore();
+      window.setTimeout(restore, 0);
+    });
+  };
+
   const publishPreviewSelection = () => {
     if (!onSelectionChange || editable) return;
     const nextSelection = readPreviewSelection();
     if (nextSelection === lastPreviewSelectionRef.current) return;
+    const selectedSnapshot = nextSelection ? capturePreviewSelectionSnapshot() : null;
     lastPreviewSelectionRef.current = nextSelection;
     onSelectionChange(nextSelection);
+    restorePreviewSelectionSnapshot(selectedSnapshot);
   };
 
   const revealEditButton = () => {
@@ -471,11 +571,23 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       }, 80);
     };
 
-    const handlePointerUp = () => {
+    const handlePointerUp = (event: PointerEvent) => {
       if (!previewPointerSelectingRef.current) return;
       previewPointerSelectingRef.current = false;
+      const start = previewPointerStartRef.current;
+      previewPointerStartRef.current = null;
+      const moved =
+        start ? Math.abs(event.clientX - start.x) > 4 || Math.abs(event.clientY - start.y) > 4 : false;
+      const hasSelection = Boolean(readPreviewSelection());
+      previewSelectionJustFinishedRef.current = moved || hasSelection;
       clearPreviewSelectionTimer();
-      publishPreviewSelection();
+      previewSelectionTimerRef.current = window.setTimeout(() => {
+        previewSelectionTimerRef.current = null;
+        publishPreviewSelection();
+        window.setTimeout(() => {
+          previewSelectionJustFinishedRef.current = false;
+        }, 0);
+      }, 0);
     };
 
     document.addEventListener("selectionchange", handleSelectionChange);
@@ -489,9 +601,11 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     };
   }, [editable, onSelectionChange]);
 
-  const handlePreviewPointerDown = () => {
+  const handlePreviewPointerDown = (event: ReactPointerEvent<HTMLElement>) => {
     if (editable) return;
     previewPointerSelectingRef.current = true;
+    previewSelectionJustFinishedRef.current = false;
+    previewPointerStartRef.current = { x: event.clientX, y: event.clientY };
   };
 
   const syncTextareaSelection = () => {
@@ -549,6 +663,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
 
   const handlePreviewClick = (event: ReactMouseEvent<HTMLElement>) => {
     if (editable) return;
+    if (previewSelectionJustFinishedRef.current || readPreviewSelection()) {
+      return;
+    }
     onNoteInteract?.();
     revealEditButton();
 

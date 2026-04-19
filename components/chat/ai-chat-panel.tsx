@@ -160,6 +160,20 @@ function composePromptTextForModeDetection(messagePrompt: string, templates: Pro
   return [messagePrompt.trim(), ...templates.map((template) => template.content.trim())].filter(Boolean).join("\n");
 }
 
+function formatSelectedTextContext(selection: string) {
+  return `user selected:${selection.trim()}\nendselected\n\n`;
+}
+
+function buildReadAloudPrompt(text: string) {
+  return [
+    "Read the following selected note text aloud exactly as written.",
+    "Do not summarize, translate, explain, or add commentary.",
+    "Only speak the selected text.",
+    "",
+    text.trim(),
+  ].join("\n");
+}
+
 function getPreferredRecordingMimeType() {
   if (typeof MediaRecorder === "undefined") return null;
   const candidates = [
@@ -319,6 +333,7 @@ export function AIChatPanel({
     messageAttachments: AIMessageAttachment[];
     prompts: AIMessagePrompt[];
     mode: AIRequestMode;
+    displayPrompt?: string;
   }) => Promise<boolean>;
   onApply: (edits: TextSubstitution[]) => void;
   onAddAttachmentToNote: (attachment: AIMessageAttachment) => void;
@@ -358,6 +373,7 @@ export function AIChatPanel({
   const [promptNameDraft, setPromptNameDraft] = useState("");
   const [promptContentDraft, setPromptContentDraft] = useState("");
   const [creatingPrompt, setCreatingPrompt] = useState(false);
+  const [readingSelection, setReadingSelection] = useState(false);
   const [recording, setRecording] = useState(false);
   const [preparingRecording, setPreparingRecording] = useState(false);
   const [cameraPreparing, setCameraPreparing] = useState(false);
@@ -407,6 +423,8 @@ export function AIChatPanel({
   const recordHoldActiveRef = useRef(false);
   const microphoneLongPressTimerRef = useRef<number | null>(null);
   const microphoneLongPressTriggeredRef = useRef(false);
+  const autoReadSelectionTimerRef = useRef<number | null>(null);
+  const lastAutoReadSelectionKeyRef = useRef<string | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
   const cameraRecorderRef = useRef<MediaRecorder | null>(null);
@@ -474,6 +492,9 @@ export function AIChatPanel({
       ? liveHistoryTargets.hasCamera
       : cameraPreviewVisible || cameraPreparing || cameraRecording || Boolean(latestChatCameraAttachmentId);
   const liveCameraShortcutFlashing = activeTab === "live" && liveVideoShareMode === "camera" && liveHistoryTargets.hasCamera;
+  const selectedTextForReadAloud = selectedText?.trim() ?? "";
+  const liveDisconnected = activeTab === "live" && !liveSessionState.ready;
+  const composerMenuOpen = microphoneMenuOpen || liveVideoMenuOpen;
 
   const triggerLatestMessageShortcutFlash = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -648,7 +669,7 @@ export function AIChatPanel({
   useEffect(() => {
     const trimmedSelection = selectedText?.trim();
     if (!trimmedSelection) return;
-    setPrompt(`\n${trimmedSelection}\n`);
+    setPrompt(formatSelectedTextContext(trimmedSelection));
   }, [selectedText]);
 
   useEffect(() => {
@@ -790,6 +811,9 @@ export function AIChatPanel({
       if (microphoneLongPressTimerRef.current) {
         window.clearTimeout(microphoneLongPressTimerRef.current);
       }
+      if (autoReadSelectionTimerRef.current) {
+        window.clearTimeout(autoReadSelectionTimerRef.current);
+      }
       if (cameraLongPressTimerRef.current) {
         window.clearTimeout(cameraLongPressTimerRef.current);
       }
@@ -818,6 +842,13 @@ export function AIChatPanel({
     if (cameraLongPressTimerRef.current) {
       window.clearTimeout(cameraLongPressTimerRef.current);
       cameraLongPressTimerRef.current = null;
+    }
+  };
+
+  const clearAutoReadSelectionTimer = () => {
+    if (autoReadSelectionTimerRef.current) {
+      window.clearTimeout(autoReadSelectionTimerRef.current);
+      autoReadSelectionTimerRef.current = null;
     }
   };
 
@@ -1140,6 +1171,72 @@ export function AIChatPanel({
     }
   };
 
+  const handleReadSelectedText = useCallback(async () => {
+    const text = selectedTextForReadAloud;
+    if (!text || readingSelection) return false;
+
+    clearAutoReadSelectionTimer();
+    const readKey = `${activeTab}:${text}`;
+
+    if (activeTab === "live") {
+      if (!liveSendHandle) {
+        onError(liveSessionState.status);
+        return false;
+      }
+      const sent = liveSendHandle.sendText(buildReadAloudPrompt(text), {
+        displayText: `Read selected text aloud:\n${text}`,
+      });
+      if (!sent) {
+        onError(liveSessionState.status);
+        return false;
+      }
+      lastAutoReadSelectionKeyRef.current = readKey;
+      return true;
+    }
+
+    setReadingSelection(true);
+    try {
+      const sent = await onAsk({
+        prompt: text,
+        attachments: [],
+        messageAttachments: [],
+        prompts: [],
+        mode: "tts",
+        displayPrompt: "Read selected text aloud.",
+      });
+      if (sent) {
+        lastAutoReadSelectionKeyRef.current = readKey;
+      }
+      return sent;
+    } finally {
+      setReadingSelection(false);
+    }
+  }, [activeTab, liveSendHandle, liveSessionState.status, onAsk, onError, readingSelection, selectedTextForReadAloud]);
+
+  useEffect(() => {
+    clearAutoReadSelectionTimer();
+
+    const text = selectedTextForReadAloud;
+    if (!text) {
+      lastAutoReadSelectionKeyRef.current = null;
+      return;
+    }
+
+    const readKey = `${activeTab}:${text}`;
+    if (lastAutoReadSelectionKeyRef.current === readKey) return;
+    if (provider !== "gemini" || !providerSettings.apiKey) return;
+    if (readingSelection) return;
+    if (activeTab === "live" && !liveSendHandle) return;
+    if (activeTab !== "live" && busy) return;
+
+    autoReadSelectionTimerRef.current = window.setTimeout(() => {
+      autoReadSelectionTimerRef.current = null;
+      void handleReadSelectedText();
+    }, 2000);
+
+    return clearAutoReadSelectionTimer;
+  }, [activeTab, busy, handleReadSelectedText, liveSendHandle, provider, providerSettings.apiKey, readingSelection, selectedTextForReadAloud]);
+
   const handleComposerSubmit = async () => {
     if (activeTab === "live") {
       const supportedLiveAttachments = attachments.filter(
@@ -1236,10 +1333,10 @@ export function AIChatPanel({
     }
   };
 
-  const startLiveScreenShare = async () => {
+  const startLiveScreenShare = async (options?: { video?: boolean }) => {
     if (!liveVideoControls) return;
     try {
-      await liveVideoControls.startScreenShare();
+      await liveVideoControls.startScreenShare(options);
       setLiveVideoMenuOpen(false);
     } catch (error) {
       onError(error instanceof Error ? error.message : "Failed to share the screen.");
@@ -1949,7 +2046,7 @@ export function AIChatPanel({
       {provider === "gemini" ? (
         <>
       <div
-        className="min-h-0 shrink-0 overflow-hidden transition-[height] duration-200 ease-out"
+        className={`min-h-0 shrink-0 transition-[height] duration-200 ease-out ${composerMenuOpen ? "overflow-visible" : "overflow-hidden"}`}
         style={composerChromeFrameHeight === undefined ? undefined : { height: composerChromeFrameHeight }}
       >
         <div
@@ -1976,7 +2073,11 @@ export function AIChatPanel({
       />
 
       <textarea
-        className="hide-scrollbar w-full resize-none overflow-y-auto rounded-[10px] border border-pine/40 bg-[#fffdf8] px-4 py-3 text-sm leading-6 overscroll-contain transition-[height] duration-200 ease-out"
+        className={`hide-scrollbar w-full resize-none overflow-y-auto rounded-[10px] border px-4 py-3 text-sm leading-6 overscroll-contain transition-[height,background-color,border-color,color] duration-200 ease-out ${
+          liveDisconnected
+            ? "border-ink/10 bg-[#e8e8e8] text-ink/55 placeholder:text-ink/40"
+            : "border-pine/40 bg-[#fffdf8] text-ink placeholder:text-ink/35"
+        }`}
         onChange={(event) => {
           setComposerCondensed(false);
           setPrompt(event.target.value);
@@ -2184,9 +2285,28 @@ export function AIChatPanel({
               )}
             </svg>
           </button>
+          {selectedTextForReadAloud ? (
+            <button
+              aria-label="Read selected text aloud"
+              className="flex h-10 w-10 items-center justify-center rounded-[4px] border border-[#1f6f78]/20 bg-[#e5f5f7] text-[#1f6f78] transition hover:border-[#1f6f78]/35 hover:bg-[#d8eef1] disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!providerSettings.apiKey || readingSelection || (activeTab === "live" ? !liveSendHandle : busy)}
+              onClick={() => void handleReadSelectedText()}
+              title={activeTab === "live" ? "Read selected text in Live" : "Generate read-aloud audio"}
+              type="button"
+            >
+              {readingSelection ? (
+                <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
+              ) : (
+                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <path d="M5 10v4h3l4 3.5v-11L8 10H5Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.7" />
+                  <path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+                </svg>
+              )}
+            </button>
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
-          <div className="relative" ref={microphoneMenuRef}>
+          <div className={`relative ${microphoneMenuOpen ? "z-[90]" : ""}`} ref={microphoneMenuRef}>
             <button
               aria-expanded={microphoneMenuOpen}
               aria-label={recording ? "Release to stop recording" : "Quick tap for microphones, hold 2 seconds to record audio"}
@@ -2240,7 +2360,7 @@ export function AIChatPanel({
               )}
             </button>
             {microphoneMenuOpen ? (
-              <div className="absolute bottom-12 right-0 z-30 grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
+              <div className="absolute bottom-12 right-0 z-[100] grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Microphones</div>
@@ -2292,7 +2412,7 @@ export function AIChatPanel({
             ) : null}
           </div>
           {activeTab === "live" ? (
-            <div className="relative" ref={liveVideoMenuRef}>
+            <div className={`relative ${liveVideoMenuOpen ? "z-[90]" : ""}`} ref={liveVideoMenuRef}>
               <button
                 aria-expanded={liveVideoMenuOpen}
                 aria-label={liveVideoShareMode ? "Manage live video share" : "Share camera or screen"}
@@ -2315,7 +2435,7 @@ export function AIChatPanel({
                 </svg>
               </button>
               {liveVideoMenuOpen ? (
-                <div className="absolute bottom-12 right-0 z-30 grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
+                <div className="absolute bottom-12 right-0 z-[100] grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Live video</div>
@@ -2348,10 +2468,26 @@ export function AIChatPanel({
                     onClick={() => void startLiveScreenShare()}
                     type="button"
                   >
-                    <span>Share screen</span>
+                    <span>Share screen snapshot</span>
                     <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
                       <path d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v8A1.5 1.5 0 0 1 18.5 16h-13A1.5 1.5 0 0 1 4 14.5v-8Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.6" />
                       <path d="M9 19h6M12 16v3" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+                    </svg>
+                  </button>
+                  <button
+                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => void startLiveScreenShare({ video: true })}
+                    type="button"
+                  >
+                    <span>Share screen video</span>
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path
+                        d="M4.5 7.5A1.5 1.5 0 0 1 6 6h8a1.5 1.5 0 0 1 1.5 1.5v1.3l3-2A1 1 0 0 1 20 7.6v8.8a1 1 0 0 1-1.5.8l-3-2v1.3A1.5 1.5 0 0 1 14 18H6a1.5 1.5 0 0 1-1.5-1.5v-9Z"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.6"
+                      />
                     </svg>
                   </button>
                   <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Available cameras</div>
@@ -2652,9 +2788,17 @@ export function AIChatPanel({
                 message.role === "assistant"
                   ? (message.attachments ?? []).filter((attachment) => attachment.kind === "image" && attachment.url)
                   : [];
+              const generatedAudioAttachments =
+                message.role === "assistant"
+                  ? (message.attachments ?? []).filter((attachment) => attachment.kind === "audio" && attachment.url && attachment.origin === "generated")
+                  : [];
               const compactAttachments =
                 message.role === "assistant"
-                  ? (message.attachments ?? []).filter((attachment) => attachment.kind !== "image" || !attachment.url)
+                  ? (message.attachments ?? []).filter(
+                      (attachment) =>
+                        (attachment.kind !== "image" || !attachment.url) &&
+                        !(attachment.kind === "audio" && attachment.url && attachment.origin === "generated"),
+                    )
                   : (message.attachments ?? []);
               return (
                 <div
@@ -2733,9 +2877,28 @@ export function AIChatPanel({
                       {generatedImageAttachments.map((attachment) => renderGeneratedImageCard(attachment))}
                     </div>
                   ) : null}
+                  {generatedAudioAttachments.length > 0 ? (
+                    <div
+                      className={`${
+                        message.prompts?.length || compactAttachments.length || generatedImageAttachments.length ? "mt-3" : ""
+                      } grid gap-2`}
+                    >
+                      {generatedAudioAttachments.map((attachment) => (
+                        <div className="rounded-[8px] border border-ink/10 bg-mist/70 px-3 py-3" key={attachment.id}>
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Read aloud</div>
+                              <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
+                            </div>
+                          </div>
+                          <audio className="h-10 w-full" controls preload="metadata" src={attachment.url} />
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                   <div
                     className={`${
-                      message.prompts?.length || compactAttachments.length || generatedImageAttachments.length ? "mt-3" : ""
+                      message.prompts?.length || compactAttachments.length || generatedImageAttachments.length || generatedAudioAttachments.length ? "mt-3" : ""
                     } whitespace-pre-wrap break-words`}
                   >
                     {message.content}
@@ -2763,6 +2926,7 @@ export function AIChatPanel({
             active={activeTab === "live"}
             currentNoteBodyMarkdown={currentNoteBodyMarkdown}
             currentNoteTitle={currentNoteTitle}
+            currentSelectedText={selectedTextForReadAloud}
             microphoneDeviceId={selectedMicrophoneId}
             microphoneEnabled={liveMicrophoneEnabled}
             onError={onError}

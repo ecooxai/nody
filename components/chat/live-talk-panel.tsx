@@ -26,6 +26,8 @@ type LiveTurn = {
   videoMode?: "camera" | "screen";
 };
 
+type ScreenShareSendMode = "screenshot" | "video";
+
 type LiveMessage =
   | {
       setupComplete?: unknown;
@@ -74,7 +76,7 @@ export type LiveSendAttachment = {
 
 export type LiveSendHandle = {
   sendAttachment: (attachment: LiveSendAttachment) => Promise<boolean>;
-  sendText: (text: string) => boolean;
+  sendText: (text: string, options?: { displayText?: string }) => boolean;
 };
 
 export type LiveVideoSource = {
@@ -86,13 +88,14 @@ export type LiveVideoControls = {
   listSources: () => Promise<LiveVideoSource[]>;
   startCameraShare: (deviceId?: string) => Promise<boolean>;
   switchCameraShare: () => Promise<boolean>;
-  startScreenShare: () => Promise<boolean>;
+  startScreenShare: (options?: { video?: boolean }) => Promise<boolean>;
   stopVideoShare: () => void;
 };
 
 export type LiveVideoShareState = {
   mode: "camera" | "screen" | null;
   cameraDeviceId?: string | null;
+  screenMode?: ScreenShareSendMode | null;
 };
 
 export type LiveHistoryControls = {
@@ -123,6 +126,10 @@ type LiveImageContext = {
 };
 
 const LIVE_IMAGE_GENERATION_NOTICE = "i'll generate image now";
+
+function formatSelectedTextContext(selection: string) {
+  return `user selected:${selection.trim()}\nendselected\n\n`;
+}
 
 function LiveStreamPreview({
   className,
@@ -322,7 +329,8 @@ function buildNoteContext(title: string, bodyMarkdown: string) {
     "If the user asks you to look through their camera, inspect a physical object, read a page in front of the device, or watch something in the room, call start_camera_share.",
     "If the user asks to switch, flip, or change cameras, call switch_camera_share. This is useful on phones with more than one camera.",
     "If the user asks you to take, shoot, snap, or capture a photo/image from the current camera feed, call capture_camera_shot.",
-    "If the user asks you to see their screen, browser tab, desktop, app, code editor, or UI, call start_screen_share.",
+    "If the user asks you to see their screen, browser tab, desktop, app, code editor, or UI, call start_screen_share with screenshot mode unless they explicitly ask for live or continuous screen video.",
+    "Screenshot screen sharing sends one current screen image with each user turn. Prefer it over live screen video to save tokens.",
     "If you need a specific camera, call list_available_cameras first.",
     "If the user asks to stop sharing video, call stop_video_share.",
     "Do not tell the user to press the camera or screen-share UI if a tool call can do it. Use the tool call so the browser can prompt for permission.",
@@ -420,10 +428,15 @@ const captureCameraShotFunctionDeclaration = {
 const startScreenShareFunctionDeclaration = {
   name: "start_screen_share",
   description:
-    "Start screen sharing so Gemini can see the user's screen in the live session. Use this when the user wants to show a screen, app, or UI.",
+    "Start screen sharing so Gemini can see the user's screen. Use screenshot mode by default to receive one still image with each user turn. Use video mode only when the user explicitly asks for live/continuous screen video.",
   parameters: {
     type: "OBJECT",
-    properties: {},
+    properties: {
+      mode: {
+        type: "STRING",
+        description: "Optional. Use 'screenshot' by default. Use 'video' only for explicit live or continuous screen video requests.",
+      },
+    },
   },
 };
 
@@ -556,6 +569,7 @@ export function LiveTalkPanel({
   active,
   currentNoteBodyMarkdown,
   currentNoteTitle,
+  currentSelectedText,
   microphoneDeviceId,
   microphoneEnabled,
   onApplyEdits,
@@ -576,6 +590,7 @@ export function LiveTalkPanel({
   active: boolean;
   currentNoteBodyMarkdown: string;
   currentNoteTitle: string;
+  currentSelectedText?: string;
   microphoneDeviceId?: string | null;
   microphoneEnabled?: boolean;
   onApplyEdits?: (edits: TextSubstitution[]) => void;
@@ -615,6 +630,7 @@ export function LiveTalkPanel({
   const microphoneProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const microphoneSinkRef = useRef<GainNode | null>(null);
   const nextAudioTimeRef = useRef(0);
+  const assistantPlaybackMutedUntilRef = useRef(0);
   const liveAssistantTurnIdRef = useRef<string | null>(null);
   const readyRef = useRef(false);
   const activeRef = useRef(active);
@@ -636,7 +652,9 @@ export function LiveTalkPanel({
   const socketSessionIdRef = useRef(0);
   const userTurnIdRef = useRef<string | null>(null);
   const userAudioChunksRef = useRef<Uint8Array[]>([]);
+  const pendingUserAudioChunksRef = useRef<Array<{ encodedAudio: string; bytes: Uint8Array }>>([]);
   const userAudioActiveRef = useRef(false);
+  const userAudioSpeechStartMsRef = useRef(0);
   const userAudioTrailingSilenceMsRef = useRef(0);
   const assistantAudioChunksRef = useRef<Uint8Array[]>([]);
   const audioUrlsRef = useRef<string[]>([]);
@@ -647,6 +665,7 @@ export function LiveTalkPanel({
   const videoShareCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoShareIntervalRef = useRef<number | null>(null);
   const videoShareModeRef = useRef<"camera" | "screen" | null>(null);
+  const screenShareSendModeRef = useRef<ScreenShareSendMode | null>(null);
   const currentCameraDeviceIdRef = useRef<string | null>(null);
   const currentCameraLabelRef = useRef<string | null>(null);
   const videoShareTurnIdRef = useRef<string | null>(null);
@@ -654,6 +673,8 @@ export function LiveTalkPanel({
   const cancelledToolCallIdsRef = useRef<Set<string>>(new Set());
   const finalizeUserAudioRef = useRef(() => {});
   const appliedNoteContextRef = useRef(noteContext);
+  const currentSelectedTextRef = useRef(currentSelectedText?.trim() ?? "");
+  const userAudioSelectionContextRef = useRef("");
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const pendingGeneratedImageScrollRef = useRef(false);
@@ -681,7 +702,8 @@ export function LiveTalkPanel({
     noteContextRef.current = noteContext;
     noteTitleRef.current = currentNoteTitle;
     noteBodyMarkdownRef.current = currentNoteBodyMarkdown;
-  }, [noteContext]);
+    currentSelectedTextRef.current = currentSelectedText?.trim() ?? "";
+  }, [currentSelectedText, noteContext]);
 
   useEffect(
     () => () => {
@@ -1049,6 +1071,18 @@ export function LiveTalkPanel({
           const socketConnection = socketRef.current;
           if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) return;
 
+          if (performance.now() < assistantPlaybackMutedUntilRef.current) {
+            if (userAudioActiveRef.current) {
+              userAudioActiveRef.current = false;
+              userAudioSpeechStartMsRef.current = 0;
+              userAudioTrailingSilenceMsRef.current = 0;
+              finalizeUserAudioRef.current();
+            }
+            pendingUserAudioChunksRef.current = [];
+            userAudioSpeechStartMsRef.current = 0;
+            return;
+          }
+
           const input = event.inputBuffer.getChannelData(0);
           const resampled = resampleFloat32Array(input, audioContext.sampleRate, 16000);
           if (resampled.length === 0) return;
@@ -1061,32 +1095,80 @@ export function LiveTalkPanel({
           }
           const rms = Math.sqrt(sumSquares / resampled.length);
           const chunkDurationMs = (resampled.length / 16000) * 1000;
-          if (rms >= 0.018) {
+          const audioBytes = base64ToUint8Array(encodedAudio);
+          const sendAudioChunk = (chunk: string) => {
+            socketConnection.send(
+              JSON.stringify({
+                realtimeInput: {
+                  audio: {
+                    data: chunk,
+                    mimeType: "audio/pcm;rate=16000",
+                  },
+                },
+              }),
+            );
+          };
+          const sendAudioStreamEnd = () => {
+            socketConnection.send(
+              JSON.stringify({
+                realtimeInput: {
+                  audioStreamEnd: true,
+                },
+              }),
+            );
+          };
+
+          if (rms >= 0.018 && !userAudioActiveRef.current) {
+            pendingUserAudioChunksRef.current.push({ encodedAudio, bytes: audioBytes });
+            userAudioSpeechStartMsRef.current += chunkDurationMs;
+            if (userAudioSpeechStartMsRef.current < 180) {
+              return;
+            }
+            userAudioSelectionContextRef.current = sendSelectedTextContext(socketConnection);
+            ensureUserTurn();
             userAudioActiveRef.current = true;
             userAudioTrailingSilenceMsRef.current = 0;
-            userAudioChunksRef.current.push(base64ToUint8Array(encodedAudio));
-          } else if (userAudioActiveRef.current && userAudioTrailingSilenceMsRef.current < 700) {
-            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
-            userAudioChunksRef.current.push(base64ToUint8Array(encodedAudio));
-          } else if (userAudioActiveRef.current) {
-            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
-            if (userAudioTrailingSilenceMsRef.current >= 2200) {
-              userAudioActiveRef.current = false;
-              userAudioTrailingSilenceMsRef.current = 0;
-              finalizeUserAudioRef.current();
+            for (const chunk of pendingUserAudioChunksRef.current) {
+              sendAudioChunk(chunk.encodedAudio);
+              userAudioChunksRef.current.push(chunk.bytes);
             }
+            pendingUserAudioChunksRef.current = [];
+            userAudioSpeechStartMsRef.current = 0;
+            return;
           }
 
-          socketConnection.send(
-            JSON.stringify({
-              realtimeInput: {
-                audio: {
-                  data: encodedAudio,
-                  mimeType: "audio/pcm;rate=16000",
-                },
-              },
-            }),
-          );
+          if (rms >= 0.018 && userAudioActiveRef.current) {
+            userAudioTrailingSilenceMsRef.current = 0;
+            sendAudioChunk(encodedAudio);
+            userAudioChunksRef.current.push(audioBytes);
+            return;
+          }
+
+          if (userAudioActiveRef.current && userAudioTrailingSilenceMsRef.current < 450) {
+            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
+            sendAudioChunk(encodedAudio);
+            userAudioChunksRef.current.push(audioBytes);
+            return;
+          }
+
+          if (userAudioActiveRef.current) {
+            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
+            if (userAudioTrailingSilenceMsRef.current >= 850) {
+              userAudioActiveRef.current = false;
+              userAudioSpeechStartMsRef.current = 0;
+              userAudioTrailingSilenceMsRef.current = 0;
+              const screenImage = sendScreenSnapshotForTurn("speech");
+              if (screenImage) {
+                appendImagesToUserTurn([screenImage], userTurnIdRef.current);
+              }
+              sendAudioStreamEnd();
+              finalizeUserAudioRef.current();
+            }
+            return;
+          }
+
+          pendingUserAudioChunksRef.current = [];
+          userAudioSpeechStartMsRef.current = 0;
         };
 
         source.connect(processor);
@@ -1118,16 +1200,42 @@ export function LiveTalkPanel({
       return id;
     };
 
+    const sendSelectedTextContext = (socketConnection: WebSocket) => {
+      const selection = currentSelectedTextRef.current.trim();
+      if (!selection) return "";
+      const context = formatSelectedTextContext(selection);
+      socketConnection.send(
+        JSON.stringify({
+          realtimeInput: {
+            text: context,
+          },
+        }),
+      );
+      return context;
+    };
+
+    const withActiveSelectionContext = (content: string) => {
+      const selectionContext = userAudioSelectionContextRef.current.trim();
+      const trimmedContent = content.trim();
+      return [selectionContext, trimmedContent].filter(Boolean).join("\n\n");
+    };
+
     const updateUserTurn = (content: string) => {
       if (!content.trim()) return;
       const id = ensureUserTurn();
+      const nextContent = withActiveSelectionContext(content);
       setTurns((current) =>
-        current.map((turn) => (turn.id === id ? { ...turn, content } : turn)),
+        current.map((turn) => (turn.id === id ? { ...turn, content: nextContent } : turn)),
       );
       moveVideoShareTurnToEnd();
     };
 
-    const videoShareContent = (mode: "camera" | "screen") => (mode === "camera" ? "Shared camera with Gemini." : "Shared screen with Gemini.");
+    const videoShareContent = (mode: "camera" | "screen") =>
+      mode === "camera"
+        ? "Shared camera with Gemini."
+        : screenShareSendModeRef.current === "video"
+          ? "Shared screen video with Gemini."
+          : "Shared screen screenshots with Gemini.";
 
     const moveVideoShareTurnToEnd = () => {
       const turnId = videoShareTurnIdRef.current;
@@ -1164,6 +1272,9 @@ export function LiveTalkPanel({
       const userTurnId = userTurnIdRef.current;
       if (!userTurnId) {
         userAudioChunksRef.current = [];
+        pendingUserAudioChunksRef.current = [];
+        userAudioSpeechStartMsRef.current = 0;
+        userAudioSelectionContextRef.current = "";
         userAudioActiveRef.current = false;
         userAudioTrailingSilenceMsRef.current = 0;
         return;
@@ -1177,7 +1288,10 @@ export function LiveTalkPanel({
         moveVideoShareTurnToEnd();
       }
       userTurnIdRef.current = null;
+      userAudioSelectionContextRef.current = "";
       userAudioChunksRef.current = [];
+      pendingUserAudioChunksRef.current = [];
+      userAudioSpeechStartMsRef.current = 0;
       userAudioActiveRef.current = false;
       userAudioTrailingSilenceMsRef.current = 0;
     };
@@ -1259,6 +1373,24 @@ export function LiveTalkPanel({
       moveVideoShareTurnToEnd();
     };
 
+    const appendImagesToUserTurn = (images: LiveGeneratedImage[], targetTurnId?: string | null) => {
+      if (images.length === 0) return;
+      const existingId = targetTurnId ?? crypto.randomUUID();
+      setTurns((current) => {
+        let updated = false;
+        const next = current.map((turn) => {
+          if (turn.id !== existingId) return turn;
+          updated = true;
+          return {
+            ...turn,
+            images: [...(turn.images ?? []), ...images],
+          };
+        });
+        return updated ? next : [...current, { id: existingId, role: "user", content: "", images }];
+      });
+      moveVideoShareTurnToEnd();
+    };
+
     const appendEditsToAssistantTurn = (substitutions: TextSubstitution[], message?: string) => {
       if (substitutions.length === 0 && !message?.trim()) return;
       const existingId = liveAssistantTurnIdRef.current ?? createAssistantTurn();
@@ -1323,6 +1455,8 @@ export function LiveTalkPanel({
       const startAt = Math.max(nextAudioTimeRef.current, context.currentTime);
       source.start(startAt);
       nextAudioTimeRef.current = startAt + buffer.duration;
+      const mutedUntil = performance.now() + Math.max(0, nextAudioTimeRef.current - context.currentTime) * 1000 + 350;
+      assistantPlaybackMutedUntilRef.current = Math.max(assistantPlaybackMutedUntilRef.current, mutedUntil);
     };
 
     const sendSetup = () => {
@@ -1367,10 +1501,19 @@ export function LiveTalkPanel({
       );
     };
 
-    const updateVideoShareState = (mode: "camera" | "screen" | null, cameraDeviceId?: string | null) => {
+    const updateVideoShareState = (
+      mode: "camera" | "screen" | null,
+      cameraDeviceId?: string | null,
+      screenMode?: ScreenShareSendMode | null,
+    ) => {
       videoShareModeRef.current = mode;
+      screenShareSendModeRef.current = mode === "screen" ? screenMode ?? "screenshot" : null;
       currentCameraDeviceIdRef.current = mode === "camera" ? cameraDeviceId ?? null : null;
-      onVideoShareStateChangeRef.current?.({ mode, cameraDeviceId: currentCameraDeviceIdRef.current });
+      onVideoShareStateChangeRef.current?.({
+        mode,
+        cameraDeviceId: currentCameraDeviceIdRef.current,
+        screenMode: screenShareSendModeRef.current,
+      });
     };
 
     const clearVideoShareTurn = (message: string) => {
@@ -1420,29 +1563,36 @@ export function LiveTalkPanel({
       }
     };
 
-    const sendVideoFrame = () => {
-      const socketConnection = socketRef.current;
+    const captureVideoFrameBase64 = (maxWidth = 1280, quality = 0.82) => {
       const videoElement = videoShareElementRef.current;
-      if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN || !videoElement) {
-        return;
+      if (!videoElement) {
+        return null;
       }
       if (videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || videoElement.videoWidth <= 0 || videoElement.videoHeight <= 0) {
-        return;
+        return null;
       }
 
       const canvas = videoShareCanvasRef.current ?? document.createElement("canvas");
       videoShareCanvasRef.current = canvas;
-      const maxWidth = 1280;
       const ratio = maxWidth / Math.max(videoElement.videoWidth, 1);
       canvas.width = videoElement.videoWidth > maxWidth ? Math.max(1, Math.round(videoElement.videoWidth * ratio)) : videoElement.videoWidth;
       canvas.height =
         videoElement.videoWidth > maxWidth ? Math.max(1, Math.round(videoElement.videoHeight * ratio)) : videoElement.videoHeight;
 
       const context = canvas.getContext("2d");
-      if (!context) return;
+      if (!context) return null;
       context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.82);
+      const dataUrl = canvas.toDataURL("image/jpeg", quality);
       const [, dataBase64] = dataUrl.split(",", 2);
+      return dataBase64 || null;
+    };
+
+    const sendVideoFrame = () => {
+      const socketConnection = socketRef.current;
+      if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) {
+        return;
+      }
+      const dataBase64 = captureVideoFrameBase64();
       if (!dataBase64) return;
 
       socketConnection.send(
@@ -1457,7 +1607,59 @@ export function LiveTalkPanel({
       );
     };
 
-    const startVideoShare = async (stream: MediaStream, mode: "camera" | "screen", cameraDeviceId?: string | null) => {
+    const sendScreenSnapshotForTurn = (reason: "speech" | "text" | "audio") => {
+      const socketConnection = socketRef.current;
+      if (
+        videoShareModeRef.current !== "screen" ||
+        screenShareSendModeRef.current !== "screenshot" ||
+        !socketConnection ||
+        socketConnection.readyState !== WebSocket.OPEN
+      ) {
+        return null;
+      }
+
+      const dataBase64 = captureVideoFrameBase64(1280, 0.82);
+      if (!dataBase64) return null;
+      const image: LiveGeneratedImage = {
+        id: crypto.randomUUID(),
+        fileName: `screen-shot-${Date.now()}.jpg`,
+        mimeType: "image/jpeg",
+        origin: "camera",
+        url: base64ToObjectUrl(dataBase64, "image/jpeg"),
+        dataBase64,
+      };
+      generatedImageUrlsRef.current.push(image.url);
+      socketConnection.send(
+        JSON.stringify({
+          realtimeInput: {
+            video: {
+              data: dataBase64,
+              mimeType: "image/jpeg",
+            },
+          },
+        }),
+      );
+      socketConnection.send(
+        JSON.stringify({
+          realtimeInput: {
+            text:
+              reason === "speech"
+                ? "Current screen screenshot captured at the end of the user's spoken turn."
+                : reason === "audio"
+                  ? "Current screen screenshot captured with the user's audio message."
+                  : "Current screen screenshot captured with the user's text message.",
+          },
+        }),
+      );
+      return image;
+    };
+
+    const startVideoShare = async (
+      stream: MediaStream,
+      mode: "camera" | "screen",
+      cameraDeviceId?: string | null,
+      options?: { screenMode?: ScreenShareSendMode },
+    ) => {
       const socketConnection = socketRef.current;
       if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) {
         stream.getTracks().forEach((track) => track.stop());
@@ -1482,14 +1684,23 @@ export function LiveTalkPanel({
 
       await videoElement.play().catch(() => undefined);
       await waitForVideoFrame(videoElement);
-      sendVideoFrame();
-      videoShareIntervalRef.current = window.setInterval(sendVideoFrame, 900);
+      const screenMode = mode === "screen" ? options?.screenMode ?? "screenshot" : null;
+      if (mode === "camera" || screenMode === "video") {
+        sendVideoFrame();
+        videoShareIntervalRef.current = window.setInterval(sendVideoFrame, 900);
+      }
       const videoTrack = stream.getVideoTracks()[0];
       const resolvedCameraDeviceId = mode === "camera" ? videoTrack?.getSettings().deviceId ?? cameraDeviceId ?? null : null;
       currentCameraLabelRef.current = mode === "camera" ? videoTrack?.label ?? null : null;
-      updateVideoShareState(mode, resolvedCameraDeviceId);
+      updateVideoShareState(mode, resolvedCameraDeviceId, screenMode);
       upsertVideoShareTurn(stream, mode);
-      setStatus(mode === "camera" ? "Sharing camera with Gemini." : "Sharing your screen with Gemini.");
+      setStatus(
+        mode === "camera"
+          ? "Sharing camera with Gemini."
+          : screenMode === "video"
+            ? "Sharing your screen video with Gemini."
+            : "Screen screenshot sharing ready.",
+      );
     };
 
     const listSources = async () => {
@@ -1578,7 +1789,7 @@ export function LiveTalkPanel({
       return true;
     };
 
-    const startScreenShare = async () => {
+    const startScreenShare = async (options?: { video?: boolean }) => {
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getDisplayMedia) {
         throw new Error("Screen sharing is not supported in this browser.");
       }
@@ -1587,7 +1798,7 @@ export function LiveTalkPanel({
         video: true,
         audio: false,
       });
-      await startVideoShare(stream, "screen");
+      await startVideoShare(stream, "screen", null, { screenMode: options?.video ? "video" : "screenshot" });
       return true;
     };
 
@@ -1681,13 +1892,14 @@ export function LiveTalkPanel({
       }
     };
 
-    const sendLiveText = (text: string) => {
+    const sendLiveText = (text: string, options?: { displayText?: string }) => {
       const socketConnection = socketRef.current;
       const trimmedText = text.trim();
       if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN || !trimmedText) {
         return false;
       }
 
+      const screenImage = sendScreenSnapshotForTurn("text");
       socketConnection.send(
         JSON.stringify({
           realtimeInput: {
@@ -1695,7 +1907,15 @@ export function LiveTalkPanel({
           },
         }),
       );
-      setTurns((current) => [...current, { id: crypto.randomUUID(), role: "user", content: trimmedText }]);
+      setTurns((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          content: options?.displayText?.trim() || trimmedText,
+          images: screenImage ? [screenImage] : undefined,
+        },
+      ]);
       moveVideoShareTurnToEnd();
       setStatus("Sent.");
       return true;
@@ -1709,6 +1929,8 @@ export function LiveTalkPanel({
 
       const blob = await loadAttachmentBlob(attachment);
       if (attachment.kind === "audio") {
+        const selectionContext = sendSelectedTextContext(socketConnection);
+        const screenImage = sendScreenSnapshotForTurn("audio");
         const chunks = await decodeAudioBlobToPcm16ChunksBase64(blob);
         for (const chunk of chunks) {
           socketConnection.send(
@@ -1722,7 +1944,15 @@ export function LiveTalkPanel({
             }),
           );
         }
-        setTurns((current) => [...current, { id: crypto.randomUUID(), role: "user", content: `Sent audio clip: ${attachment.fileName}` }]);
+        setTurns((current) => [
+          ...current,
+          {
+            id: crypto.randomUUID(),
+            role: "user",
+            content: [selectionContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
+            images: screenImage ? [screenImage] : undefined,
+          },
+        ]);
         moveVideoShareTurnToEnd();
         setStatus(`${attachment.fileName} sent to live talk.`);
         return true;
@@ -1979,15 +2209,22 @@ export function LiveTalkPanel({
       };
     };
 
-    const runStartScreenShareTool = async (call: { id?: string; name?: string }) => {
-      const started = await startScreenShare();
+    const runStartScreenShareTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const requestedMode = typeof call.args?.mode === "string" ? call.args.mode.toLowerCase() : "";
+      const useVideo = /\b(video|live|continuous|stream)\b/.test(requestedMode);
+      const started = await startScreenShare({ video: useVideo });
       return {
         id: typeof call.id === "string" ? call.id : "",
         name: call.name ?? "start_screen_share",
         response: {
           ok: started,
           mode: started ? "screen" : null,
-          message: started ? "Screen sharing started." : "Screen sharing was not started.",
+          screen_mode: started ? (useVideo ? "video" : "screenshot") : null,
+          message: started
+            ? useVideo
+              ? "Screen video sharing started."
+              : "Screen screenshot sharing started."
+            : "Screen sharing was not started.",
         },
       };
     };
@@ -2215,8 +2452,11 @@ export function LiveTalkPanel({
       microphoneCaptureEnabledRef.current = false;
       resetMicrophone();
       nextAudioTimeRef.current = 0;
+      assistantPlaybackMutedUntilRef.current = 0;
       userAudioChunksRef.current = [];
+      pendingUserAudioChunksRef.current = [];
       userAudioActiveRef.current = false;
+      userAudioSpeechStartMsRef.current = 0;
       userAudioTrailingSilenceMsRef.current = 0;
       assistantAudioChunksRef.current = [];
       cancelledToolCallIdsRef.current.clear();
@@ -2310,7 +2550,11 @@ export function LiveTalkPanel({
                         onClick={() => setPreviewImage(image)}
                         type="button"
                       >
-                        <img alt={image.fileName} className="max-h-[240px] w-auto max-w-full object-contain" src={image.url} />
+                        <img
+                          alt={image.fileName}
+                          className={`${turn.role === "user" ? "h-[150px]" : "max-h-[240px]"} w-auto max-w-full object-contain`}
+                          src={image.url}
+                        />
                       </button>
                     ))}
                   </div>

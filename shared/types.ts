@@ -84,7 +84,7 @@ export type AIRequestAttachment = {
   assetUrl?: string;
 };
 
-export type AIRequestMode = "chat" | "image";
+export type AIRequestMode = "chat" | "image" | "tts";
 
 export type AIMessageAttachment = Pick<AIRequestAttachment, "id" | "kind" | "fileName" | "mimeType"> & {
   url?: string;

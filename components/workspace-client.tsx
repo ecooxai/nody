@@ -32,6 +32,7 @@ import type {
   AIMediaKind,
   AIMessagePrompt,
   AIRequestAttachment,
+  AIRequestMode,
   DocumentRecord,
   FolderAsset,
   FolderRecord,
@@ -1072,15 +1073,18 @@ function WorkspaceClientContent() {
     messageAttachments,
     mode,
     prompts,
+    displayPrompt,
   }: {
     prompt: string;
     attachments: AIRequestAttachment[];
     messageAttachments: AIMessage["attachments"];
-    mode: "chat" | "image";
+    mode: AIRequestMode;
     prompts: AIMessagePrompt[];
+    displayPrompt?: string;
   }) => {
     setThinking(true);
     const promptSummary =
+      displayPrompt?.trim() ||
       prompt.trim() ||
       (prompts.length > 0 ? `Use prompts: ${prompts.map((item) => item.name).join(", ")}` : "Analyze the attached media.");
     const userMessage: AIMessage = {
@@ -1128,14 +1132,14 @@ function WorkspaceClientContent() {
         onDone: async (reply) => {
           const generatedAttachments: AIMessageAttachment[] = [];
           for (const attachment of reply.attachments ?? []) {
-            if (attachment.kind !== "image") continue;
+            if (attachment.kind !== "image" && attachment.kind !== "audio" && attachment.kind !== "video") continue;
             const file = base64ToFile(attachment.dataBase64, attachment.fileName, attachment.mimeType);
             try {
               const savedAsset = await uploadFolderAsset(selectedFolderId, file);
               if (savedAsset) {
                 generatedAttachments.push({
                   id: savedAsset.id,
-                  kind: "image",
+                  kind: savedAsset.kind,
                   fileName: savedAsset.fileName,
                   mimeType: savedAsset.mimeType,
                   origin: "generated",
@@ -1147,7 +1151,7 @@ function WorkspaceClientContent() {
 
             generatedAttachments.push({
               id: crypto.randomUUID(),
-              kind: "image",
+              kind: attachment.kind,
               fileName: attachment.fileName,
               mimeType: attachment.mimeType,
               origin: "generated",

@@ -24,9 +24,17 @@ const streamHeaders = {
   "content-type": "text/event-stream; charset=utf-8",
 };
 
+const geminiTtsModel = "gemini-3.1-flash-tts-preview";
+
 export async function askProvider(env: Env, userId: string, settings: ProviderSettings, request: AIRequest): Promise<AIResponse> {
   if (!settings.apiKey) {
     throw new Error("Missing API key. Save provider settings first.");
+  }
+  if (request.mode === "tts") {
+    if (settings.provider !== "gemini") {
+      throw new Error("Text-to-speech is currently supported only with the Gemini provider.");
+    }
+    return askGeminiTts(settings, request);
   }
   if (request.mode === "image") {
     if (settings.provider !== "gemini") {
@@ -41,7 +49,7 @@ export async function streamProvider(env: Env, userId: string, settings: Provide
   if (!settings.apiKey) {
     throw new Error("Missing API key. Save provider settings first.");
   }
-  if (request.mode === "image") {
+  if (request.mode === "image" || request.mode === "tts") {
     const response = await askProvider(env, userId, settings, request);
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -198,6 +206,71 @@ async function askGeminiImage(env: Env, userId: string, settings: ProviderSettin
     answer: answer || (attachments.length > 0 ? "Generated image." : "No answer"),
     substitutions: [],
     attachments,
+  });
+}
+
+async function askGeminiTts(settings: ProviderSettings, request: AIRequest) {
+  const text = request.selection?.trim() || request.prompt.trim();
+  if (!text) {
+    throw new Error("Select text to read aloud first.");
+  }
+
+  const response = await fetch(buildGeminiTtsUrl(settings), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: buildTtsPromptText(text),
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseModalities: ["AUDIO"],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: {
+              voiceName: "Kore",
+            },
+          },
+        },
+      },
+    }),
+  });
+  if (!response.ok) {
+    throw new Error(await readProviderError(response, "Gemini TTS request failed"));
+  }
+
+  const data = await response.json() as {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{
+          inlineData?: { data?: string; mimeType?: string };
+        }>;
+      };
+    }>;
+  };
+  const inlineData = data.candidates?.[0]?.content?.parts?.find((part) => part.inlineData?.data)?.inlineData;
+  if (!inlineData?.data) {
+    throw new Error("Gemini TTS returned no audio.");
+  }
+
+  const sampleRate = parsePcmSampleRate(inlineData.mimeType) ?? 24000;
+  return normalizeAiResponse({
+    answer: "Read-aloud audio.",
+    substitutions: [],
+    attachments: [
+      {
+        kind: "audio",
+        fileName: `read-aloud-${Date.now()}.wav`,
+        mimeType: "audio/wav",
+        dataBase64: pcm16Base64ToWavBase64(inlineData.data, sampleRate),
+      },
+    ],
   });
 }
 
@@ -422,10 +495,11 @@ function normalizeAiResponse(response: AIResponse): AIResponse {
               Boolean(attachment.dataBase64.trim()) &&
               typeof attachment?.fileName === "string" &&
               typeof attachment?.mimeType === "string" &&
-              attachment.kind === "image",
+              (attachment.kind === "image" || attachment.kind === "audio" || attachment.kind === "video") &&
+              attachment.mimeType.startsWith(`${attachment.kind}/`),
           )
           .map((attachment) => ({
-            kind: "image",
+            kind: attachment.kind,
             fileName: attachment.fileName,
             mimeType: attachment.mimeType,
             dataBase64: attachment.dataBase64,
@@ -453,6 +527,16 @@ function buildImagePromptText(request: AIRequest) {
     .join("\n\n");
 }
 
+function buildTtsPromptText(text: string) {
+  return [
+    "Read the following selected note text aloud exactly as written.",
+    "Do not summarize, translate, explain, or add commentary.",
+    "Use any bracketed audio tags as delivery directions.",
+    "",
+    text,
+  ].join("\n");
+}
+
 function buildGeminiUrl(settings: ProviderSettings, stream = false) {
   const base = settings.apiUrl.replace(/\/$/, "");
   const key = encodeURIComponent(settings.apiKey);
@@ -461,11 +545,74 @@ function buildGeminiUrl(settings: ProviderSettings, stream = false) {
     : `${base}/v1beta/models/${settings.model}:generateContent?key=${key}`;
 }
 
+function buildGeminiTtsUrl(settings: ProviderSettings) {
+  const base = settings.apiUrl.replace(/\/$/, "");
+  const key = encodeURIComponent(settings.apiKey);
+  return `${base}/v1beta/models/${geminiTtsModel}:generateContent?key=${key}`;
+}
+
 function buildGeminiImageUrl(settings: ProviderSettings) {
   const base = settings.apiUrl.replace(/\/$/, "");
   const key = encodeURIComponent(settings.apiKey);
   const model = encodeURIComponent(settings.imageModel || "gemini-3.1-flash-image-preview");
   return `${base}/v1beta/models/${model}:generateContent?key=${key}`;
+}
+
+function parsePcmSampleRate(mimeType?: string) {
+  const match = mimeType?.match(/rate=(\d+)/i);
+  if (!match) return null;
+  const rate = Number.parseInt(match[1], 10);
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
+}
+
+function pcm16Base64ToWavBase64(pcmBase64: string, sampleRate: number) {
+  const pcmBytes = base64ToUint8Array(pcmBase64);
+  const channels = 1;
+  const bytesPerSample = 2;
+  const headerSize = 44;
+  const wavBytes = new Uint8Array(headerSize + pcmBytes.byteLength);
+  const view = new DataView(wavBytes.buffer);
+
+  writeAscii(view, 0, "RIFF");
+  view.setUint32(4, 36 + pcmBytes.byteLength, true);
+  writeAscii(view, 8, "WAVE");
+  writeAscii(view, 12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * channels * bytesPerSample, true);
+  view.setUint16(32, channels * bytesPerSample, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeAscii(view, 36, "data");
+  view.setUint32(40, pcmBytes.byteLength, true);
+  wavBytes.set(pcmBytes, headerSize);
+
+  return uint8ArrayToBase64(wavBytes);
+}
+
+function writeAscii(view: DataView, offset: number, value: string) {
+  for (let index = 0; index < value.length; index += 1) {
+    view.setUint8(offset + index, value.charCodeAt(index));
+  }
+}
+
+function base64ToUint8Array(base64: string) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes;
+}
+
+function uint8ArrayToBase64(bytes: Uint8Array) {
+  const chunkSize = 0x8000;
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return btoa(binary);
 }
 
 function imageExtensionForMimeType(mimeType: string) {
