@@ -22,7 +22,7 @@ Runtime note:
 
 - `app/`: Next.js app router pages, auth routes, proxy route, workspace page, and global styles.
 - `components/`: UI building blocks for the editor, AI chat, sync status, settings, layout, and notifications.
-- `lib/`: Frontend helpers for auth config, API calls, editor commands, provider defaults, local cache, device identity, and service worker registration.
+- `lib/`: Frontend helpers for auth config, API calls, editor commands, note templates, provider defaults, local cache, device identity, and service worker registration.
 - `shared/`: Shared types plus substitution and sync helpers used by both frontend and Worker code.
 - `worker/`: Cloudflare Worker source, Wrangler config, and D1 schema migration.
 - `tests/`: Vitest coverage for shared substitution and sync logic.
@@ -72,7 +72,8 @@ Runtime note:
 │   ├── hooks/use-service-worker.ts                 # Service worker registration and update refresh
 │   ├── providers/defaults.ts                       # Default OpenAI and Gemini settings
 │   ├── storage/device.ts                           # Stable per-device ID
-│   └── storage/local-cache.ts                      # Local document cache
+│   ├── storage/local-cache.ts                      # Local document cache
+│   └── templates/notes.ts                          # Note starter and welcome template loader
 ├── middleware.ts                                   # Clerk route protection
 ├── next-env.d.ts                                   # Next.js type shim
 ├── next.config.ts                                  # Next.js config
@@ -81,7 +82,10 @@ Runtime note:
 ├── package.json                                    # Scripts and dependencies
 ├── postcss.config.js                               # PostCSS config
 ├── public
-│   └── sw.js                                       # Offline cache service worker
+│   ├── sw.js                                       # Offline cache service worker
+│   └── template
+│       ├── untitled.md                             # New note starter Markdown
+│       └── welcome.md                              # First-login welcome Markdown
 ├── shared
 │   ├── substitutions.ts                            # Shared substitution helpers
 │   ├── sync.ts                                     # Shared sync helpers

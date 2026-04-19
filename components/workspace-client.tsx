@@ -15,6 +15,7 @@ import { createStarterMarkdown, ensureTrailingNewlines, normalizeStoredMarkdown 
 import { useServiceWorker } from "@/lib/hooks/use-service-worker";
 import { createDefaultSettings } from "@/lib/providers/defaults";
 import { getDeviceId } from "@/lib/storage/device";
+import { DEFAULT_FOLDER_NAME, UNTITLED_NOTE_TITLE, WELCOME_NOTE_TITLE, loadNoteTemplate } from "@/lib/templates/notes";
 import {
   loadCachedDocument,
   loadAiPanelHeight,
@@ -72,7 +73,7 @@ function emptyDocument(deviceId: string, folderId: string | null): DocumentRecor
   const now = new Date().toISOString();
   return {
     id: "",
-    title: "Untitled note",
+    title: UNTITLED_NOTE_TITLE,
     bodyMarkdown: createStarterMarkdown(),
     folderId,
     revision: 0,
@@ -104,6 +105,15 @@ function sortFolders(folders: FolderRecord[]) {
     if (byUpdatedAt !== 0) return byUpdatedAt;
     return left.name.localeCompare(right.name);
   });
+}
+
+function findFolderByName(folders: FolderRecord[], name: string, parentFolderId: string | null) {
+  const normalizedName = name.toLowerCase();
+  return (
+    folders.find(
+      (folder) => folder.parentFolderId === parentFolderId && folder.name.trim().toLowerCase() === normalizedName,
+    ) ?? null
+  );
 }
 
 function formatBytes(bytes: number) {
@@ -320,16 +330,16 @@ function WorkspaceClientContent() {
   const { pushError } = useErrorToast();
   const deviceId = useMemo(() => getDeviceId(), []);
   const editorRef = useRef<RichEditorHandle>(null);
-  const [cachedDocument] = useState<DocumentRecord | null>(() => loadCachedDocument());
+  const cachedDocumentRef = useRef<DocumentRecord | null>(null);
   const [folders, setFolders] = useState<FolderRecord[]>([]);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [folderAssets, setFolderAssets] = useState<FolderAsset[]>([]);
-  const [document, setDocument] = useState<DocumentRecord>(() => cachedDocument ?? emptyDocument(deviceId, null));
+  const [document, setDocument] = useState<DocumentRecord>(() => emptyDocument(deviceId, null));
   const [messages, setMessages] = useState<AIMessage[]>([]);
   const [promptTemplates, setPromptTemplates] = useState<PromptTemplate[]>([]);
   const [settings, setSettings] = useState<ProviderSettings>(createDefaultSettings());
-  const [recentDocumentIds, setRecentDocumentIds] = useState<string[]>(() => loadRecentDocumentIds());
-  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(cachedDocument?.folderId ?? null);
+  const [recentDocumentIds, setRecentDocumentIds] = useState<string[]>([]);
+  const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
   const [expandedFolderIds, setExpandedFolderIds] = useState<string[]>([]);
   const [selectedFolderAsset, setSelectedFolderAsset] = useState<FolderAsset | null>(null);
   const [assetPickerKind, setAssetPickerKind] = useState<FolderAsset["kind"] | null>(null);
@@ -365,8 +375,21 @@ function WorkspaceClientContent() {
   const syncInFlightRef = useRef(false);
   const documentStateRef = useRef(document);
   const dirtyStateRef = useRef(dirty);
+  const skippedInitialCacheSaveRef = useRef(false);
   const refreshDocumentsFromServerRef = useRef<(statusWhenFresh?: string) => Promise<void>>(async () => {});
   const [previewUrlCopied, setPreviewUrlCopied] = useState(false);
+
+  useEffect(() => {
+    const cachedDocument = loadCachedDocument();
+    cachedDocumentRef.current = cachedDocument;
+    setRecentDocumentIds(loadRecentDocumentIds());
+
+    if (cachedDocument) {
+      documentStateRef.current = cachedDocument;
+      setDocument(cachedDocument);
+      setSelectedFolderId(cachedDocument.folderId);
+    }
+  }, []);
 
   useEffect(() => {
     if (!isEditing || !pendingEditorInsertAsset) return;
@@ -679,6 +702,7 @@ function WorkspaceClientContent() {
           .catch(() => setPromptTemplates([]));
 
         if (normalizedRemoteDocs[0]) {
+          const cachedDocument = cachedDocumentRef.current;
           const initialDocument =
             (cachedDocument && normalizedRemoteDocs.find((item) => item.id === cachedDocument.id)) ?? normalizedRemoteDocs[0];
           selectDocument(initialDocument);
@@ -686,11 +710,20 @@ function WorkspaceClientContent() {
           return;
         }
 
+        const defaultFolder =
+          findFolderByName(remoteFolders, DEFAULT_FOLDER_NAME, null) ??
+          (await apiClient.createFolder({
+            name: DEFAULT_FOLDER_NAME,
+            parentFolderId: null,
+          }));
+        const nextFolders = remoteFolders.some((folder) => folder.id === defaultFolder.id) ? remoteFolders : [...remoteFolders, defaultFolder];
+        setFolders(sortFolders(nextFolders));
+
         const created = normalizeDocumentRecord(await apiClient.createDocument({
-          title: cachedDocument?.title ?? "Untitled note",
-          bodyMarkdown: cachedDocument?.bodyMarkdown ?? createStarterMarkdown(),
+          title: WELCOME_NOTE_TITLE,
+          bodyMarkdown: await loadNoteTemplate("welcome"),
           deviceId,
-          folderId: cachedDocument?.folderId ?? null,
+          folderId: defaultFolder.id,
         }));
         setDocuments([created]);
         selectDocument(created);
@@ -700,9 +733,13 @@ function WorkspaceClientContent() {
         pushError(error instanceof Error ? error.message : "Failed to load workspace");
       }
     })();
-  }, [cachedDocument, deviceId, pushError]);
+  }, [deviceId, pushError]);
 
   useEffect(() => {
+    if (!skippedInitialCacheSaveRef.current) {
+      skippedInitialCacheSaveRef.current = true;
+      return;
+    }
     saveCachedDocument(document);
   }, [document]);
 
@@ -890,8 +927,8 @@ function WorkspaceClientContent() {
     setCreatingNote(true);
     try {
       const created = normalizeDocumentRecord(await apiClient.createDocument({
-        title: "Untitled note",
-        bodyMarkdown: createStarterMarkdown(),
+        title: UNTITLED_NOTE_TITLE,
+        bodyMarkdown: await loadNoteTemplate("untitled"),
         deviceId,
         folderId,
       }));
@@ -1171,7 +1208,7 @@ function WorkspaceClientContent() {
           />
           <path d="M13 3.5V9h5.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
         </svg>
-        <span className="min-w-0 flex-1 truncate">{item.title || "Untitled note"}</span>
+        <span className="min-w-0 flex-1 truncate">{item.title || UNTITLED_NOTE_TITLE}</span>
       </button>
     );
   };
@@ -1867,7 +1904,7 @@ function WorkspaceClientContent() {
                   <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                     <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Title</div>
-                      <div className="mt-2 font-medium text-ink">{document.title || "Untitled note"}</div>
+                      <div className="mt-2 font-medium text-ink">{document.title || UNTITLED_NOTE_TITLE}</div>
                     </div>
                     <div className="rounded-[20px] bg-white px-4 py-3">
                       <div className="text-xs uppercase tracking-[0.18em] text-ink/45">Folder</div>

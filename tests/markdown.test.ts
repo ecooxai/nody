@@ -1,6 +1,13 @@
+import fs from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { ensureTrailingNewlines, markdownToHtml, normalizeStoredMarkdown } from "@/lib/editor/markdown";
+import { createStarterMarkdown, ensureTrailingNewlines, markdownToHtml, normalizeStoredMarkdown } from "@/lib/editor/markdown";
+import { noteTemplateFallbacks } from "@/lib/templates/notes";
+
+function readPublicTemplate(name: keyof typeof noteTemplateFallbacks) {
+  return fs.readFileSync(path.resolve("public", "template", `${name}.md`), "utf8").replace(/\r\n?/g, "\n").trim();
+}
 
 describe("normalizeStoredMarkdown", () => {
   it("preserves trailing markdown newlines", () => {
@@ -56,5 +63,21 @@ describe("ensureTrailingNewlines", () => {
 
   it("normalizes line endings before counting trailing newlines", () => {
     expect(ensureTrailingNewlines("First line\r\n")).toBe(`First line${"\n".repeat(10)}`);
+  });
+});
+
+describe("starter note templates", () => {
+  it("uses a short untitled starter without a title heading", () => {
+    const starter = createStarterMarkdown();
+
+    expect(starter).toBe(noteTemplateFallbacks.untitled);
+    expect(starter).not.toContain("Untitled");
+    expect(starter).not.toMatch(/^#/m);
+    expect(starter.split("\n")).toHaveLength(3);
+  });
+
+  it("keeps public markdown templates aligned with code fallbacks", () => {
+    expect(readPublicTemplate("untitled")).toBe(noteTemplateFallbacks.untitled);
+    expect(readPublicTemplate("welcome")).toBe(noteTemplateFallbacks.welcome);
   });
 });

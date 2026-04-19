@@ -2,6 +2,14 @@
 
 This file gives coding agents the project-specific context needed to work in this repo without rediscovering the basics.
 
+## Deploy
+
+- Do not use `.env.local` in this repo. Local development uses `.env.dev`; Cloudflare deployment uses `.env.deploy`.
+- `npm run dev` and `./dev.sh` load `.env.dev` before starting Next.js and the local Worker.
+- Deploy-related npm scripts load `.env.deploy` themselves: `npm run worker:check`, `npm run worker:migrate:remote`, `npm run worker:deploy`, `npm run deploy`, `npm run preview`, and `npm run upload`.
+- Keep `.env.dev`, `.env.deploy`, and every other `.env*` file out of git. Only `.env.example` may be tracked.
+- For redeploys, prefer: `npm run typecheck`, `npm run test`, `npm run worker:check`, `npm run worker:migrate:remote`, `npm run worker:deploy`, then `npm run deploy`.
+
 ## Project Overview
 
 Nody is a full-stack writing app scaffold built with:
@@ -30,7 +38,7 @@ Use Node/npm with the checked-in `package-lock.json`.
 
 ```bash
 npm install
-cp .env.example .env.local
+cp .env.example .env.dev
 ```
 
 For local full-stack development, the default worker URL is:
@@ -101,6 +109,7 @@ Important environment variables are documented in `.env.example`.
 - `WORKER_API_BASE_URL` controls the Next.js proxy target and defaults locally to `http://127.0.0.1:8787/v1`.
 - `OPENAI_*` and `GEMINI_*` variables provide optional defaults for provider settings; users can override settings in the app.
 - `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_API_TOKEN`, `D1_DATABASE_ID`, and `R2_BUCKET_NAME` are deployment/runtime values for Cloudflare.
+- Put local development values in `.env.dev` and deployment values in `.env.deploy`; do not recreate `.env.local`.
 
 ## Coding Conventions
 

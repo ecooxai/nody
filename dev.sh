@@ -5,15 +5,27 @@ RUN_CHECKS=0
 RUN_WORKER=1
 WORKER_MODE="auto"
 WORKER_URL="http://127.0.0.1:8787/v1/health"
-export WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
+ENV_FILE="${NODY_DEV_ENV_FILE:-.env.dev}"
 PROJECT_LOCK_ID="$(pwd | sha256sum | awk '{print $1}')"
 LOCK_DIR="${TMPDIR:-/tmp}/nody-dev-${PROJECT_LOCK_ID}.lock"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
+else
+  echo "No ${ENV_FILE} found; using built-in local development defaults." >&2
+fi
+
+export WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
 
 usage() {
   cat <<'EOF'
 Usage: ./dev.sh [--check] [--worker] [--no-worker] [--full] [--help]
 
 Defaults to local dev mode:
+  - loads .env.dev when present
   - starts the Next.js dev server
   - starts the local Cloudflare worker when WORKER_API_BASE_URL points to localhost
   - skips the typecheck/test gate

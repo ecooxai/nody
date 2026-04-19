@@ -662,7 +662,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 onChange={(event) => onTitleChange(event.target.value)}
                 onFocus={onNoteInteract}
                 onPointerDown={onNoteInteract}
-                placeholder="Untitled note"
+                placeholder="Untitled"
                 ref={titleInputRef}
                 value={title}
               />
@@ -673,7 +673,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 onFocus={onNoteInteract}
                 type="button"
               >
-                {title || "Untitled note"}
+                {title || "Untitled"}
               </button>
             )}
           </div>

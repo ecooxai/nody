@@ -3,5 +3,5 @@ export function stripHtml(html: string) {
 }
 
 export function createStarterDocument() {
-  return "<h1>Untitled note</h1><p>Start writing here. Ask AI to summarize, rewrite, or patch selected passages.</p>";
+  return "<p>Start with plain text, then add <strong>bold</strong>, lists, or quotes.</p><ul><li>Keep related files in the same folder.</li></ul><p>Ask AI to summarize, rewrite, or patch selected text.</p>";
 }

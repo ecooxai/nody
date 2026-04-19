@@ -1,3 +1,5 @@
+import { noteTemplateFallbacks } from "@/lib/templates/notes";
+
 const MEDIA_PLACEHOLDER_PREFIX = "__NODY_MEDIA_BLOCK_";
 const UNDERLINE_PLACEHOLDER_PREFIX = "__NODY_UNDERLINE_";
 
@@ -226,5 +228,5 @@ export function ensureTrailingNewlines(value: string, count = 10) {
 }
 
 export function createStarterMarkdown() {
-  return "# Untitled note\n\nStart writing here. Ask AI to summarize, rewrite, or patch selected passages.";
+  return noteTemplateFallbacks.untitled;
 }

@@ -6,6 +6,17 @@ RUN_WORKER=1
 WORKER_MODE="auto"
 WORKER_URL="http://127.0.0.1:8787/v1/health"
 WRANGLER_BIN="./node_modules/.bin/wrangler"
+ENV_FILE="${NODY_DEV_ENV_FILE:-.env.dev}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  set +a
+else
+  echo "No ${ENV_FILE} found; using built-in local production defaults." >&2
+fi
+
 export WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
 
 usage() {
@@ -13,6 +24,7 @@ usage() {
 Usage: ./run.sh [--check] [--worker] [--no-worker] [--full] [--help]
 
 Defaults to production mode:
+  - loads .env.dev when present
   - builds the Next.js app
   - serves the production build
   - starts the local Cloudflare worker when WORKER_API_BASE_URL points to localhost

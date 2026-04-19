@@ -11,7 +11,7 @@ The Worker API is deployed separately from the frontend. Keep the frontend's `WO
 
 Deployment has four phases:
 
-1. Confirm `.env.local` has the Cloudflare and Clerk values listed below.
+1. Confirm `.env.deploy` has the Cloudflare and Clerk values listed below.
 2. Create or reuse Cloudflare D1 and R2 resources, then update `worker/wrangler.jsonc`.
 3. Apply D1 migrations and deploy the Worker API.
 4. Deploy the Next.js frontend with OpenNext, then set the frontend Worker runtime secrets.
@@ -26,10 +26,6 @@ Worker API:  https://nody-worker.ecooxai.workers.dev/v1
 Minimum command flow after env vars and Cloudflare resources are ready:
 
 ```bash
-set -a
-. ./.env.local
-set +a
-
 npm run typecheck
 npm run test
 npm run worker:check
@@ -48,9 +44,11 @@ printf '%s' "$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY" | npx wrangler secret put NEXT_
 
 Important note: run commands from the repo root. The frontend Worker uses root `wrangler.jsonc`; the API Worker uses `worker/wrangler.jsonc`.
 
+Important note: deploy-related npm scripts source `.env.deploy` themselves. Use `.env.dev` for local development and do not recreate `.env.local`.
+
 ## API Keys And Env Vars
 
-These are the deploy-relevant variables currently expected from `.env.local`. Secret values must stay out of git.
+These are the deploy-relevant variables currently expected from `.env.deploy`. Secret values must stay out of git.
 
 | Env var | Required for deploy | Secret | Purpose | How to get it |
 | --- | --- | --- | --- | --- |
@@ -85,7 +83,7 @@ Important note: keep the Worker binding names as `DB` and `MEDIA_BUCKET`. The Wo
 
 ## 1. Confirm Local Environment
 
-Check `.env.local` has these deployment values:
+Check `.env.deploy` has these deployment values:
 
 ```bash
 CLOUDFLARE_ACCOUNT_ID=...
@@ -95,7 +93,7 @@ D1_DATABASE_ID=381c67c7-23c8-48d4-b41b-57dec0d0608e
 R2_BUCKET_NAME=nody-media
 ```
 
-Important note: `.env.local` contains secrets and local deployment values. Do not commit it.
+Important note: `.env.deploy` contains secrets and deployment values. Do not commit it.
 
 ## 2. Get Any Missing Cloudflare Values
 
@@ -104,7 +102,7 @@ If `CLOUDFLARE_ACCOUNT_ID` is missing:
 1. Open the Cloudflare dashboard.
 2. Select the target account.
 3. Copy the Account ID from the account overview or right sidebar.
-4. Add it to `.env.local` as `CLOUDFLARE_ACCOUNT_ID=...`.
+4. Add it to `.env.deploy` as `CLOUDFLARE_ACCOUNT_ID=...`.
 
 If `CLOUDFLARE_API_TOKEN` is missing:
 
@@ -112,7 +110,7 @@ If `CLOUDFLARE_API_TOKEN` is missing:
 2. Go to My Profile > API Tokens.
 3. Create a custom token.
 4. Include permissions for Workers deployment, D1 edit access, and R2 edit access on the target account.
-5. Add it to `.env.local` as `CLOUDFLARE_API_TOKEN=...`.
+5. Add it to `.env.deploy` as `CLOUDFLARE_API_TOKEN=...`.
 
 For this project, the token must be able to:
 
@@ -131,7 +129,7 @@ List existing D1 databases:
 
 ```bash
 set -a
-. ./.env.local
+. ./.env.deploy
 set +a
 npx wrangler d1 list --json
 ```
@@ -160,7 +158,7 @@ List existing R2 buckets:
 
 ```bash
 set -a
-. ./.env.local
+. ./.env.deploy
 set +a
 npx wrangler r2 bucket list
 ```
@@ -199,9 +197,6 @@ Important note: `worker:check` validates the Worker build and Cloudflare binding
 Apply schema migrations to the remote D1 database:
 
 ```bash
-set -a
-. ./.env.local
-set +a
 npm run worker:migrate:remote
 ```
 
@@ -212,9 +207,6 @@ Important note: remote migrations change the production Cloudflare D1 database. 
 Deploy the Worker API:
 
 ```bash
-set -a
-. ./.env.local
-set +a
 npm run worker:deploy
 ```
 
@@ -231,9 +223,6 @@ Important note: the frontend proxy route reads `WORKER_API_BASE_URL`. If it stil
 Deploy the frontend Worker:
 
 ```bash
-set -a
-. ./.env.local
-set +a
 npm run deploy
 ```
 
@@ -241,7 +230,7 @@ After the first deploy, set the runtime secrets on the frontend Worker:
 
 ```bash
 set -a
-. ./.env.local
+. ./.env.deploy
 set +a
 printf '%s' "$CLERK_SECRET_KEY" | npx wrangler secret put CLERK_SECRET_KEY --config wrangler.jsonc
 printf '%s' "$WORKER_API_BASE_URL" | npx wrangler secret put WORKER_API_BASE_URL --config wrangler.jsonc
