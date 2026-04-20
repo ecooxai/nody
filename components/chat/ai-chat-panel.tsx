@@ -1272,19 +1272,27 @@ export function AIChatPanel({
         })),
       );
 
-      const sent = await onAsk({
+      const submittedPrompt = prompt;
+      const askPromise = onAsk({
         prompt: finalPrompt,
         attachments: requestAttachments,
         messageAttachments: items.map(buildMessageAttachment),
         prompts: selectedMessagePrompts,
         mode: options?.mode ?? "chat",
       });
+      if (submittedPrompt) {
+        setPrompt("");
+      }
+
+      const sent = await askPromise;
 
       if (sent) {
         if (!options?.preserveComposer) {
           clearComposer({ preservePrompts: true });
         }
         setFolderPickerOpen(false);
+      } else if (submittedPrompt) {
+        setPrompt((current) => current || submittedPrompt);
       }
     } catch (error) {
       onError(error instanceof Error ? error.message : "Failed to prepare attachments.");
@@ -3145,6 +3153,7 @@ export function AIChatPanel({
             onUploadImageToCurrentFolder={onUploadImageToCurrentFolder}
             providerSettings={providerSettings}
             sessionRequested={supportsLive && liveConnectionRequested}
+            speechPrompt={composePrompt(prompt, selectedPrompts)}
           />
         </div>
       </div>

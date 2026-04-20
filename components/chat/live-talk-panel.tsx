@@ -67,8 +67,9 @@ type LiveSessionState = {
   status: string;
 };
 
-const LIVE_MIC_SPEECH_RMS_THRESHOLD = 0.006;
-const LIVE_MIC_SPEECH_START_MS = 80;
+const LIVE_MIC_SPEECH_RMS_THRESHOLD = 0.012;
+const LIVE_MIC_SPEECH_START_MS = 220;
+const LIVE_MIC_MIN_TURN_SPEECH_MS = 2000;
 const LIVE_MIC_TRAILING_AUDIO_MS = 450;
 const LIVE_MIC_TURN_END_SILENCE_MS = 850;
 
@@ -259,7 +260,10 @@ async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000
       chunks.push(float32ToBase64Pcm16(resampled.subarray(offset, Math.min(offset + chunkSize, resampled.length))));
     }
 
-    return chunks;
+    return {
+      chunks,
+      durationMs: (resampled.length / sampleRate) * 1000,
+    };
   } finally {
     context.close().catch(() => undefined);
   }
@@ -727,6 +731,7 @@ export function LiveTalkPanel({
   onUploadImageToCurrentFolder,
   providerSettings,
   sessionRequested,
+  speechPrompt,
 }: {
   active: boolean;
   currentNoteBodyMarkdown: string;
@@ -756,6 +761,7 @@ export function LiveTalkPanel({
   onUploadImageToCurrentFolder?: ((attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<unknown>) | undefined;
   providerSettings: ProviderSettings;
   sessionRequested: boolean;
+  speechPrompt?: string;
 }) {
   const [connecting, setConnecting] = useState(false);
   const [ready, setReady] = useState(false);
@@ -805,6 +811,7 @@ export function LiveTalkPanel({
   const onInsertGeneratedImageInNoteRef = useRef(onInsertGeneratedImageInNote);
   const onOpenNoteRef = useRef(onOpenNote);
   const onVideoShareStateChangeRef = useRef(onVideoShareStateChange);
+  const speechPromptRef = useRef(speechPrompt ?? "");
   const sendLiveHandleRef = useRef<LiveSendHandle>({
     sendText: () => false,
     sendAttachment: async () => false,
@@ -813,7 +820,10 @@ export function LiveTalkPanel({
   const userTurnIdRef = useRef<string | null>(null);
   const userAudioChunksRef = useRef<Uint8Array[]>([]);
   const pendingUserAudioChunksRef = useRef<Uint8Array[]>([]);
+  const pendingUserAudioBase64ChunksRef = useRef<string[]>([]);
   const userAudioActiveRef = useRef(false);
+  const userAudioSentToModelRef = useRef(false);
+  const userAudioSpeechDurationMsRef = useRef(0);
   const userAudioSpeechStartMsRef = useRef(0);
   const userAudioTrailingSilenceMsRef = useRef(0);
   const assistantAudioChunksRef = useRef<Uint8Array[]>([]);
@@ -844,6 +854,7 @@ export function LiveTalkPanel({
   const appliedNoteContextRef = useRef(noteContext);
   const currentSelectedTextRef = useRef(currentSelectedText?.trim() ?? "");
   const userAudioSelectionContextRef = useRef("");
+  const userAudioPromptContextRef = useRef("");
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const pendingGeneratedImageScrollRef = useRef(false);
@@ -1001,6 +1012,10 @@ export function LiveTalkPanel({
   useEffect(() => {
     onOpenNoteRef.current = onOpenNote;
   }, [onOpenNote]);
+
+  useEffect(() => {
+    speechPromptRef.current = speechPrompt ?? "";
+  }, [speechPrompt]);
 
   useEffect(() => {
     onSessionStateChange?.({ connecting, ready, status });
@@ -1344,12 +1359,17 @@ export function LiveTalkPanel({
           if (performance.now() < assistantPlaybackMutedUntilRef.current) {
             if (userAudioActiveRef.current) {
               userAudioActiveRef.current = false;
+              userAudioSentToModelRef.current = false;
+              userAudioSpeechDurationMsRef.current = 0;
               userAudioSpeechStartMsRef.current = 0;
               userAudioTrailingSilenceMsRef.current = 0;
               finalizeUserAudioRef.current();
             }
             pendingUserAudioChunksRef.current = [];
+            pendingUserAudioBase64ChunksRef.current = [];
             pendingSpeechCameraImageRef.current = null;
+            userAudioSentToModelRef.current = false;
+            userAudioSpeechDurationMsRef.current = 0;
             userAudioSpeechStartMsRef.current = 0;
             return;
           }
@@ -1389,36 +1409,64 @@ export function LiveTalkPanel({
             );
           };
           const hasSpeech = rms >= LIVE_MIC_SPEECH_RMS_THRESHOLD;
-
-          sendAudioChunk(encodedAudio);
-
-          if (hasSpeech && !userAudioActiveRef.current) {
-            pendingUserAudioChunksRef.current.push(audioBytes);
-            userAudioSpeechStartMsRef.current += chunkDurationMs;
-            if (userAudioSpeechStartMsRef.current < LIVE_MIC_SPEECH_START_MS) {
-              return;
-            }
+          const sendBufferedAudioToModel = () => {
+            if (userAudioSentToModelRef.current) return;
             userAudioSelectionContextRef.current = sendSelectedTextContext(socketConnection);
-            ensureUserTurn();
+            userAudioPromptContextRef.current = sendSpeechPromptContext(socketConnection);
+            ensureUserTurn({ content: withActiveSelectionContext("") });
             pendingSpeechCameraImageRef.current = captureCameraSnapshotForSpeechStart();
-            userAudioActiveRef.current = true;
-            userAudioTrailingSilenceMsRef.current = 0;
+            userAudioSentToModelRef.current = true;
+            for (const chunk of pendingUserAudioBase64ChunksRef.current) {
+              sendAudioChunk(chunk);
+            }
             for (const chunk of pendingUserAudioChunksRef.current) {
               userAudioChunksRef.current.push(chunk);
             }
             pendingUserAudioChunksRef.current = [];
+            pendingUserAudioBase64ChunksRef.current = [];
+          };
+
+          if (hasSpeech && !userAudioActiveRef.current) {
+            pendingUserAudioChunksRef.current.push(audioBytes);
+            pendingUserAudioBase64ChunksRef.current.push(encodedAudio);
+            userAudioSpeechStartMsRef.current += chunkDurationMs;
+            if (userAudioSpeechStartMsRef.current < LIVE_MIC_SPEECH_START_MS) {
+              return;
+            }
+            userAudioActiveRef.current = true;
+            userAudioTrailingSilenceMsRef.current = 0;
+            userAudioSpeechDurationMsRef.current = userAudioSpeechStartMsRef.current;
+            if (userAudioSpeechDurationMsRef.current >= LIVE_MIC_MIN_TURN_SPEECH_MS) {
+              sendBufferedAudioToModel();
+            }
             userAudioSpeechStartMsRef.current = 0;
             return;
           }
 
           if (hasSpeech && userAudioActiveRef.current) {
             userAudioTrailingSilenceMsRef.current = 0;
+            userAudioSpeechDurationMsRef.current += chunkDurationMs;
+            if (!userAudioSentToModelRef.current) {
+              pendingUserAudioChunksRef.current.push(audioBytes);
+              pendingUserAudioBase64ChunksRef.current.push(encodedAudio);
+              if (userAudioSpeechDurationMsRef.current >= LIVE_MIC_MIN_TURN_SPEECH_MS) {
+                sendBufferedAudioToModel();
+              }
+              return;
+            }
+            sendAudioChunk(encodedAudio);
             userAudioChunksRef.current.push(audioBytes);
             return;
           }
 
           if (userAudioActiveRef.current && userAudioTrailingSilenceMsRef.current < LIVE_MIC_TRAILING_AUDIO_MS) {
             userAudioTrailingSilenceMsRef.current += chunkDurationMs;
+            if (!userAudioSentToModelRef.current) {
+              pendingUserAudioChunksRef.current.push(audioBytes);
+              pendingUserAudioBase64ChunksRef.current.push(encodedAudio);
+              return;
+            }
+            sendAudioChunk(encodedAudio);
             userAudioChunksRef.current.push(audioBytes);
             return;
           }
@@ -1426,23 +1474,31 @@ export function LiveTalkPanel({
           if (userAudioActiveRef.current) {
             userAudioTrailingSilenceMsRef.current += chunkDurationMs;
             if (userAudioTrailingSilenceMsRef.current >= LIVE_MIC_TURN_END_SILENCE_MS) {
+              const sentToModel = userAudioSentToModelRef.current;
               userAudioActiveRef.current = false;
               userAudioSpeechStartMsRef.current = 0;
               userAudioTrailingSilenceMsRef.current = 0;
-              const cameraImage = sendCameraSnapshotForTurn("speech");
-              const screenImage = sendScreenSnapshotForTurn("speech");
-              const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
-              if (turnImages.length > 0) {
-                appendImagesToUserTurn(turnImages, userTurnIdRef.current);
+              if (sentToModel) {
+                const cameraImage = sendCameraSnapshotForTurn("speech");
+                const screenImage = sendScreenSnapshotForTurn("speech");
+                const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+                if (turnImages.length > 0) {
+                  appendImagesToUserTurn(turnImages, userTurnIdRef.current);
+                }
+                sendAudioStreamEnd();
+              } else if (userAudioSpeechDurationMsRef.current > 0) {
+                setStatus("Ignored short audio.");
               }
-              sendAudioStreamEnd();
               finalizeUserAudioRef.current();
             }
             return;
           }
 
           pendingUserAudioChunksRef.current = [];
+          pendingUserAudioBase64ChunksRef.current = [];
           pendingSpeechCameraImageRef.current = null;
+          userAudioSentToModelRef.current = false;
+          userAudioSpeechDurationMsRef.current = 0;
           userAudioSpeechStartMsRef.current = 0;
         };
 
@@ -1464,14 +1520,14 @@ export function LiveTalkPanel({
     requestMicrophoneRef.current = requestMicrophone;
     resetMicrophoneRef.current = resetMicrophone;
 
-    const ensureUserTurn = () => {
+    const ensureUserTurn = (defaults?: { content?: string }) => {
       const existingId = userTurnIdRef.current;
       if (existingId) {
         return existingId;
       }
       const id = crypto.randomUUID();
       userTurnIdRef.current = id;
-      setTurns((current) => [...current, { id, role: "user", content: "" }]);
+      setTurns((current) => [...current, { id, role: "user", content: defaults?.content ?? "" }]);
       return id;
     };
 
@@ -1489,10 +1545,26 @@ export function LiveTalkPanel({
       return context;
     };
 
+    const sendSpeechPromptContext = (socketConnection: WebSocket) => {
+      const prompt = speechPromptRef.current.trim();
+      if (!prompt) return "";
+      const context = `Live prompt instructions:\n${prompt}`;
+      socketConnection.send(
+        JSON.stringify({
+          realtimeInput: {
+            text: context,
+          },
+        }),
+      );
+      recordLiveContextUsage(context);
+      return context;
+    };
+
     const withActiveSelectionContext = (content: string) => {
       const selectionContext = userAudioSelectionContextRef.current.trim();
+      const promptContext = userAudioPromptContextRef.current.trim();
       const trimmedContent = content.trim();
-      return [selectionContext, trimmedContent].filter(Boolean).join("\n\n");
+      return [selectionContext, promptContext, trimmedContent].filter(Boolean).join("\n\n");
     };
 
     const updateUserTurn = (content: string) => {
@@ -1550,10 +1622,14 @@ export function LiveTalkPanel({
       if (!userTurnId) {
         userAudioChunksRef.current = [];
         pendingUserAudioChunksRef.current = [];
+        pendingUserAudioBase64ChunksRef.current = [];
         pendingSpeechCameraImageRef.current = null;
         userAudioSpeechStartMsRef.current = 0;
         userAudioSelectionContextRef.current = "";
+        userAudioPromptContextRef.current = "";
         userAudioActiveRef.current = false;
+        userAudioSentToModelRef.current = false;
+        userAudioSpeechDurationMsRef.current = 0;
         userAudioTrailingSilenceMsRef.current = 0;
         return;
       }
@@ -1567,11 +1643,15 @@ export function LiveTalkPanel({
       }
       userTurnIdRef.current = null;
       userAudioSelectionContextRef.current = "";
+      userAudioPromptContextRef.current = "";
       userAudioChunksRef.current = [];
       pendingUserAudioChunksRef.current = [];
+      pendingUserAudioBase64ChunksRef.current = [];
       pendingSpeechCameraImageRef.current = null;
       userAudioSpeechStartMsRef.current = 0;
       userAudioActiveRef.current = false;
+      userAudioSentToModelRef.current = false;
+      userAudioSpeechDurationMsRef.current = 0;
       userAudioTrailingSilenceMsRef.current = 0;
     };
     finalizeUserAudioRef.current = finalizeUserAudio;
@@ -2316,12 +2396,17 @@ export function LiveTalkPanel({
 
       const blob = await loadAttachmentBlob(attachment);
       if (attachment.kind === "audio") {
+        const decodedAudio = await decodeAudioBlobToPcm16ChunksBase64(blob);
+        if (decodedAudio.durationMs < LIVE_MIC_MIN_TURN_SPEECH_MS) {
+          setStatus("Ignored short audio.");
+          return true;
+        }
         const selectionContext = sendSelectedTextContext(socketConnection);
+        const promptContext = sendSpeechPromptContext(socketConnection);
         const cameraImage = sendCameraSnapshotForTurn("audio");
         const screenImage = sendScreenSnapshotForTurn("audio");
         const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
-        const chunks = await decodeAudioBlobToPcm16ChunksBase64(blob);
-        for (const chunk of chunks) {
+        for (const chunk of decodedAudio.chunks) {
           socketConnection.send(
             JSON.stringify({
               realtimeInput: {
@@ -2333,12 +2418,19 @@ export function LiveTalkPanel({
             }),
           );
         }
+        socketConnection.send(
+          JSON.stringify({
+            realtimeInput: {
+              audioStreamEnd: true,
+            },
+          }),
+        );
         setTurns((current) => [
           ...current,
           {
             id: crypto.randomUUID(),
             role: "user",
-            content: [selectionContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
+            content: [selectionContext, promptContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
             images: turnImages.length > 0 ? turnImages : undefined,
           },
         ]);
