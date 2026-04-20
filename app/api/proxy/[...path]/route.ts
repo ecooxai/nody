@@ -12,14 +12,16 @@ function corsHeaders() {
   };
 }
 
-function sanitizeProxyResponseHeaders(response: Response) {
+function sanitizeProxyResponseHeaders(response: Response, options?: { preserveContentLength?: boolean }) {
   const headers = new Headers(response.headers);
 
   // `fetch()` transparently decodes gzip/br content but may leave the original
   // transport headers behind. Forwarding those stale headers causes the browser
   // to attempt a second decode and fail.
   headers.delete("content-encoding");
-  headers.delete("content-length");
+  if (!options?.preserveContentLength) {
+    headers.delete("content-length");
+  }
   headers.delete("transfer-encoding");
   headers.delete("connection");
   headers.delete("keep-alive");
@@ -67,15 +69,20 @@ async function forward(request: Request, params: { path: string[] }) {
   sourceUrl.searchParams.forEach((value, key) => url.searchParams.set(key, value));
 
   const body = request.method === "GET" || request.method === "HEAD" ? undefined : await request.arrayBuffer();
+  const headers = new Headers();
+  headers.set("content-type", request.headers.get("content-type") ?? "application/json");
+  if (userId) headers.set("x-user-id", userId);
+  const range = request.headers.get("range");
+  if (range) headers.set("range", range);
+  const ifRange = request.headers.get("if-range");
+  if (ifRange) headers.set("if-range", ifRange);
+
   let response: Response;
   try {
     response = await fetch(url, {
       method: request.method,
       body,
-      headers: {
-        "content-type": request.headers.get("content-type") ?? "application/json",
-        ...(userId ? { "x-user-id": userId } : {}),
-      },
+      headers,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown proxy error";
@@ -104,18 +111,18 @@ async function forward(request: Request, params: { path: string[] }) {
     );
   }
 
-  const headers = sanitizeProxyResponseHeaders(response);
-  if (!headers.has("content-type")) {
-    headers.set("content-type", "application/json");
+  const responseHeaders = sanitizeProxyResponseHeaders(response, { preserveContentLength: isMediaRequest });
+  if (!responseHeaders.has("content-type")) {
+    responseHeaders.set("content-type", "application/json");
   }
   if (params.path[0] === "media") {
     for (const [key, value] of Object.entries(corsHeaders())) {
-      headers.set(key, value);
+      responseHeaders.set(key, value);
     }
   }
   return new Response(response.body, {
     status: response.status,
-    headers,
+    headers: responseHeaders,
   });
 }
 

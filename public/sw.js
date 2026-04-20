@@ -1,4 +1,4 @@
-const CACHE_NAME = "nody-static-v1";
+const CACHE_NAME = "nody-static-v2";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -16,6 +16,8 @@ self.addEventListener("activate", (event) => {
 
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET") return;
+  if (event.request.headers.has("range")) return;
+  if (event.request.destination === "audio" || event.request.destination === "video") return;
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/_next/")) return;

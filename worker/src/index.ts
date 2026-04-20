@@ -43,6 +43,59 @@ function normalizeFileName(value: unknown) {
   return fileName;
 }
 
+type ParsedByteRange = {
+  end: number;
+  length: number;
+  offset: number;
+};
+
+function parseByteRange(rangeHeader: string | null, size: number): ParsedByteRange | "invalid" | null {
+  if (!rangeHeader) return null;
+  if (size <= 0) return "invalid";
+  const normalized = rangeHeader.trim();
+  if (!normalized.startsWith("bytes=") || normalized.includes(",")) return "invalid";
+
+  const range = normalized.slice("bytes=".length).trim();
+  const separator = range.indexOf("-");
+  if (separator < 0) return "invalid";
+
+  const startText = range.slice(0, separator).trim();
+  const endText = range.slice(separator + 1).trim();
+  if (!startText && !endText) return "invalid";
+
+  if (!startText) {
+    const suffixLength = Number(endText);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return "invalid";
+    const length = Math.min(suffixLength, size);
+    const offset = Math.max(0, size - length);
+    return { offset, length, end: size > 0 ? size - 1 : 0 };
+  }
+
+  const offset = Number(startText);
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset >= size) return "invalid";
+  const requestedEnd = endText ? Number(endText) : size - 1;
+  if (!Number.isSafeInteger(requestedEnd) || requestedEnd < offset) return "invalid";
+  const end = Math.min(requestedEnd, size - 1);
+  return { offset, end, length: end - offset + 1 };
+}
+
+function mediaHeaders(object: R2Object, contentLength: number, range?: ParsedByteRange) {
+  const headers = new Headers({
+    "content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
+    "content-length": String(contentLength),
+    "accept-ranges": "bytes",
+    "etag": object.httpEtag,
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, HEAD, OPTIONS",
+    "access-control-allow-headers": "*",
+  });
+  object.writeHttpMetadata(headers);
+  if (range) {
+    headers.set("content-range", `bytes ${range.offset}-${range.end}/${object.size}`);
+  }
+  return headers;
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -62,15 +115,36 @@ export default {
       }
 
       if ((request.method === "GET" || request.method === "HEAD") && parts[0] === "media" && parts[1]) {
-        const object = await env.MEDIA_BUCKET.get(parts.slice(1).join("/"));
+        const key = parts.slice(1).join("/");
+        const head = await env.MEDIA_BUCKET.head(key);
+        if (!head) return json({ error: "Not found" }, { status: 404 });
+
+        const range = parseByteRange(request.headers.get("range"), head.size);
+        if (range === "invalid") {
+          return new Response(null, {
+            status: 416,
+            headers: {
+              "content-range": `bytes */${head.size}`,
+              "accept-ranges": "bytes",
+              "access-control-allow-origin": "*",
+              "access-control-allow-methods": "GET, HEAD, OPTIONS",
+              "access-control-allow-headers": "*",
+            },
+          });
+        }
+
+        if (request.method === "HEAD") {
+          return new Response(null, {
+            status: range ? 206 : 200,
+            headers: mediaHeaders(head, range?.length ?? head.size, range ?? undefined),
+          });
+        }
+
+        const object = await env.MEDIA_BUCKET.get(key, range ? { range: { offset: range.offset, length: range.length } } : undefined);
         if (!object) return json({ error: "Not found" }, { status: 404 });
-        return new Response(request.method === "HEAD" ? null : object.body, {
-          headers: {
-            "content-type": object.httpMetadata?.contentType ?? "application/octet-stream",
-            "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, HEAD, OPTIONS",
-            "access-control-allow-headers": "*",
-          },
+        return new Response(object.body, {
+          status: range ? 206 : 200,
+          headers: mediaHeaders(head, range?.length ?? head.size, range ?? undefined),
         });
       }
 

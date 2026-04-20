@@ -2,6 +2,8 @@ import Link from "next/link";
 
 import { Panel } from "@/components/ui/panel";
 
+export const dynamic = "force-static";
+
 export default function NotFound() {
   return (
     <div className="relative isolate py-8 sm:py-12">

@@ -138,7 +138,7 @@ type EmbeddedMedia = {
 
 type MediaTagPreview = {
   endIndex: number;
-  kind: "image" | "video";
+  kind: "image" | "audio" | "video";
   matchIndex: number;
   tagText: string;
   src: string;
@@ -147,16 +147,22 @@ type MediaTagPreview = {
 const EDITOR_PREVIEW_VERTICAL_GAP_PX = 8;
 const EDITOR_PREVIEW_SIZE_PX = 200;
 
+function compactMediaTags(value: string) {
+  return value.replace(/<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi, (match) =>
+    match.replace(/\s+/g, " ").trim(),
+  );
+}
+
 function extractMediaTagPreviews(value: string) {
   const previews: MediaTagPreview[] = [];
-  const tagPattern = /<(img|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/video>)/gi;
+  const tagPattern = /<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi;
 
   for (const match of value.matchAll(tagPattern)) {
     const rawTag = match[0] ?? "";
-    const tagText = rawTag.trim();
+    const tagText = compactMediaTags(rawTag);
     const srcMatch = rawTag.match(/\ssrc=(?:"([^"]+)"|'([^']+)')/i);
     const src = srcMatch?.[1] || srcMatch?.[2] || "";
-    const kind = /^<video\b/i.test(rawTag) ? "video" : "image";
+    const kind = /^<video\b/i.test(rawTag) ? "video" : /^<audio\b/i.test(rawTag) ? "audio" : "image";
     if (!src) continue;
     const matchIndex = match.index ?? 0;
     previews.push({
@@ -169,6 +175,10 @@ function extractMediaTagPreviews(value: string) {
   }
 
   return previews;
+}
+
+function mediaTagPreviewKey(preview: MediaTagPreview) {
+  return `${preview.kind}:${preview.matchIndex}`;
 }
 
 function measureMediaPreviewTops(textarea: HTMLTextAreaElement, value: string, previews: MediaTagPreview[]) {
@@ -264,6 +274,28 @@ function inferMimeFromUrl(url: string, kind: AIMediaKind) {
   return "video/webm";
 }
 
+function formatFileSize(bytes: number | null) {
+  if (bytes === null) return "Unknown";
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 ? value.toFixed(1) : value.toFixed(2)} ${units[unitIndex]}`;
+}
+
+function absoluteMediaUrl(url: string) {
+  if (typeof window === "undefined") return url;
+  try {
+    return new URL(url, window.location.origin).toString();
+  } catch {
+    return url;
+  }
+}
+
 function findLineStartOffset(value: string, lineNumber: number) {
   const targetLine = Math.max(1, Math.floor(lineNumber));
   if (targetLine <= 1) return 0;
@@ -290,6 +322,17 @@ function insertBlockAtLine(value: string, block: string, lineNumber: number) {
   return {
     value: `${before}${inserted}${after}`,
     caret: before.length + inserted.length,
+  };
+}
+
+function embeddedMediaFromPreview(preview: MediaTagPreview): EmbeddedMedia {
+  return {
+    id: `${preview.kind}:${preview.src}`,
+    kind: preview.kind,
+    fileName: fileNameFromUrl(preview.src),
+    mimeType: inferMimeFromUrl(preview.src, preview.kind),
+    assetUrl: preview.src,
+    previewUrl: preview.src,
   };
 }
 
@@ -343,6 +386,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const previewSelectionJustFinishedRef = useRef(false);
   const previewPointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const lastPreviewSelectionRef = useRef("");
+  const bodyChangeTimerRef = useRef<number | null>(null);
+  const lastPublishedBodyRef = useRef(bodyMarkdown);
+  const viewerCopyTimerRef = useRef<number | null>(null);
   const lineTapRef = useRef<{ key: string | null; count: number; startedAt: number }>({
     key: null,
     count: 0,
@@ -353,8 +399,18 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const [mediaPreviewTops, setMediaPreviewTops] = useState<Record<number, number>>({});
   const [lineStartTops, setLineStartTops] = useState<LineTopMap>({});
   const [viewerMedia, setViewerMedia] = useState<EmbeddedMedia | null>(null);
-  const noteBodyMarkdown = useMemo(() => ensureTrailingNewlines(bodyMarkdown), [bodyMarkdown]);
-  const previewHtml = useMemo(() => markdownToHtml(noteBodyMarkdown), [noteBodyMarkdown]);
+  const [viewerImageInfo, setViewerImageInfo] = useState<{
+    copied: boolean;
+    fileSize: number | null;
+    height: number | null;
+    loadingSize: boolean;
+    width: number | null;
+  }>({ copied: false, fileSize: null, height: null, loadingSize: false, width: null });
+  const [editingImageTagKey, setEditingImageTagKey] = useState<string | null>(null);
+  const [bodyDraft, setBodyDraft] = useState(() => compactMediaTags(bodyMarkdown));
+  const bodyDraftRef = useRef(compactMediaTags(bodyMarkdown));
+  const noteBodyMarkdown = useMemo(() => ensureTrailingNewlines(bodyDraft), [bodyDraft]);
+  const previewHtml = useMemo(() => (editable ? "" : markdownToHtml(noteBodyMarkdown)), [editable, noteBodyMarkdown]);
   const mediaTagPreviews = useMemo(() => extractMediaTagPreviews(noteBodyMarkdown), [noteBodyMarkdown]);
   const lineNumbers = useMemo(() => {
     const lineCount = Math.max(1, noteBodyMarkdown.split("\n").length);
@@ -389,6 +445,42 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       window.clearTimeout(previewSelectionTimerRef.current);
       previewSelectionTimerRef.current = null;
     }
+  };
+
+  const clearBodyChangeTimer = () => {
+    if (bodyChangeTimerRef.current) {
+      window.clearTimeout(bodyChangeTimerRef.current);
+      bodyChangeTimerRef.current = null;
+    }
+  };
+
+  const clearViewerCopyTimer = () => {
+    if (viewerCopyTimerRef.current) {
+      window.clearTimeout(viewerCopyTimerRef.current);
+      viewerCopyTimerRef.current = null;
+    }
+  };
+
+  const publishBodyChange = (value: string) => {
+    const compactedValue = compactMediaTags(value);
+    clearBodyChangeTimer();
+    if (compactedValue !== bodyDraftRef.current) {
+      bodyDraftRef.current = compactedValue;
+      setBodyDraft(compactedValue);
+    }
+    if (compactedValue === lastPublishedBodyRef.current) return;
+    lastPublishedBodyRef.current = compactedValue;
+    bodyDraftRef.current = compactedValue;
+    onBodyChange(compactedValue);
+  };
+
+  const scheduleBodyChange = (value: string) => {
+    if (value === lastPublishedBodyRef.current) return;
+    clearBodyChangeTimer();
+    bodyChangeTimerRef.current = window.setTimeout(() => {
+      bodyChangeTimerRef.current = null;
+      publishBodyChange(value);
+    }, 350);
   };
 
   const readPreviewSelection = () => {
@@ -570,9 +662,31 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     () => () => {
       clearActiveMediaHideTimer();
       clearPreviewSelectionTimer();
+      clearBodyChangeTimer();
+      clearViewerCopyTimer();
+      if (bodyDraftRef.current !== lastPublishedBodyRef.current) {
+        onBodyChange(compactMediaTags(bodyDraftRef.current));
+      }
     },
     [],
   );
+
+  useEffect(() => {
+    const compactedBodyMarkdown = compactMediaTags(bodyMarkdown);
+    if (compactedBodyMarkdown !== bodyMarkdown) {
+      lastPublishedBodyRef.current = compactedBodyMarkdown;
+      bodyDraftRef.current = compactedBodyMarkdown;
+      setBodyDraft(compactedBodyMarkdown);
+      clearBodyChangeTimer();
+      onBodyChange(compactedBodyMarkdown);
+      return;
+    }
+    if (compactedBodyMarkdown === lastPublishedBodyRef.current) return;
+    lastPublishedBodyRef.current = compactedBodyMarkdown;
+    bodyDraftRef.current = compactedBodyMarkdown;
+    setBodyDraft(compactedBodyMarkdown);
+    clearBodyChangeTimer();
+  }, [bodyMarkdown]);
 
   useEffect(() => {
     lastPreviewSelectionRef.current = "";
@@ -580,6 +694,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     clearPreviewSelectionTimer();
 
     if (!editable) {
+      publishBodyChange(bodyDraft);
       selectionRef.current = { start: 0, end: 0 };
       return;
     }
@@ -592,6 +707,39 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       setTextareaScrollTop(textarea?.scrollTop ?? 0);
     });
   }, [editable]);
+
+  useEffect(() => {
+    if (!editingImageTagKey) return;
+    const stillEditingImage = mediaTagPreviews.some((preview) => preview.kind === "image" && mediaTagPreviewKey(preview) === editingImageTagKey);
+    if (!stillEditingImage) {
+      setEditingImageTagKey(null);
+    }
+  }, [editingImageTagKey, mediaTagPreviews]);
+
+  useEffect(() => {
+    clearViewerCopyTimer();
+    setViewerImageInfo({ copied: false, fileSize: null, height: null, loadingSize: viewerMedia?.kind === "image", width: null });
+
+    if (viewerMedia?.kind !== "image") return;
+
+    const controller = new AbortController();
+    fetch(viewerMedia.previewUrl, { method: "HEAD", signal: controller.signal })
+      .then((response) => {
+        const contentLength = response.headers.get("content-length");
+        const fileSize = contentLength ? Number.parseInt(contentLength, 10) : Number.NaN;
+        setViewerImageInfo((current) => ({
+          ...current,
+          fileSize: Number.isFinite(fileSize) ? fileSize : null,
+          loadingSize: false,
+        }));
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setViewerImageInfo((current) => ({ ...current, fileSize: null, loadingSize: false }));
+      });
+
+    return () => controller.abort();
+  }, [viewerMedia?.kind, viewerMedia?.previewUrl]);
 
   useLayoutEffect(() => {
     if (!editable) return;
@@ -734,8 +882,16 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     onSelectionChange?.(textarea.value.slice(selectionRef.current.start, selectionRef.current.end).trim());
   };
 
+  const handleBodyTextareaChange = (value: string) => {
+    bodyDraftRef.current = value;
+    setBodyDraft(value);
+    scheduleBodyChange(value);
+  };
+
   const applyTextareaMutation = (nextValue: string, nextSelection: TextSelection) => {
-    onBodyChange(nextValue);
+    bodyDraftRef.current = nextValue;
+    setBodyDraft(nextValue);
+    publishBodyChange(nextValue);
     selectionRef.current = nextSelection;
     window.requestAnimationFrame(() => {
       const textarea = textareaRef.current;
@@ -780,10 +936,22 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     });
   };
 
+  const removeMediaTag = (preview: MediaTagPreview) => {
+    const before = noteBodyMarkdown.slice(0, preview.matchIndex);
+    const after = noteBodyMarkdown.slice(preview.endIndex);
+    const removeLeadingBlank = before.endsWith("\n\n") && after.startsWith("\n") ? 1 : 0;
+    const nextValue = `${before}${after.slice(removeLeadingBlank)}`;
+    applyTextareaMutation(nextValue, { start: preview.matchIndex, end: preview.matchIndex });
+  };
+
   const updateMediaTagText = (preview: MediaTagPreview, nextTagText: string) => {
-    const nextValue = `${noteBodyMarkdown.slice(0, preview.matchIndex)}${nextTagText}${noteBodyMarkdown.slice(preview.endIndex)}`;
-    const caret = preview.matchIndex + nextTagText.length;
-    onBodyChange(nextValue);
+    const compactedTag = compactMediaTags(nextTagText);
+    const sourceValue = bodyDraftRef.current;
+    const nextValue = `${sourceValue.slice(0, preview.matchIndex)}${compactedTag}${sourceValue.slice(preview.endIndex)}`;
+    const caret = preview.matchIndex + compactedTag.length;
+    bodyDraftRef.current = nextValue;
+    setBodyDraft(nextValue);
+    scheduleBodyChange(nextValue);
     selectionRef.current = { start: caret, end: caret };
   };
 
@@ -793,6 +961,21 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       end: preview.matchIndex + (target.selectionEnd ?? 0),
     };
     onSelectionChange?.(target.value.slice(target.selectionStart ?? 0, target.selectionEnd ?? 0).trim());
+  };
+
+  const copyViewerImageUrl = async () => {
+    if (!viewerMedia || viewerMedia.kind !== "image") return;
+    try {
+      await navigator.clipboard.writeText(absoluteMediaUrl(viewerMedia.assetUrl));
+      clearViewerCopyTimer();
+      setViewerImageInfo((current) => ({ ...current, copied: true }));
+      viewerCopyTimerRef.current = window.setTimeout(() => {
+        setViewerImageInfo((current) => ({ ...current, copied: false }));
+        viewerCopyTimerRef.current = null;
+      }, 1600);
+    } catch {
+      setViewerImageInfo((current) => ({ ...current, copied: false }));
+    }
   };
 
   const focusTextareaRange = (start: number, end: number) => {
@@ -1064,7 +1247,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 {renderLineNumberGutter(textareaScrollTop)}
                 <textarea
                   className="min-h-[34rem] w-full resize-none overflow-hidden bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
-                  onChange={(event) => onBodyChange(event.target.value)}
+                  onChange={(event) => handleBodyTextareaChange(event.target.value)}
                   onFocus={onNoteInteract}
                   onKeyUp={syncTextareaSelection}
                   onMouseUp={syncTextareaSelection}
@@ -1077,36 +1260,85 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 />
                 {mediaTagPreviews.length > 0 ? (
                   <div className="pointer-events-none absolute bottom-0 left-[20px] right-0 top-0 overflow-hidden" aria-label="Media tag previews">
-                    {mediaTagPreviews.map((preview) => (
-                      <div
-                        className="pointer-events-auto absolute left-[10px] right-[10px] grid min-h-[200px] grid-cols-[200px_minmax(0,1fr)] items-start gap-3 bg-[#fffbf4]"
-                        key={`${preview.kind}:${preview.src}:${preview.matchIndex}`}
-                        style={{
-                          top: (mediaPreviewTops[preview.matchIndex] ?? 0) - textareaScrollTop,
-                        }}
-                        title={preview.tagText}
-                      >
-                        <div className="flex h-[200px] w-[200px] items-start justify-start overflow-hidden">
-                          {preview.kind === "image" ? (
-                            <img alt="" className="max-h-[200px] max-w-[200px] rounded-xl object-cover" src={preview.src} />
-                          ) : (
-                            <video className="max-h-[200px] max-w-[200px] rounded-xl bg-black" controls muted playsInline src={preview.src} />
-                          )}
+                    {mediaTagPreviews.map((preview) => {
+                      const previewKey = mediaTagPreviewKey(preview);
+                      const isEditingImageTag = preview.kind === "image" && editingImageTagKey === previewKey;
+                      return (
+                        <div
+                          className="pointer-events-auto absolute left-[10px] right-[10px] flex items-start gap-3 bg-[#fffbf4]"
+                          key={`${preview.kind}:${preview.src}:${preview.matchIndex}`}
+                          style={{
+                            top: (mediaPreviewTops[preview.matchIndex] ?? 0) - textareaScrollTop,
+                          }}
+                          title={preview.tagText}
+                        >
+                          <div className="flex max-w-[200px] shrink-0 items-start justify-start overflow-hidden">
+                            {preview.kind === "image" ? (
+                              <img alt="" className="max-h-[200px] max-w-[200px] rounded-xl object-cover" src={preview.src} />
+                            ) : preview.kind === "audio" ? (
+                              <audio className="mt-2 h-10 w-[200px]" controls preload="metadata" src={preview.src} />
+                            ) : (
+                              <video className="max-h-[200px] max-w-[200px] rounded-xl bg-black" controls muted playsInline src={preview.src} />
+                            )}
+                          </div>
+                          <div className="mt-2 flex shrink-0 flex-col gap-2">
+                            <button
+                              className="flex h-9 w-9 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-[#bb3e2d]/30 hover:bg-[#fff0ed] hover:text-[#bb3e2d]"
+                              onClick={() => removeMediaTag(preview)}
+                              onPointerDown={onNoteInteract}
+                              title={`Remove ${preview.kind}`}
+                              type="button"
+                            >
+                              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                                <path d="M9 4h6M5 7h14M10 11v6M14 11v6M7 7l1 13h8l1-13" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+                              </svg>
+                            </button>
+                            {preview.kind === "image" ? (
+                              <>
+                                <button
+                                  className="flex h-9 w-9 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-ink/20 hover:bg-mist"
+                                  onClick={() => setViewerMedia(embeddedMediaFromPreview(preview))}
+                                  onPointerDown={onNoteInteract}
+                                  title="View large"
+                                  type="button"
+                                >
+                                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                                    <path d="M14 4h6v6M10 20H4v-6M20 10V4h-6M4 14v6h6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+                                  </svg>
+                                </button>
+                                <button
+                                  className={`flex h-9 w-9 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-ink/20 hover:bg-mist ${isEditingImageTag ? "border-ink/25 bg-mist" : ""}`}
+                                  onClick={() => setEditingImageTagKey((current) => (current === previewKey ? null : previewKey))}
+                                  onPointerDown={onNoteInteract}
+                                  title="Edit image tag"
+                                  type="button"
+                                >
+                                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                                    <path d="M14.5 5.5l4 4M4 20l4.2-.8L19 8.4 15.6 5 4.8 15.8 4 20z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                                  </svg>
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
+                          {isEditingImageTag ? (
+                            <textarea
+                              aria-label="Image tag source"
+                              className="mt-2 min-h-[96px] min-w-0 flex-1 resize-y overflow-x-auto rounded-lg border border-ink/10 bg-white px-3 py-2 font-mono text-xs leading-5 text-ink outline-none shadow-[0_8px_20px_rgba(15,23,42,0.06)] focus:border-ink/25"
+                              onChange={(event) => updateMediaTagText(preview, event.target.value)}
+                              onFocus={onNoteInteract}
+                              onKeyUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                              onMouseUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                              onPointerDown={onNoteInteract}
+                              onSelect={(event) => syncMediaTagSelection(preview, event.currentTarget)}
+                              rows={4}
+                              spellCheck={false}
+                              value={preview.tagText}
+                              wrap="off"
+                            />
+                          ) : null}
                         </div>
-                        <textarea
-                          aria-label="Media tag"
-                          className="hide-scrollbar min-h-[200px] w-full resize-none bg-transparent px-[5px] py-[5px] text-[15px] leading-7 text-ink outline-none"
-                          onChange={(event) => updateMediaTagText(preview, event.target.value)}
-                          onFocus={onNoteInteract}
-                          onKeyUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
-                          onMouseUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
-                          onPointerDown={onNoteInteract}
-                          onSelect={(event) => syncMediaTagSelection(preview, event.currentTarget)}
-                          spellCheck={false}
-                          value={preview.tagText}
-                        />
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ) : null}
               </div>
@@ -1170,7 +1402,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       </section>
       {viewerMedia ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="relative max-h-[90vh] w-full max-w-5xl overflow-hidden rounded-[20px] bg-[#fffdf8] p-4">
+          <div className="relative max-h-[92vh] w-auto max-w-[94vw] overflow-auto rounded-[20px] bg-[#fffdf8] p-4">
             <div className="mb-3 flex items-center justify-between gap-3">
               <div className="min-w-0 truncate text-sm font-medium text-ink">{viewerMedia.fileName}</div>
               <button
@@ -1183,13 +1415,59 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                 </svg>
               </button>
             </div>
-            <div className="flex max-h-[calc(90vh-4rem)] items-center justify-center overflow-auto">
+            <div className="flex max-h-[calc(92vh-12rem)] items-center justify-center overflow-auto">
               {viewerMedia.kind === "image" ? (
-                <img alt={viewerMedia.fileName} className="max-h-[80vh] max-w-full object-contain" src={viewerMedia.previewUrl} />
+                <img
+                  alt={viewerMedia.fileName}
+                  className="h-auto max-h-[70vh] max-w-[90vw] object-contain"
+                  onLoad={(event) => {
+                    const image = event.currentTarget;
+                    setViewerImageInfo((current) => ({
+                      ...current,
+                      height: image.naturalHeight || null,
+                      width: image.naturalWidth || null,
+                    }));
+                  }}
+                  src={viewerMedia.previewUrl}
+                />
               ) : (
                 <video className="max-h-[80vh] max-w-full" controls src={viewerMedia.previewUrl} />
               )}
             </div>
+            {viewerMedia.kind === "image" ? (
+              <div className="mt-4 grid gap-2 text-xs text-ink/70">
+                <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-2">
+                  <div className="font-medium text-ink">Resolution</div>
+                  <div>
+                    {viewerImageInfo.width && viewerImageInfo.height
+                      ? `${viewerImageInfo.width} x ${viewerImageInfo.height}`
+                      : "Loading"}
+                  </div>
+                </div>
+                <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-2">
+                  <div className="font-medium text-ink">File size</div>
+                  <div>{viewerImageInfo.loadingSize ? "Loading" : formatFileSize(viewerImageInfo.fileSize)}</div>
+                </div>
+                <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] items-center gap-2">
+                  <div className="font-medium text-ink">URL</div>
+                  <div className="flex min-w-0 items-center gap-2">
+                    <div className="min-w-0 flex-1 truncate rounded-md bg-black/[0.04] px-2 py-1 font-mono text-[11px] text-ink/75">
+                      {absoluteMediaUrl(viewerMedia.assetUrl)}
+                    </div>
+                    <button
+                      className="flex h-8 shrink-0 items-center gap-1 rounded-full border border-ink/10 bg-white px-3 text-xs font-medium text-ink transition hover:border-ink/20 hover:bg-mist"
+                      onClick={() => void copyViewerImageUrl()}
+                      type="button"
+                    >
+                      <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                        <path d="M8 8V5.5A1.5 1.5 0 019.5 4h9A1.5 1.5 0 0120 5.5v9a1.5 1.5 0 01-1.5 1.5H16M5.5 8h9A1.5 1.5 0 0116 9.5v9a1.5 1.5 0 01-1.5 1.5h-9A1.5 1.5 0 014 18.5v-9A1.5 1.5 0 015.5 8z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                      </svg>
+                      {viewerImageInfo.copied ? "Copied" : "Copy"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}
