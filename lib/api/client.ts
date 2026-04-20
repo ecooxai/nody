@@ -89,6 +89,12 @@ export const apiClient = {
       body: formData,
     });
   },
+  renameFolderAsset: (id: string, fileName: string) =>
+    request<FolderAsset>(`/folder-assets/${id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ fileName }),
+    }),
   syncDocument: (id: string, payload: SyncPayload) =>
     request<SyncResult>(`/documents/${id}/sync`, {
       method: "POST",

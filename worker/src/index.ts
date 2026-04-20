@@ -5,6 +5,7 @@ import {
   createPromptTemplate,
   createFolder,
   createDocument,
+  findFolderAssetByPath,
   getDocument,
   listFolders,
   listFolderAssets,
@@ -16,6 +17,7 @@ import {
   saveFolderAsset,
   saveSettings,
   syncDocument,
+  updateFolderAssetName,
 } from "./db";
 import type { Env } from "./env";
 import { json } from "./json";
@@ -24,6 +26,21 @@ function requireUserId(request: Request) {
   const userId = request.headers.get("x-user-id");
   if (!userId) throw new Error("Unauthorized");
   return userId;
+}
+
+function decodePathSegments(parts: string[]) {
+  try {
+    return parts.map((part) => decodeURIComponent(part));
+  } catch {
+    return null;
+  }
+}
+
+function normalizeFileName(value: unknown) {
+  if (typeof value !== "string") return null;
+  const fileName = value.trim();
+  if (!fileName || fileName.length > 180 || /[\\/]/.test(fileName)) return null;
+  return fileName;
 }
 
 export default {
@@ -73,6 +90,12 @@ export default {
       if (request.method === "GET" && parts[0] === "folder-assets" && parts.length === 1) {
         return json(await listFolderAssets(env.DB, userId));
       }
+      if (request.method === "GET" && parts[0] === "folder-url" && parts.length >= 2) {
+        const pathSegments = decodePathSegments(parts.slice(1));
+        if (!pathSegments) return json({ error: "Invalid folder path" }, { status: 400 });
+        const asset = await findFolderAssetByPath(env.DB, userId, pathSegments);
+        return asset ? json(asset) : json({ error: "Not found" }, { status: 404 });
+      }
       if (request.method === "GET" && parts[0] === "prompts" && parts.length === 1) {
         return json(await listPromptTemplates(env.DB, userId));
       }
@@ -87,6 +110,13 @@ export default {
       if (request.method === "PUT" && parts[0] === "prompts" && parts.length === 2) {
         const payload = await request.json() as { name: string; content: string };
         return json(await updatePromptTemplate(env.DB, userId, parts[1], payload));
+      }
+      if (request.method === "PUT" && parts[0] === "folder-assets" && parts.length === 2) {
+        const payload = await request.json() as { fileName?: unknown };
+        const fileName = normalizeFileName(payload.fileName);
+        if (!fileName) return json({ error: "Use a file name without slashes." }, { status: 400 });
+        const asset = await updateFolderAssetName(env.DB, userId, parts[1], fileName);
+        return asset ? json(asset) : json({ error: "Not found" }, { status: 404 });
       }
       if (request.method === "POST" && parts[0] === "folders" && parts[2] === "assets") {
         const formData = await request.formData();

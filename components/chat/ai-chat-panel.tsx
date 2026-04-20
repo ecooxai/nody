@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type TouchEvent, type WheelEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   LiveTalkPanel,
@@ -14,6 +14,12 @@ import {
   type LiveVideoSource,
 } from "@/components/chat/live-talk-panel";
 import { Panel } from "@/components/ui/panel";
+import {
+  loadPreferredLiveCameraDeviceId,
+  loadPreferredMicrophoneDeviceId,
+  savePreferredLiveCameraDeviceId,
+  savePreferredMicrophoneDeviceId,
+} from "@/lib/storage/local-cache";
 import type { ProviderSettings } from "@/shared/types";
 import type {
   AIMessage,
@@ -22,6 +28,7 @@ import type {
   AIRequestMode,
   AIRequestAttachment,
   AIMediaKind,
+  AINoteReference,
   FolderAsset,
   PromptTemplate,
   ProviderName,
@@ -100,6 +107,43 @@ const builtInPrompts: PromptTemplate[] = [
 ];
 
 const COMPACT_PANEL_HEIGHT = 200;
+const SCROLL_EDGE_TOLERANCE = 1;
+
+function canScrollVertically(element: HTMLElement) {
+  if (element.scrollHeight <= element.clientHeight + SCROLL_EDGE_TOLERANCE) return false;
+  const overflowY = window.getComputedStyle(element).overflowY;
+  return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+}
+
+function findVerticalScrollContainer(target: EventTarget | null, boundary: HTMLElement) {
+  if (!(target instanceof Node)) return null;
+
+  let current: Node | null = target;
+  while (current && boundary.contains(current)) {
+    if (current instanceof HTMLElement && canScrollVertically(current)) {
+      return current;
+    }
+    if (current === boundary) break;
+    current = current.parentNode;
+  }
+
+  return null;
+}
+
+function canConsumeVerticalDelta(element: HTMLElement, deltaY: number) {
+  if (deltaY < 0) return Math.abs(deltaY) <= element.scrollTop + SCROLL_EDGE_TOLERANCE;
+  if (deltaY > 0) {
+    const maxScrollTop = element.scrollHeight - element.clientHeight;
+    return deltaY <= maxScrollTop - element.scrollTop + SCROLL_EDGE_TOLERANCE;
+  }
+  return true;
+}
+
+function normalizeWheelDeltaY(event: WheelEvent<HTMLElement>) {
+  if (event.deltaMode === 1) return event.deltaY * 16;
+  if (event.deltaMode === 2) return event.deltaY * window.innerHeight;
+  return event.deltaY;
+}
 
 function inferMediaKind(mimeType: string): AIMediaKind | null {
   if (mimeType.startsWith("image/")) return "image";
@@ -316,10 +360,17 @@ export function AIChatPanel({
   provider,
   providerSettings,
   currentNoteBodyMarkdown,
+  currentNoteId,
   currentNoteTitle,
+  noteCatalog,
   selectedText,
   storedPanelHeight,
   compact,
+  onAppendToCurrentNote,
+  onInsertGeneratedImageInNote,
+  onOpenNote,
+  onFindInNote,
+  onScrollNote,
   onPanelHeightChange,
   onUploadImageToCurrentFolder,
 }: {
@@ -336,7 +387,8 @@ export function AIChatPanel({
     displayPrompt?: string;
   }) => Promise<boolean>;
   onApply: (edits: TextSubstitution[]) => void;
-  onAddAttachmentToNote: (attachment: AIMessageAttachment) => void;
+  onAddAttachmentToNote: (attachment: AIMessageAttachment, options?: { lineNumber?: number }) => void;
+  onAppendToCurrentNote: (markdown: string) => void;
   onCreatePrompt: (value: Pick<PromptTemplate, "name" | "content">) => Promise<PromptTemplate>;
   onUpdatePrompt: (id: string, value: Pick<PromptTemplate, "name" | "content">) => Promise<PromptTemplate>;
   onError: (message: string) => void;
@@ -346,12 +398,18 @@ export function AIChatPanel({
   provider: ProviderName;
   providerSettings: ProviderSettings;
   currentNoteBodyMarkdown: string;
+  currentNoteId: string;
   currentNoteTitle: string;
+  noteCatalog: AINoteReference[];
   selectedText?: string;
   storedPanelHeight?: number | null;
   compact?: boolean;
+  onInsertGeneratedImageInNote: (attachment: { fileName: string; mimeType: string; previewUrl: string }, lineNumber?: number) => Promise<boolean>;
+  onOpenNote: (target: { noteId?: string; title?: string }) => boolean;
+  onFindInNote: (target: { query: string; occurrence?: "first" | "next" | "previous" }) => boolean;
+  onScrollNote: (target: { target: "top" | "middle" | "bottom" | "line" | "up" | "down"; lineNumber?: number; pixels?: number }) => boolean;
   onPanelHeightChange?: (height: number) => void;
-  onUploadImageToCurrentFolder: (attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<void>;
+  onUploadImageToCurrentFolder: (attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<unknown>;
 }) {
   const supportsMedia = provider === "gemini";
   const supportsLive = provider === "gemini" && Boolean(providerSettings.apiKey) && Boolean(providerSettings.liveModel || providerSettings.model);
@@ -397,6 +455,7 @@ export function AIChatPanel({
   const [liveVideoMenuOpen, setLiveVideoMenuOpen] = useState(false);
   const [liveVideoMenuLoading, setLiveVideoMenuLoading] = useState(false);
   const [liveVideoShareMode, setLiveVideoShareMode] = useState<LiveVideoShareState["mode"]>(null);
+  const [liveVideoShareCameraMode, setLiveVideoShareCameraMode] = useState<LiveVideoShareState["cameraMode"]>(null);
   const [liveCameraFlashOn, setLiveCameraFlashOn] = useState(true);
   const [liveHistoryTargets, setLiveHistoryTargets] = useState<LiveHistoryTargets>({
     hasCamera: false,
@@ -409,11 +468,13 @@ export function AIChatPanel({
   const [microphoneSources, setMicrophoneSources] = useState<MicrophoneSource[]>([]);
   const [microphoneMenuOpen, setMicrophoneMenuOpen] = useState(false);
   const [microphoneMenuLoading, setMicrophoneMenuLoading] = useState(false);
-  const [selectedMicrophoneId, setSelectedMicrophoneId] = useState<string | null>(null);
+  const [selectedMicrophoneId, setSelectedMicrophoneId] = useState<string | null>(() => loadPreferredMicrophoneDeviceId());
+  const [preferredLiveCameraDeviceId, setPreferredLiveCameraDeviceId] = useState<string | null>(() => loadPreferredLiveCameraDeviceId());
   const attachmentsRef = useRef<LocalAttachment[]>([]);
   const composerItemsRef = useRef<HTMLDivElement>(null);
   const composerChromeRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const lastAiPanelTouchYRef = useRef<number | null>(null);
   const latestAssistantMessageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -521,6 +582,14 @@ export function AIChatPanel({
   }, [activeTab]);
 
   useEffect(() => {
+    savePreferredMicrophoneDeviceId(selectedMicrophoneId);
+  }, [selectedMicrophoneId]);
+
+  useEffect(() => {
+    savePreferredLiveCameraDeviceId(preferredLiveCameraDeviceId);
+  }, [preferredLiveCameraDeviceId]);
+
+  useEffect(() => {
     if (!liveCameraShortcutFlashing) {
       setLiveCameraFlashOn(true);
       return;
@@ -578,6 +647,43 @@ export function AIChatPanel({
     setHistoryExpanded(false);
   }, []);
 
+  const containAiPanelWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    if (event.ctrlKey || event.metaKey || event.deltaY === 0) return;
+
+    const deltaY = normalizeWheelDeltaY(event);
+    const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
+    if (!scrollContainer || !canConsumeVerticalDelta(scrollContainer, deltaY)) {
+      if (scrollContainer) {
+        scrollContainer.scrollTop += deltaY;
+      }
+      event.preventDefault();
+    }
+  }, []);
+
+  const rememberAiPanelTouch = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    lastAiPanelTouchYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const containAiPanelTouch = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) return;
+
+    const currentY = event.touches[0].clientY;
+    const previousY = lastAiPanelTouchYRef.current;
+    lastAiPanelTouchYRef.current = currentY;
+    if (previousY === null) return;
+
+    const deltaY = previousY - currentY;
+    if (deltaY === 0) return;
+
+    const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
+    if ((!scrollContainer || !canConsumeVerticalDelta(scrollContainer, deltaY)) && event.cancelable) {
+      if (scrollContainer) {
+        scrollContainer.scrollTop += deltaY;
+      }
+      event.preventDefault();
+    }
+  }, []);
+
   const scrollToChatHistoryTarget = useCallback((selector: string) => {
     const container = messagesContainerRef.current;
     if (!container) return;
@@ -614,6 +720,11 @@ export function AIChatPanel({
       setGeneratedImageTrayOpen(true);
     }
   }, [activeGeneratedImages.length, scrollToGeneratedImage]);
+
+  const pickPreferredDeviceId = <T extends { deviceId: string }>(sources: T[], preferredDeviceId: string | null) =>
+    preferredDeviceId && sources.some((source) => source.deviceId === preferredDeviceId)
+      ? preferredDeviceId
+      : sources[0]?.deviceId ?? null;
 
   const scrollToCameraTarget = useCallback(() => {
     if (activeTab === "live") {
@@ -866,6 +977,35 @@ export function AIChatPanel({
     if (cameraCaptureHandledRef.current) return false;
     cameraCaptureHandledRef.current = true;
     return true;
+  };
+
+  const requestMicrophoneStream = async (deviceId?: string | null) => {
+    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      throw new Error("Audio recording is not supported in this browser.");
+    }
+
+    const baseConstraints = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+
+    if (deviceId) {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          audio: {
+            deviceId: { exact: deviceId },
+            ...baseConstraints,
+          },
+        });
+      } catch {
+        // Fall back to the browser default microphone when the saved device is unavailable.
+      }
+    }
+
+    return navigator.mediaDevices.getUserMedia({
+      audio: baseConstraints,
+    });
   };
 
   const createFileAttachment = (file: File, kind: AIMediaKind): LocalAttachment => ({
@@ -1289,6 +1429,7 @@ export function AIChatPanel({
     try {
       const sources = await liveVideoControls.listSources();
       setLiveVideoSources(sources);
+      setPreferredLiveCameraDeviceId((current) => pickPreferredDeviceId(sources, current));
       return sources;
     } catch (error) {
       onError(error instanceof Error ? error.message : "Failed to load cameras.");
@@ -1313,10 +1454,21 @@ export function AIChatPanel({
     void refreshLiveVideoSources();
   };
 
-  const startLiveCameraShare = async (deviceId?: string) => {
+  const startLiveCameraShare = async (deviceId?: string, options?: { video?: boolean }) => {
     if (!liveVideoControls) return;
     try {
-      await liveVideoControls.startCameraShare(deviceId);
+      const resolvedDeviceId = deviceId ?? pickPreferredDeviceId(liveVideoSources, preferredLiveCameraDeviceId) ?? undefined;
+      if (resolvedDeviceId) {
+        setPreferredLiveCameraDeviceId(resolvedDeviceId);
+      }
+      try {
+        await liveVideoControls.startCameraShare(resolvedDeviceId, options);
+      } catch (error) {
+        if (!resolvedDeviceId) {
+          throw error;
+        }
+        await liveVideoControls.startCameraShare(undefined, options);
+      }
       setLiveVideoMenuOpen(false);
     } catch (error) {
       onError(error instanceof Error ? error.message : "Failed to share the camera.");
@@ -1348,9 +1500,7 @@ export function AIChatPanel({
     try {
       const sources = await listMicrophoneSources();
       setMicrophoneSources(sources);
-      if (!selectedMicrophoneId && sources[0]) {
-        setSelectedMicrophoneId(sources[0].deviceId);
-      }
+      setSelectedMicrophoneId((current) => pickPreferredDeviceId(sources, current));
       return sources;
     } catch (error) {
       onError(error instanceof Error ? error.message : "Failed to load microphones.");
@@ -1390,6 +1540,10 @@ export function AIChatPanel({
 
   const handleLiveVideoShareStateChange = useCallback((state: LiveVideoShareState) => {
     setLiveVideoShareMode((current) => (current === state.mode ? current : state.mode));
+    setLiveVideoShareCameraMode(state.cameraMode ?? null);
+    if (state.mode === "camera" && state.cameraDeviceId) {
+      setPreferredLiveCameraDeviceId(state.cameraDeviceId);
+    }
   }, []);
 
   const handleLiveHistoryTargetsChange = useCallback((targets: LiveHistoryTargets) => {
@@ -1551,10 +1705,6 @@ export function AIChatPanel({
       onError(liveSessionState.status);
       return;
     }
-    if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
-      onError("Audio recording is not supported in this browser.");
-      return;
-    }
     if (typeof MediaRecorder === "undefined") {
       onError("Audio recording is not supported in this browser.");
       return;
@@ -1569,21 +1719,14 @@ export function AIChatPanel({
     setPreparingRecording(true);
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: selectedMicrophoneId
-          ? {
-              deviceId: { exact: selectedMicrophoneId },
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            }
-          : {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-      });
+      const stream = await requestMicrophoneStream(selectedMicrophoneId);
       mediaStreamRef.current = stream;
+      const resolvedDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId ?? null;
+      if (resolvedDeviceId && resolvedDeviceId !== selectedMicrophoneId) {
+        setSelectedMicrophoneId(resolvedDeviceId);
+      } else if (!resolvedDeviceId && selectedMicrophoneId) {
+        setSelectedMicrophoneId(null);
+      }
       recordedChunksRef.current = [];
       const recorder = new MediaRecorder(stream, { mimeType });
       recorder.ondataavailable = (event) => {
@@ -1854,6 +1997,12 @@ export function AIChatPanel({
   return (
     <Panel
       className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-1 shadow-none transition-[height] duration-200 ease-out"
+      onTouchEndCapture={() => {
+        lastAiPanelTouchYRef.current = null;
+      }}
+      onTouchMoveCapture={containAiPanelTouch}
+      onTouchStartCapture={rememberAiPanelTouch}
+      onWheelCapture={containAiPanelWheel}
       style={{ height: displayedPanelHeight }}
     >
       <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-7 rounded-full bg-ink/20 blur-xl" />
@@ -2439,7 +2588,15 @@ export function AIChatPanel({
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Live video</div>
-                      <div className="text-xs text-ink/55">{liveVideoShareMode ? `Currently sharing ${liveVideoShareMode}.` : "Share a camera or your screen."}</div>
+                      <div className="text-xs text-ink/55">
+                        {liveVideoShareMode
+                          ? liveVideoShareMode === "camera"
+                            ? liveVideoShareCameraMode === "video"
+                              ? "Currently sharing camera video."
+                              : "Currently sharing camera snapshots."
+                            : "Currently sharing screen."
+                          : "Share camera snapshots, camera video, or your screen."}
+                      </div>
                     </div>
                     <button
                       className="rounded-full border border-ink/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
@@ -2490,7 +2647,39 @@ export function AIChatPanel({
                       />
                     </svg>
                   </button>
-                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Available cameras</div>
+                  <button
+                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => void startLiveCameraShare(undefined, { video: false })}
+                    type="button"
+                  >
+                    <span>Share camera snapshots</span>
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path
+                        d="M4.5 7.5A1.5 1.5 0 0 1 6 6h8a1.5 1.5 0 0 1 1.5 1.5v1.3l3-2A1 1 0 0 1 20 7.6v8.8a1 1 0 0 1-1.5.8l-3-2v1.3A1.5 1.5 0 0 1 14 18H6a1.5 1.5 0 0 1-1.5-1.5v-9Z"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.6"
+                      />
+                    </svg>
+                  </button>
+                  <button
+                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    onClick={() => void startLiveCameraShare(undefined, { video: true })}
+                    type="button"
+                  >
+                    <span>Share camera video</span>
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path
+                        d="M4.5 7.5A1.5 1.5 0 0 1 6 6h8a1.5 1.5 0 0 1 1.5 1.5v1.3l3-2A1 1 0 0 1 20 7.6v8.8a1 1 0 0 1-1.5.8l-3-2v1.3A1.5 1.5 0 0 1 14 18H6a1.5 1.5 0 0 1-1.5-1.5v-9Z"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.6"
+                      />
+                    </svg>
+                  </button>
+                  <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Camera devices</div>
                   {liveVideoMenuLoading ? (
                     <div className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-xs text-ink/45">Loading cameras...</div>
                   ) : liveVideoSources.length === 0 ? (
@@ -2502,16 +2691,21 @@ export function AIChatPanel({
                       Refresh camera list
                     </button>
                   ) : (
-                    liveVideoSources.map((source) => (
-                      <button
-                        className="rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
-                        key={source.deviceId}
-                        onClick={() => void startLiveCameraShare(source.deviceId)}
-                        type="button"
-                      >
-                        {source.label}
-                      </button>
-                    ))
+                    liveVideoSources.map((source) => {
+                      const selected = preferredLiveCameraDeviceId === source.deviceId;
+                      return (
+                        <button
+                          className={`rounded-[12px] border px-3 py-2 text-left text-sm transition ${
+                            selected ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]" : "border-ink/10 bg-[#fffdfa] text-ink hover:border-ink/20 hover:bg-mist"
+                          }`}
+                          key={source.deviceId}
+                          onClick={() => void startLiveCameraShare(source.deviceId)}
+                          type="button"
+                        >
+                          {source.label}
+                        </button>
+                      );
+                    })
                   )}
                 </div>
               ) : null}
@@ -2925,20 +3119,28 @@ export function AIChatPanel({
           <LiveTalkPanel
             active={activeTab === "live"}
             currentNoteBodyMarkdown={currentNoteBodyMarkdown}
+            currentNoteId={currentNoteId}
             currentNoteTitle={currentNoteTitle}
             currentSelectedText={selectedTextForReadAloud}
             microphoneDeviceId={selectedMicrophoneId}
             microphoneEnabled={liveMicrophoneEnabled}
+            noteCatalog={noteCatalog}
             onError={onError}
             onApplyEdits={onApply}
+            onAppendToCurrentNote={onAppendToCurrentNote}
             onHistoryInteract={focusHistory}
             onHistoryTargetsChange={handleLiveHistoryTargetsChange}
             onImageGenerationStateChange={setImageGenerationActive}
+            onInsertGeneratedImageInNote={onInsertGeneratedImageInNote}
+            onFindInNote={onFindInNote}
             onLatestMessageStateChange={handleLiveLatestMessageStateChange}
+            onOpenNote={onOpenNote}
+            onScrollNote={onScrollNote}
             onRegisterHistoryControls={setLiveHistoryControls}
             onRegisterSend={setLiveSendHandle}
             onRegisterVideoControls={setLiveVideoControls}
             onSessionStateChange={setLiveSessionState}
+            onDisconnectRequest={() => setLiveConnectionRequested(false)}
             onVideoShareStateChange={handleLiveVideoShareStateChange}
             onUploadImageToCurrentFolder={onUploadImageToCurrentFolder}
             providerSettings={providerSettings}

@@ -3,6 +3,7 @@ import type {
   AIRequestAttachment,
   AIResponse,
   AIResponseAttachment,
+  AIResponseAction,
   ProviderSettings,
 } from "../../shared/types";
 import { safeJsonParse } from "../../shared/substitutions";
@@ -11,11 +12,17 @@ import type { Env } from "./env";
 const systemPrompt =
   [
     "You are a writing assistant inside a note editor.",
-    "Reply with JSON only using this shape: {\"answer\":\"...\",\"substitutions\":[{\"find\":\"...\",\"replace\":\"...\",\"all\":false}]}",
+    "Reply with JSON only using this shape: {\"answer\":\"...\",\"substitutions\":[{\"find\":\"...\",\"replace\":\"...\",\"all\":false}],\"actions\":[{\"type\":\"open_note\",\"noteId\":\"...\",\"title\":\"...\"}]}",
     "Use the selection as the primary editing target when it is provided.",
     "Only propose substitutions when the user asks to rewrite, edit, fix, shorten, expand, or transform text.",
     "Each substitution must use exact source text from the document or selection.",
     "Keep substitutions minimal, precise, and safe to apply mechanically.",
+    "When the user asks to open or switch to a note by name, add one open_note action using an exact note id from Available notes. Do not invent note ids.",
+    "When the user asks to scroll within the note, add a scroll_note action. Use target top, middle, bottom, line, up, or down. Include lineNumber for line scrolling and pixels for up/down scrolling when helpful.",
+    "When the user asks to find text in the note or move to the next match, add a find_note action with the search query and occurrence set to first, next, or previous when relevant.",
+    "When the user asks to create or edit an image, first ask for a spoken confirmation such as 'generate image' or 'do not generate' and do not call any image tool until the user confirms.",
+    "When the user asks to upload the latest generated image, add one upload_latest_image action.",
+    "When the user asks to insert the latest generated image into the note, add one insert_latest_image action. Include lineNumber only when the user gives a line number.",
     "Do not include markdown fences or extra keys.",
   ].join(" ");
 
@@ -487,6 +494,65 @@ function normalizeAiResponse(response: AIResponse): AIResponse {
             all: Boolean(edit.all),
           }))
       : [],
+    actions: Array.isArray(response.actions)
+      ? response.actions.flatMap<AIResponseAction>((action) => {
+          if (!action || typeof action.type !== "string") return [];
+          if (action.type === "open_note") {
+            const noteId = typeof action.noteId === "string" ? action.noteId.trim() : "";
+            const title = typeof action.title === "string" ? action.title.trim() : "";
+            if (!noteId && !title) return [];
+            return [
+              {
+                type: "open_note" as const,
+                ...(noteId ? { noteId } : {}),
+                ...(title ? { title } : {}),
+              },
+            ];
+          }
+          if (action.type === "scroll_note") {
+            const target = typeof action.target === "string" ? action.target.trim() : "";
+            if (!["top", "middle", "bottom", "line", "up", "down"].includes(target)) return [];
+            const rawLineNumber = "lineNumber" in action ? action.lineNumber : undefined;
+            const lineNumber = typeof rawLineNumber === "number" && Number.isFinite(rawLineNumber) ? Math.max(1, Math.floor(rawLineNumber)) : undefined;
+            const rawPixels = "pixels" in action ? action.pixels : undefined;
+            const pixels = typeof rawPixels === "number" && Number.isFinite(rawPixels) ? Math.max(1, Math.floor(rawPixels)) : undefined;
+            return [
+              {
+                type: "scroll_note" as const,
+                target: target as "top" | "middle" | "bottom" | "line" | "up" | "down",
+                ...(lineNumber ? { lineNumber } : {}),
+                ...(pixels ? { pixels } : {}),
+              },
+            ];
+          }
+          if (action.type === "find_note") {
+            const query = typeof action.query === "string" ? action.query.trim() : "";
+            const occurrence = typeof action.occurrence === "string" ? action.occurrence.trim() : "";
+            if (!query) return [];
+            return [
+              {
+                type: "find_note" as const,
+                query,
+                ...(occurrence === "first" || occurrence === "next" || occurrence === "previous" ? { occurrence } : {}),
+              },
+            ];
+          }
+          if (action.type === "insert_latest_image") {
+            const rawLineNumber = "lineNumber" in action ? action.lineNumber : undefined;
+            const lineNumber = typeof rawLineNumber === "number" && Number.isFinite(rawLineNumber) ? Math.max(1, Math.floor(rawLineNumber)) : undefined;
+            return [
+              {
+                type: "insert_latest_image" as const,
+                ...(lineNumber ? { lineNumber } : {}),
+              },
+            ];
+          }
+          if (action.type === "upload_latest_image") {
+            return [{ type: "upload_latest_image" as const }];
+          }
+          return [];
+        })
+      : [],
     attachments: Array.isArray(response.attachments)
       ? response.attachments
           .filter(
@@ -514,7 +580,23 @@ async function readProviderError(response: Response, fallback: string) {
 }
 
 function buildPromptText(request: AIRequest) {
-  return `Title: ${request.title}\n\nDocument Markdown:\n${request.bodyMarkdown}\n\nSelection:\n${request.selection ?? ""}\n\nPrompt:\n${request.prompt}`;
+  return [
+    `Title: ${request.title}`,
+    `Available notes:\n${formatAvailableNotes(request.availableNotes ?? [])}`,
+    `Document Markdown:\n${request.bodyMarkdown}`,
+    `Selection:\n${request.selection ?? ""}`,
+    `Prompt:\n${request.prompt}`,
+  ].join("\n\n");
+}
+
+function formatAvailableNotes(notes: NonNullable<AIRequest["availableNotes"]>) {
+  if (notes.length === 0) return "No other notes are available.";
+  return notes
+    .map((note, index) => {
+      const folder = note.folderName?.trim() ? `, folder: ${note.folderName.trim()}` : "";
+      return `${index + 1}. id: ${note.id}, title: ${note.title}${folder}`;
+    })
+    .join("\n");
 }
 
 function buildImagePromptText(request: AIRequest) {

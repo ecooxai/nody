@@ -131,6 +131,56 @@ export async function listFolderAssets(db: DB, userId: string) {
   return (rows.results ?? []).map(mapFolderAsset);
 }
 
+export async function getFolderAsset(db: DB, userId: string, assetId: string) {
+  const row = await db
+    .prepare("SELECT * FROM folder_assets WHERE id = ? AND user_id = ?")
+    .bind(assetId, userId)
+    .first<Record<string, unknown>>();
+  return row ? mapFolderAsset(row) : null;
+}
+
+export async function updateFolderAssetName(db: DB, userId: string, assetId: string, fileName: string) {
+  await db
+    .prepare("UPDATE folder_assets SET file_name = ? WHERE id = ? AND user_id = ?")
+    .bind(fileName, assetId, userId)
+    .run();
+  return getFolderAsset(db, userId, assetId);
+}
+
+async function findFolderByName(db: DB, userId: string, parentFolderId: string | null, name: string) {
+  const query =
+    parentFolderId === null
+      ? "SELECT * FROM folders WHERE user_id = ? AND parent_folder_id IS NULL AND name = ? COLLATE NOCASE ORDER BY updated_at DESC LIMIT 1"
+      : "SELECT * FROM folders WHERE user_id = ? AND parent_folder_id = ? AND name = ? COLLATE NOCASE ORDER BY updated_at DESC LIMIT 1";
+  const row =
+    parentFolderId === null
+      ? await db.prepare(query).bind(userId, name).first<Record<string, unknown>>()
+      : await db.prepare(query).bind(userId, parentFolderId, name).first<Record<string, unknown>>();
+  return row ? mapFolder(row) : null;
+}
+
+export async function findFolderAssetByPath(db: DB, userId: string, pathSegments: string[]) {
+  if (pathSegments.length === 0) return null;
+  const fileName = pathSegments[pathSegments.length - 1];
+  let folderId: string | null = null;
+
+  for (const folderName of pathSegments.slice(0, -1)) {
+    const folder = await findFolderByName(db, userId, folderId, folderName);
+    if (!folder) return null;
+    folderId = folder.id;
+  }
+
+  const query =
+    folderId === null
+      ? "SELECT * FROM folder_assets WHERE user_id = ? AND folder_id IS NULL AND file_name = ? ORDER BY created_at DESC LIMIT 1"
+      : "SELECT * FROM folder_assets WHERE user_id = ? AND folder_id = ? AND file_name = ? ORDER BY created_at DESC LIMIT 1";
+  const row =
+    folderId === null
+      ? await db.prepare(query).bind(userId, fileName).first<Record<string, unknown>>()
+      : await db.prepare(query).bind(userId, folderId, fileName).first<Record<string, unknown>>();
+  return row ? mapFolderAsset(row) : null;
+}
+
 export async function saveFolderAsset(
   db: DB,
   userId: string,

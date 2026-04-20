@@ -4,6 +4,8 @@ import { normalizeStoredMarkdown } from "@/lib/editor/markdown";
 const CACHE_KEY = "nody.active-document";
 const RECENT_DOCUMENT_IDS_KEY = "nody.recent-documents";
 const AI_PANEL_HEIGHT_KEY = "nody.ai-panel-height";
+const PREFERRED_MICROPHONE_DEVICE_ID_KEY = "nody.preferred-microphone-device-id";
+const PREFERRED_LIVE_CAMERA_DEVICE_ID_KEY = "nody.preferred-live-camera-device-id";
 
 export function loadCachedDocument() {
   if (typeof window === "undefined") return null;
@@ -53,4 +55,32 @@ export function loadAiPanelHeight() {
 export function saveAiPanelHeight(height: number) {
   if (typeof window === "undefined") return;
   window.localStorage.setItem(AI_PANEL_HEIGHT_KEY, String(height));
+}
+
+export function loadPreferredMicrophoneDeviceId() {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(PREFERRED_MICROPHONE_DEVICE_ID_KEY);
+}
+
+export function savePreferredMicrophoneDeviceId(deviceId: string | null) {
+  if (typeof window === "undefined") return;
+  if (deviceId) {
+    window.localStorage.setItem(PREFERRED_MICROPHONE_DEVICE_ID_KEY, deviceId);
+    return;
+  }
+  window.localStorage.removeItem(PREFERRED_MICROPHONE_DEVICE_ID_KEY);
+}
+
+export function loadPreferredLiveCameraDeviceId() {
+  if (typeof window === "undefined") return null;
+  return window.localStorage.getItem(PREFERRED_LIVE_CAMERA_DEVICE_ID_KEY);
+}
+
+export function savePreferredLiveCameraDeviceId(deviceId: string | null) {
+  if (typeof window === "undefined") return;
+  if (deviceId) {
+    window.localStorage.setItem(PREFERRED_LIVE_CAMERA_DEVICE_ID_KEY, deviceId);
+    return;
+  }
+  window.localStorage.removeItem(PREFERRED_LIVE_CAMERA_DEVICE_ID_KEY);
 }

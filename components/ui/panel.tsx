@@ -1,14 +1,13 @@
+import type { ComponentPropsWithoutRef } from "react";
+
 export function Panel({
   children,
   className = "",
   style,
-}: {
-  children: React.ReactNode;
-  className?: string;
-  style?: React.CSSProperties;
-}) {
+  ...props
+}: ComponentPropsWithoutRef<"section">) {
   return (
-    <section className={`rounded-[4px] bg-white/90 p-5 text-ink shadow-panel ${className}`} style={style}>
+    <section className={`rounded-[4px] bg-white/90 p-5 text-ink shadow-panel ${className}`} style={style} {...props}>
       {children}
     </section>
   );

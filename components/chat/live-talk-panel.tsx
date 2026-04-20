@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiClient } from "@/lib/api/client";
 import { stripMarkdown } from "@/lib/editor/markdown";
-import type { AIMediaKind, ProviderSettings, TextSubstitution } from "@/shared/types";
+import type { AIMediaKind, AINoteReference, ProviderSettings, TextSubstitution } from "@/shared/types";
 
 type LiveGeneratedImage = {
   id: string;
@@ -26,6 +26,7 @@ type LiveTurn = {
   videoMode?: "camera" | "screen";
 };
 
+type CameraShareSendMode = "snapshot" | "video";
 type ScreenShareSendMode = "screenshot" | "video";
 
 type LiveMessage =
@@ -86,7 +87,7 @@ export type LiveVideoSource = {
 
 export type LiveVideoControls = {
   listSources: () => Promise<LiveVideoSource[]>;
-  startCameraShare: (deviceId?: string) => Promise<boolean>;
+  startCameraShare: (deviceId?: string, options?: { video?: boolean }) => Promise<boolean>;
   switchCameraShare: () => Promise<boolean>;
   startScreenShare: (options?: { video?: boolean }) => Promise<boolean>;
   stopVideoShare: () => void;
@@ -95,6 +96,7 @@ export type LiveVideoControls = {
 export type LiveVideoShareState = {
   mode: "camera" | "screen" | null;
   cameraDeviceId?: string | null;
+  cameraMode?: CameraShareSendMode | null;
   screenMode?: ScreenShareSendMode | null;
 };
 
@@ -126,9 +128,16 @@ type LiveImageContext = {
 };
 
 const LIVE_IMAGE_GENERATION_NOTICE = "i'll generate image now";
+const LIVE_CONTEXT_TOKEN_LIMIT = 16_000;
 
 function formatSelectedTextContext(selection: string) {
   return `user selected:${selection.trim()}\nendselected\n\n`;
+}
+
+function estimateTokenCount(text: string) {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  return Math.ceil(trimmed.length / 4);
 }
 
 function LiveStreamPreview({
@@ -311,15 +320,30 @@ function buildLiveWebSocketUrl(apiUrl: string, apiKey: string) {
   return `${wsBase}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(apiKey)}&alt=ws`;
 }
 
-function buildNoteContext(title: string, bodyMarkdown: string) {
+function buildNoteContext(noteId: string, title: string, bodyMarkdown: string, noteCatalog: AINoteReference[]) {
   const noteText = stripMarkdown(bodyMarkdown);
   const content = noteText ? `${title}\n\n${noteText}` : `${title}\n\nThis note is currently empty.`;
+  const availableNotes =
+    noteCatalog.length > 0
+      ? noteCatalog
+          .map((note, index) => {
+            const folder = note.folderName?.trim() ? `, folder: ${note.folderName.trim()}` : "";
+            return `${index + 1}. id: ${note.id}, title: ${note.title}${folder}`;
+          })
+          .join("\n")
+      : "No other notes are available.";
   return [
     "You are a live voice assistant inside a note editor.",
     "Use the current note as the active context for the conversation.",
     "Keep responses concise, conversational, and helpful.",
-    "If the user asks you to create, generate, draw, design, render, or edit an image, call the generate_image tool instead of claiming you cannot generate images.",
-    `Before calling generate_image, first reply exactly: ${LIVE_IMAGE_GENERATION_NOTICE}`,
+    "The app provides every available note name below. If the user asks to open or switch to a note by name, call open_note with the exact note id or title.",
+    "If the user asks to scroll within the note, call scroll_note with a target of top, middle, bottom, line, up, or down. Use line_number for line targets and pixels for up/down when helpful.",
+    "If the user asks to find text in the note or jump to the next match, call find_note with the search query and occurrence when relevant.",
+    "If the user asks you to create, generate, draw, design, render, or edit an image, first ask for a clear spoken confirmation such as 'generate image' or 'do not generate' and do not call generate_image until the user confirms.",
+    `When you do generate an image after confirmation, first reply exactly: ${LIVE_IMAGE_GENERATION_NOTICE}`,
+    "If the user asks to upload the current/generated image to the current folder, call upload_current_image.",
+    "If the user asks to insert the current/generated image into the note, call insert_current_image. Include line_number when the user says a line number, for example insert image at line 12.",
+    "If the user asks to take a camera shot and insert it into the note, call capture_camera_shot and include line_number when they give a line number.",
     "If the user asks you to rewrite, edit, fix, shorten, expand, or transform the note text, call suggest_note_edits.",
     "If the user wants to change an uploaded image or a previously generated image, you must call generate_image with the edit request.",
     "Do not answer that you will only describe the current image or combine text instructions manually.",
@@ -327,6 +351,8 @@ function buildNoteContext(title: string, bodyMarkdown: string) {
     "When the user says modify, change, edit, restyle, remove something from, add something to, or make variations of the current image, treat that as an image edit request and call the tool.",
     "After the tool returns, briefly describe what was generated and mention any notable constraints or variations.",
     "If the user asks you to look through their camera, inspect a physical object, read a page in front of the device, or watch something in the room, call start_camera_share.",
+    "Camera sharing uses snapshot mode by default. It sends still images when the user starts speaking and when they send text or audio, but it can also stream live camera video if the user explicitly asks for continuous video.",
+    "If the user explicitly asks for live or continuous camera video, call start_camera_share with mode set to video.",
     "If the user asks to switch, flip, or change cameras, call switch_camera_share. This is useful on phones with more than one camera.",
     "If the user asks you to take, shoot, snap, or capture a photo/image from the current camera feed, call capture_camera_shot.",
     "If the user asks you to see their screen, browser tab, desktop, app, code editor, or UI, call start_screen_share with screenshot mode unless they explicitly ask for live or continuous screen video.",
@@ -336,6 +362,11 @@ function buildNoteContext(title: string, bodyMarkdown: string) {
     "Do not tell the user to press the camera or screen-share UI if a tool call can do it. Use the tool call so the browser can prompt for permission.",
     "If it is unclear whether the user means camera or screen, ask a short clarifying question.",
     "When the note content is shared, respond with a spoken-style answer that helps the user explore it.",
+    "",
+    `Current note id: ${noteId || "unsaved"}`,
+    "",
+    "Available notes:",
+    availableNotes,
     "",
     "Current note:",
     content,
@@ -380,6 +411,94 @@ const suggestNoteEditsFunctionDeclaration = {
   },
 };
 
+const openNoteFunctionDeclaration = {
+  name: "open_note",
+  description:
+    "Open a note in the app by exact note id or title. Use this when the user asks to open, switch to, or show a note by name.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      note_id: {
+        type: "STRING",
+        description: "Exact note id from Available notes when known.",
+      },
+      title: {
+        type: "STRING",
+        description: "Exact note title from Available notes.",
+      },
+    },
+  },
+};
+
+const scrollNoteFunctionDeclaration = {
+  name: "scroll_note",
+  description:
+    "Scroll within the current note. Use this for requests like go to line 100, scroll to the top, scroll to the bottom, scroll down 300 pixels, or scroll to the middle.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      target: {
+        type: "STRING",
+        description: "Scroll target: top, middle, bottom, line, up, or down.",
+      },
+      line_number: {
+        type: "NUMBER",
+        description: "Optional 1-based line number when target is line.",
+      },
+      pixels: {
+        type: "NUMBER",
+        description: "Optional pixel distance when target is up or down.",
+      },
+    },
+    required: ["target"],
+  },
+};
+
+const findNoteFunctionDeclaration = {
+  name: "find_note",
+  description:
+    "Find text in the current note and move to the matching content. Use this for requests like show me the part about kids or next match.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      query: {
+        type: "STRING",
+        description: "The text to find in the current note.",
+      },
+      occurrence: {
+        type: "STRING",
+        description: "Optional match selection: first, next, or previous.",
+      },
+    },
+    required: ["query"],
+  },
+};
+
+const uploadCurrentImageFunctionDeclaration = {
+  name: "upload_current_image",
+  description:
+    "Upload the current image, usually the latest generated image, to the current folder. Use this when the user asks to save or upload the generated/current image.",
+  parameters: {
+    type: "OBJECT",
+    properties: {},
+  },
+};
+
+const insertCurrentImageFunctionDeclaration = {
+  name: "insert_current_image",
+  description:
+    "Insert the current image, usually the latest generated image, into the current note. If the user gives a line number, insert before that 1-based line and move existing content down.",
+  parameters: {
+    type: "OBJECT",
+    properties: {
+      line_number: {
+        type: "NUMBER",
+        description: "Optional 1-based note line number. Insert before this line.",
+      },
+    },
+  },
+};
+
 const listAvailableCamerasFunctionDeclaration = {
   name: "list_available_cameras",
   description:
@@ -393,13 +512,17 @@ const listAvailableCamerasFunctionDeclaration = {
 const startCameraShareFunctionDeclaration = {
   name: "start_camera_share",
   description:
-    "Start camera sharing so Gemini can see the user's camera feed in the live session. Use this when the user wants to show something in front of the camera.",
+    "Start camera sharing so Gemini can see the user's camera feed in the live session. Use snapshot mode by default for still-image sharing. Use video mode only when the user explicitly asks for live or continuous camera video.",
   parameters: {
     type: "OBJECT",
     properties: {
       device_id: {
         type: "STRING",
         description: "Optional camera device id returned by list_available_cameras.",
+      },
+      mode: {
+        type: "STRING",
+        description: "Optional. Use 'snapshot' by default. Use 'video' only for explicit live or continuous camera video requests.",
       },
     },
   },
@@ -418,10 +541,15 @@ const switchCameraShareFunctionDeclaration = {
 const captureCameraShotFunctionDeclaration = {
   name: "capture_camera_shot",
   description:
-    "Capture a still image from the active live camera feed. Use this when the user asks to take, shoot, snap, or capture a photo/image from the camera. If camera sharing is not active, call start_camera_share first.",
+    "Capture a still image from the active live camera feed. Use this when the user asks to take, shoot, snap, or capture a photo/image from the camera. If camera sharing is not active, call start_camera_share first. Provide an optional line number if the user wants the shot inserted into the note.",
   parameters: {
     type: "OBJECT",
-    properties: {},
+    properties: {
+      line_number: {
+        type: "NUMBER",
+        description: "Optional 1-based note line number. Insert before this line after capturing the photo.",
+      },
+    },
   },
 };
 
@@ -568,11 +696,15 @@ async function captureVideoFrameAsJpegBase64(blob: Blob) {
 export function LiveTalkPanel({
   active,
   currentNoteBodyMarkdown,
+  currentNoteId,
   currentNoteTitle,
   currentSelectedText,
   microphoneDeviceId,
   microphoneEnabled,
+  noteCatalog,
   onApplyEdits,
+  onAppendToCurrentNote,
+  onDisconnectRequest,
   onError,
   onRegisterSend,
   onRegisterVideoControls,
@@ -580,7 +712,11 @@ export function LiveTalkPanel({
   onHistoryInteract,
   onHistoryTargetsChange,
   onImageGenerationStateChange,
+  onInsertGeneratedImageInNote,
   onLatestMessageStateChange,
+  onOpenNote,
+  onFindInNote,
+  onScrollNote,
   onSessionStateChange,
   onVideoShareStateChange,
   onUploadImageToCurrentFolder,
@@ -589,11 +725,15 @@ export function LiveTalkPanel({
 }: {
   active: boolean;
   currentNoteBodyMarkdown: string;
+  currentNoteId: string;
   currentNoteTitle: string;
   currentSelectedText?: string;
   microphoneDeviceId?: string | null;
   microphoneEnabled?: boolean;
+  noteCatalog: AINoteReference[];
   onApplyEdits?: (edits: TextSubstitution[]) => void;
+  onAppendToCurrentNote: (markdown: string) => void;
+  onDisconnectRequest: () => void;
   onError: (message: string) => void;
   onRegisterSend?: ((send: LiveSendHandle | null) => void) | undefined;
   onRegisterVideoControls?: ((controls: LiveVideoControls | null) => void) | undefined;
@@ -601,10 +741,14 @@ export function LiveTalkPanel({
   onHistoryInteract?: (() => void) | undefined;
   onHistoryTargetsChange?: ((targets: LiveHistoryTargets) => void) | undefined;
   onImageGenerationStateChange?: ((generating: boolean) => void) | undefined;
+  onInsertGeneratedImageInNote: (attachment: { fileName: string; mimeType: string; previewUrl: string }, lineNumber?: number) => Promise<boolean>;
   onLatestMessageStateChange?: ((available: boolean) => void) | undefined;
+  onOpenNote: (target: { noteId?: string; title?: string }) => boolean;
+  onFindInNote: (target: { query: string; occurrence?: "first" | "next" | "previous" }) => boolean;
+  onScrollNote: (target: { target: "top" | "middle" | "bottom" | "line" | "up" | "down"; lineNumber?: number; pixels?: number }) => boolean;
   onSessionStateChange?: ((state: LiveSessionState) => void) | undefined;
   onVideoShareStateChange?: ((state: LiveVideoShareState) => void) | undefined;
-  onUploadImageToCurrentFolder?: ((attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<void>) | undefined;
+  onUploadImageToCurrentFolder?: ((attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<unknown>) | undefined;
   providerSettings: ProviderSettings;
   sessionRequested: boolean;
 }) {
@@ -619,6 +763,7 @@ export function LiveTalkPanel({
   const [activeVideoTurnId, setActiveVideoTurnId] = useState<string | null>(null);
   const [historyNotice, setHistoryNotice] = useState<{ id: string; content: string } | null>(null);
   const liveHistoryRef = useRef<HTMLDivElement>(null);
+  const turnsRef = useRef<LiveTurn[]>([]);
   const wasNearLiveHistoryBottomRef = useRef(true);
   const historyNoticeTimerRef = useRef<number | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -629,6 +774,8 @@ export function LiveTalkPanel({
   const microphoneSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const microphoneProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const microphoneSinkRef = useRef<GainNode | null>(null);
+  const onFindInNoteRef = useRef(onFindInNote);
+  const onScrollNoteRef = useRef(onScrollNote);
   const nextAudioTimeRef = useRef(0);
   const assistantPlaybackMutedUntilRef = useRef(0);
   const liveAssistantTurnIdRef = useRef<string | null>(null);
@@ -639,11 +786,19 @@ export function LiveTalkPanel({
   const preferredMicrophoneDeviceIdRef = useRef<string | null>(microphoneDeviceId ?? null);
   const requestMicrophoneRef = useRef<() => Promise<MediaStream | null>>(async () => null);
   const resetMicrophoneRef = useRef(() => {});
-  const noteContext = useMemo(() => buildNoteContext(currentNoteTitle, currentNoteBodyMarkdown), [currentNoteBodyMarkdown, currentNoteTitle]);
+  const noteContext = useMemo(
+    () => buildNoteContext(currentNoteId, currentNoteTitle, currentNoteBodyMarkdown, noteCatalog),
+    [currentNoteBodyMarkdown, currentNoteId, currentNoteTitle, noteCatalog],
+  );
   const noteContextRef = useRef(noteContext);
+  const noteCatalogRef = useRef(noteCatalog);
   const noteTitleRef = useRef(currentNoteTitle);
   const noteBodyMarkdownRef = useRef(currentNoteBodyMarkdown);
   const onApplyEditsRef = useRef(onApplyEdits);
+  const onAppendToCurrentNoteRef = useRef(onAppendToCurrentNote);
+  const onDisconnectRequestRef = useRef(onDisconnectRequest);
+  const onInsertGeneratedImageInNoteRef = useRef(onInsertGeneratedImageInNote);
+  const onOpenNoteRef = useRef(onOpenNote);
   const onVideoShareStateChangeRef = useRef(onVideoShareStateChange);
   const sendLiveHandleRef = useRef<LiveSendHandle>({
     sendText: () => false,
@@ -660,14 +815,23 @@ export function LiveTalkPanel({
   const audioUrlsRef = useRef<string[]>([]);
   const generatedImageUrlsRef = useRef<string[]>([]);
   const latestImageContextRef = useRef<LiveImageContext | null>(null);
+  const latestImagePreviewRef = useRef<{ fileName: string; mimeType: string; previewUrl: string } | null>(null);
+  const liveImageInsertInFlightRef = useRef<Set<string>>(new Set());
+  const lastLiveImageInsertRef = useRef<{ key: string; insertedAt: number } | null>(null);
+  const cameraShotInsertInFlightRef = useRef<Set<string>>(new Set());
+  const lastCameraShotRequestRef = useRef<Map<string, number>>(new Map());
+  const pendingSpeechCameraImageRef = useRef<LiveGeneratedImage | null>(null);
   const videoShareStreamRef = useRef<MediaStream | null>(null);
   const videoShareElementRef = useRef<HTMLVideoElement | null>(null);
   const videoShareCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoShareIntervalRef = useRef<number | null>(null);
   const videoShareModeRef = useRef<"camera" | "screen" | null>(null);
+  const cameraShareSendModeRef = useRef<CameraShareSendMode | null>(null);
   const screenShareSendModeRef = useRef<ScreenShareSendMode | null>(null);
   const currentCameraDeviceIdRef = useRef<string | null>(null);
   const currentCameraLabelRef = useRef<string | null>(null);
+  const videoShareIdleTimerRef = useRef<number | null>(null);
+  const stopVideoShareRef = useRef<(options?: { replacing?: boolean }) => void>(() => {});
   const videoShareTurnIdRef = useRef<string | null>(null);
   const captureVideoShareShotRef = useRef<() => Promise<void>>(async () => {});
   const cancelledToolCallIdsRef = useRef<Set<string>>(new Set());
@@ -678,6 +842,8 @@ export function LiveTalkPanel({
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const pendingGeneratedImageScrollRef = useRef(false);
+  const liveContextTokensRef = useRef(0);
+  const contextLimitHandlingRef = useRef(false);
 
   const showHistoryNotice = useCallback((content: string) => {
     if (historyNoticeTimerRef.current) {
@@ -695,15 +861,56 @@ export function LiveTalkPanel({
   }, []);
 
   useEffect(() => {
+    turnsRef.current = turns;
+  }, [turns]);
+
+  const clearVideoShareIdleTimer = () => {
+    if (videoShareIdleTimerRef.current) {
+      window.clearTimeout(videoShareIdleTimerRef.current);
+      videoShareIdleTimerRef.current = null;
+    }
+  };
+
+  const armVideoShareIdleTimer = () => {
+    const activeVideoMode =
+      videoShareModeRef.current === "camera"
+        ? cameraShareSendModeRef.current
+        : videoShareModeRef.current === "screen"
+          ? screenShareSendModeRef.current
+          : null;
+    if (activeVideoMode !== "video") return;
+
+    clearVideoShareIdleTimer();
+    videoShareIdleTimerRef.current = window.setTimeout(() => {
+      const stillActiveMode =
+        videoShareModeRef.current === "camera"
+          ? cameraShareSendModeRef.current
+          : videoShareModeRef.current === "screen"
+            ? screenShareSendModeRef.current
+            : null;
+      if (stillActiveMode !== "video") return;
+      stopVideoShareRef.current();
+      setStatus("Video share stopped after 1 minute of inactivity.");
+    }, 60_000);
+  };
+
+  useEffect(() => {
     readyRef.current = ready;
   }, [ready]);
 
   useEffect(() => {
     noteContextRef.current = noteContext;
+    noteCatalogRef.current = noteCatalog;
     noteTitleRef.current = currentNoteTitle;
     noteBodyMarkdownRef.current = currentNoteBodyMarkdown;
     currentSelectedTextRef.current = currentSelectedText?.trim() ?? "";
-  }, [currentSelectedText, noteContext]);
+  }, [currentNoteId, currentNoteTitle, currentNoteBodyMarkdown, currentSelectedText, noteCatalog, noteContext]);
+
+  useEffect(() => {
+    onOpenNoteRef.current = onOpenNote;
+    onFindInNoteRef.current = onFindInNote;
+    onScrollNoteRef.current = onScrollNote;
+  }, [onFindInNote, onOpenNote, onScrollNote]);
 
   useEffect(
     () => () => {
@@ -775,6 +982,22 @@ export function LiveTalkPanel({
   }, [onApplyEdits]);
 
   useEffect(() => {
+    onAppendToCurrentNoteRef.current = onAppendToCurrentNote;
+  }, [onAppendToCurrentNote]);
+
+  useEffect(() => {
+    onDisconnectRequestRef.current = onDisconnectRequest;
+  }, [onDisconnectRequest]);
+
+  useEffect(() => {
+    onInsertGeneratedImageInNoteRef.current = onInsertGeneratedImageInNote;
+  }, [onInsertGeneratedImageInNote]);
+
+  useEffect(() => {
+    onOpenNoteRef.current = onOpenNote;
+  }, [onOpenNote]);
+
+  useEffect(() => {
     onSessionStateChange?.({ connecting, ready, status });
   }, [connecting, onSessionStateChange, ready, status]);
 
@@ -823,6 +1046,48 @@ export function LiveTalkPanel({
       ),
     [orderedTurns],
   );
+  const userAudioDisplay = useMemo(() => {
+    const inlineIds = new Set<string>();
+    const foldedClips: Array<{ id: string; audioUrl: string; label: string }> = [];
+    const pendingAudioOnlyTurns: LiveTurn[] = [];
+
+    const flushPendingAudioOnlyTurns = () => {
+      if (pendingAudioOnlyTurns.length === 0) return;
+      const inlineTurn = pendingAudioOnlyTurns[pendingAudioOnlyTurns.length - 1];
+      if (inlineTurn) {
+        inlineIds.add(inlineTurn.id);
+      }
+      for (const turn of pendingAudioOnlyTurns.slice(0, -1)) {
+        if (!turn.audioUrl) continue;
+        foldedClips.push({
+          id: turn.id,
+          audioUrl: turn.audioUrl,
+          label: `Spoken clip ${foldedClips.length + 1}`,
+        });
+      }
+      pendingAudioOnlyTurns.length = 0;
+    };
+
+    for (const turn of orderedTurns) {
+      if (turn.role === "user" && turn.audioUrl) {
+        if (turn.content.trim()) {
+          flushPendingAudioOnlyTurns();
+          inlineIds.add(turn.id);
+        } else {
+          pendingAudioOnlyTurns.push(turn);
+        }
+        continue;
+      }
+      flushPendingAudioOnlyTurns();
+    }
+
+    flushPendingAudioOnlyTurns();
+    return {
+      foldedClips,
+      foldedIds: new Set(foldedClips.map((clip) => clip.id)),
+      inlineIds,
+    };
+  }, [orderedTurns]);
 
   const setLatestMessageAvailable = useCallback((available: boolean) => {
     onLatestMessageStateChange?.(available);
@@ -1079,6 +1344,7 @@ export function LiveTalkPanel({
               finalizeUserAudioRef.current();
             }
             pendingUserAudioChunksRef.current = [];
+            pendingSpeechCameraImageRef.current = null;
             userAudioSpeechStartMsRef.current = 0;
             return;
           }
@@ -1126,6 +1392,7 @@ export function LiveTalkPanel({
             }
             userAudioSelectionContextRef.current = sendSelectedTextContext(socketConnection);
             ensureUserTurn();
+            pendingSpeechCameraImageRef.current = captureCameraSnapshotForSpeechStart();
             userAudioActiveRef.current = true;
             userAudioTrailingSilenceMsRef.current = 0;
             for (const chunk of pendingUserAudioChunksRef.current) {
@@ -1157,9 +1424,11 @@ export function LiveTalkPanel({
               userAudioActiveRef.current = false;
               userAudioSpeechStartMsRef.current = 0;
               userAudioTrailingSilenceMsRef.current = 0;
+              const cameraImage = sendCameraSnapshotForTurn("speech");
               const screenImage = sendScreenSnapshotForTurn("speech");
-              if (screenImage) {
-                appendImagesToUserTurn([screenImage], userTurnIdRef.current);
+              const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+              if (turnImages.length > 0) {
+                appendImagesToUserTurn(turnImages, userTurnIdRef.current);
               }
               sendAudioStreamEnd();
               finalizeUserAudioRef.current();
@@ -1168,6 +1437,7 @@ export function LiveTalkPanel({
           }
 
           pendingUserAudioChunksRef.current = [];
+          pendingSpeechCameraImageRef.current = null;
           userAudioSpeechStartMsRef.current = 0;
         };
 
@@ -1232,7 +1502,9 @@ export function LiveTalkPanel({
 
     const videoShareContent = (mode: "camera" | "screen") =>
       mode === "camera"
-        ? "Shared camera with Gemini."
+        ? cameraShareSendModeRef.current === "video"
+          ? "Camera video sharing ready."
+          : "Camera snapshot sharing ready."
         : screenShareSendModeRef.current === "video"
           ? "Shared screen video with Gemini."
           : "Shared screen screenshots with Gemini.";
@@ -1273,6 +1545,7 @@ export function LiveTalkPanel({
       if (!userTurnId) {
         userAudioChunksRef.current = [];
         pendingUserAudioChunksRef.current = [];
+        pendingSpeechCameraImageRef.current = null;
         userAudioSpeechStartMsRef.current = 0;
         userAudioSelectionContextRef.current = "";
         userAudioActiveRef.current = false;
@@ -1291,6 +1564,7 @@ export function LiveTalkPanel({
       userAudioSelectionContextRef.current = "";
       userAudioChunksRef.current = [];
       pendingUserAudioChunksRef.current = [];
+      pendingSpeechCameraImageRef.current = null;
       userAudioSpeechStartMsRef.current = 0;
       userAudioActiveRef.current = false;
       userAudioTrailingSilenceMsRef.current = 0;
@@ -1461,6 +1735,8 @@ export function LiveTalkPanel({
 
     const sendSetup = () => {
       appliedNoteContextRef.current = noteContextRef.current;
+      liveContextTokensRef.current = estimateTokenCount(noteContextRef.current);
+      contextLimitHandlingRef.current = false;
       socket.send(
         JSON.stringify({
           setup: {
@@ -1487,6 +1763,11 @@ export function LiveTalkPanel({
                 functionDeclarations: [
                   generateImageFunctionDeclaration,
                   suggestNoteEditsFunctionDeclaration,
+                  openNoteFunctionDeclaration,
+                  scrollNoteFunctionDeclaration,
+                  findNoteFunctionDeclaration,
+                  uploadCurrentImageFunctionDeclaration,
+                  insertCurrentImageFunctionDeclaration,
                   listAvailableCamerasFunctionDeclaration,
                   startCameraShareFunctionDeclaration,
                   switchCameraShareFunctionDeclaration,
@@ -1504,14 +1785,17 @@ export function LiveTalkPanel({
     const updateVideoShareState = (
       mode: "camera" | "screen" | null,
       cameraDeviceId?: string | null,
+      cameraMode?: CameraShareSendMode | null,
       screenMode?: ScreenShareSendMode | null,
     ) => {
       videoShareModeRef.current = mode;
+      cameraShareSendModeRef.current = mode === "camera" ? cameraMode ?? "snapshot" : null;
       screenShareSendModeRef.current = mode === "screen" ? screenMode ?? "screenshot" : null;
       currentCameraDeviceIdRef.current = mode === "camera" ? cameraDeviceId ?? null : null;
       onVideoShareStateChangeRef.current?.({
         mode,
         cameraDeviceId: currentCameraDeviceIdRef.current,
+        cameraMode: cameraShareSendModeRef.current,
         screenMode: screenShareSendModeRef.current,
       });
     };
@@ -1544,12 +1828,14 @@ export function LiveTalkPanel({
 
     const stopVideoShare = (options?: { replacing?: boolean }) => {
       const previousMode = videoShareModeRef.current;
+      clearVideoShareIdleTimer();
       if (videoShareIntervalRef.current) {
         window.clearInterval(videoShareIntervalRef.current);
         videoShareIntervalRef.current = null;
       }
       videoShareStreamRef.current?.getTracks().forEach((track) => track.stop());
       videoShareStreamRef.current = null;
+      pendingSpeechCameraImageRef.current = null;
       if (videoShareElementRef.current) {
         videoShareElementRef.current.pause();
         videoShareElementRef.current.srcObject = null;
@@ -1557,11 +1843,13 @@ export function LiveTalkPanel({
       videoShareElementRef.current = null;
       videoShareCanvasRef.current = null;
       currentCameraLabelRef.current = null;
+      cameraShareSendModeRef.current = null;
       updateVideoShareState(null);
       if (!options?.replacing && previousMode) {
         clearVideoShareTurn(previousMode === "camera" ? "Camera sharing stopped." : "Screen sharing stopped.");
       }
     };
+    stopVideoShareRef.current = stopVideoShare;
 
     const captureVideoFrameBase64 = (maxWidth = 1280, quality = 0.82) => {
       const videoElement = videoShareElementRef.current;
@@ -1587,9 +1875,65 @@ export function LiveTalkPanel({
       return dataBase64 || null;
     };
 
+    const createVideoShareImage = (fileNamePrefix: string, maxWidth = 1280, quality = 0.82) => {
+      const dataBase64 = captureVideoFrameBase64(maxWidth, quality);
+      if (!dataBase64) return null;
+      const image: LiveGeneratedImage = {
+        id: crypto.randomUUID(),
+        fileName: `${fileNamePrefix}-${Date.now()}.jpg`,
+        mimeType: "image/jpeg",
+        origin: "camera",
+        url: base64ToObjectUrl(dataBase64, "image/jpeg"),
+        dataBase64,
+      };
+      generatedImageUrlsRef.current.push(image.url);
+      return image;
+    };
+
+    const markLatestImageContext = (image: LiveGeneratedImage) => {
+      latestImageContextRef.current = {
+        id: image.id,
+        kind: "image",
+        fileName: image.fileName,
+        mimeType: image.mimeType,
+        source: "upload",
+        dataBase64: image.dataBase64,
+      };
+      latestImagePreviewRef.current = {
+        fileName: image.fileName,
+        mimeType: image.mimeType,
+        previewUrl: image.url,
+      };
+    };
+
+    const sendImageToLive = (socketConnection: WebSocket, image: LiveGeneratedImage, note: string) => {
+      socketConnection.send(
+        JSON.stringify({
+          realtimeInput: {
+            video: {
+              data: image.dataBase64,
+              mimeType: image.mimeType,
+            },
+          },
+        }),
+      );
+      socketConnection.send(
+        JSON.stringify({
+          realtimeInput: {
+            text: note,
+          },
+        }),
+      );
+      recordLiveContextUsage(note, 1);
+    };
+
     const sendVideoFrame = () => {
       const socketConnection = socketRef.current;
-      if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) {
+      if (
+        !socketConnection ||
+        socketConnection.readyState !== WebSocket.OPEN ||
+        (videoShareModeRef.current !== "screen" && cameraShareSendModeRef.current !== "video")
+      ) {
         return;
       }
       const dataBase64 = captureVideoFrameBase64();
@@ -1605,6 +1949,7 @@ export function LiveTalkPanel({
           },
         }),
       );
+      recordLiveContextUsage("", 1);
     };
 
     const sendScreenSnapshotForTurn = (reason: "speech" | "text" | "audio") => {
@@ -1651,6 +1996,43 @@ export function LiveTalkPanel({
           },
         }),
       );
+      recordLiveContextUsage(reason, 1);
+      return image;
+    };
+
+    const captureCameraSnapshotForSpeechStart = () => {
+      if (videoShareModeRef.current !== "camera" || cameraShareSendModeRef.current !== "snapshot") return null;
+      const image = createVideoShareImage("camera-shot", 1280, 0.82);
+      if (image) {
+        markLatestImageContext(image);
+      }
+      return image;
+    };
+
+    const sendCameraSnapshotForTurn = (reason: "speech" | "text" | "audio") => {
+      const socketConnection = socketRef.current;
+      if (
+        videoShareModeRef.current !== "camera" ||
+        cameraShareSendModeRef.current !== "snapshot" ||
+        !socketConnection ||
+        socketConnection.readyState !== WebSocket.OPEN
+      ) {
+        return null;
+      }
+
+      const image = reason === "speech" ? pendingSpeechCameraImageRef.current ?? captureCameraSnapshotForSpeechStart() : createVideoShareImage("camera-shot", 1280, 0.82);
+      pendingSpeechCameraImageRef.current = null;
+      if (!image) return null;
+      markLatestImageContext(image);
+      sendImageToLive(
+        socketConnection,
+        image,
+        reason === "speech"
+          ? "Camera still image captured at the start of the user's spoken turn and sent with their audio."
+          : reason === "audio"
+            ? "Camera still image captured with the user's audio message."
+            : "Camera still image captured with the user's text message.",
+      );
       return image;
     };
 
@@ -1658,7 +2040,7 @@ export function LiveTalkPanel({
       stream: MediaStream,
       mode: "camera" | "screen",
       cameraDeviceId?: string | null,
-      options?: { screenMode?: ScreenShareSendMode },
+      options?: { cameraMode?: CameraShareSendMode; screenMode?: ScreenShareSendMode },
     ) => {
       const socketConnection = socketRef.current;
       if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) {
@@ -1684,19 +2066,22 @@ export function LiveTalkPanel({
 
       await videoElement.play().catch(() => undefined);
       await waitForVideoFrame(videoElement);
+      const cameraMode = mode === "camera" ? options?.cameraMode ?? "snapshot" : null;
       const screenMode = mode === "screen" ? options?.screenMode ?? "screenshot" : null;
-      if (mode === "camera" || screenMode === "video") {
+      if ((mode === "screen" && screenMode === "video") || (mode === "camera" && cameraMode === "video")) {
         sendVideoFrame();
         videoShareIntervalRef.current = window.setInterval(sendVideoFrame, 900);
       }
       const videoTrack = stream.getVideoTracks()[0];
       const resolvedCameraDeviceId = mode === "camera" ? videoTrack?.getSettings().deviceId ?? cameraDeviceId ?? null : null;
       currentCameraLabelRef.current = mode === "camera" ? videoTrack?.label ?? null : null;
-      updateVideoShareState(mode, resolvedCameraDeviceId, screenMode);
+      updateVideoShareState(mode, resolvedCameraDeviceId, cameraMode, screenMode);
       upsertVideoShareTurn(stream, mode);
       setStatus(
         mode === "camera"
-          ? "Sharing camera with Gemini."
+          ? cameraMode === "video"
+            ? "Camera video sharing ready."
+            : "Camera snapshot sharing ready."
           : screenMode === "video"
             ? "Sharing your screen video with Gemini."
             : "Screen screenshot sharing ready.",
@@ -1740,7 +2125,7 @@ export function LiveTalkPanel({
         }));
     };
 
-    const startCameraShare = async (deviceId?: string) => {
+    const startCameraShare = async (deviceId?: string, options?: { video?: boolean }) => {
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
         throw new Error("Camera sharing is not supported in this browser.");
       }
@@ -1755,7 +2140,7 @@ export function LiveTalkPanel({
             },
         audio: false,
       });
-      await startVideoShare(stream, "camera", deviceId ?? null);
+      await startVideoShare(stream, "camera", deviceId ?? null, { cameraMode: options?.video ? "video" : "snapshot" });
       return true;
     };
 
@@ -1785,7 +2170,7 @@ export function LiveTalkPanel({
         throw new Error(cameras.length === 0 ? "No cameras were found." : "No other camera is available.");
       }
 
-      await startCameraShare(nextSource.deviceId);
+      await startCameraShare(nextSource.deviceId, { video: cameraShareSendModeRef.current === "video" });
       return true;
     };
 
@@ -1838,14 +2223,7 @@ export function LiveTalkPanel({
         dataBase64,
       };
       generatedImageUrlsRef.current.push(image.url);
-      latestImageContextRef.current = {
-        id: image.id,
-        kind: "image",
-        fileName: image.fileName,
-        mimeType: image.mimeType,
-        source: "upload",
-        dataBase64: image.dataBase64,
-      };
+      markLatestImageContext(image);
 
       socketConnection.send(
         JSON.stringify({
@@ -1899,7 +2277,9 @@ export function LiveTalkPanel({
         return false;
       }
 
+      const cameraImage = sendCameraSnapshotForTurn("text");
       const screenImage = sendScreenSnapshotForTurn("text");
+      const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
       socketConnection.send(
         JSON.stringify({
           realtimeInput: {
@@ -1907,17 +2287,19 @@ export function LiveTalkPanel({
           },
         }),
       );
+      recordLiveContextUsage(trimmedText, turnImages.length);
       setTurns((current) => [
         ...current,
         {
           id: crypto.randomUUID(),
           role: "user",
           content: options?.displayText?.trim() || trimmedText,
-          images: screenImage ? [screenImage] : undefined,
+          images: turnImages.length > 0 ? turnImages : undefined,
         },
       ]);
       moveVideoShareTurnToEnd();
       setStatus("Sent.");
+      armVideoShareIdleTimer();
       return true;
     };
 
@@ -1930,7 +2312,9 @@ export function LiveTalkPanel({
       const blob = await loadAttachmentBlob(attachment);
       if (attachment.kind === "audio") {
         const selectionContext = sendSelectedTextContext(socketConnection);
+        const cameraImage = sendCameraSnapshotForTurn("audio");
         const screenImage = sendScreenSnapshotForTurn("audio");
+        const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
         const chunks = await decodeAudioBlobToPcm16ChunksBase64(blob);
         for (const chunk of chunks) {
           socketConnection.send(
@@ -1950,17 +2334,23 @@ export function LiveTalkPanel({
             id: crypto.randomUUID(),
             role: "user",
             content: [selectionContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
-            images: screenImage ? [screenImage] : undefined,
+            images: turnImages.length > 0 ? turnImages : undefined,
           },
         ]);
         moveVideoShareTurnToEnd();
         setStatus(`${attachment.fileName} sent to live talk.`);
+        armVideoShareIdleTimer();
+        recordLiveContextUsage(`Sent audio clip: ${attachment.fileName}`, turnImages.length);
         return true;
       }
 
       let encodedFrame: string | null = null;
       if (attachment.kind === "image") {
         encodedFrame = await readBlobAsBase64(blob);
+        const imagePreviewUrl = attachment.url ?? base64ToObjectUrl(encodedFrame, attachment.mimeType || blob.type || "image/jpeg");
+        if (!attachment.url) {
+          generatedImageUrlsRef.current.push(imagePreviewUrl);
+        }
         latestImageContextRef.current = {
           id: crypto.randomUUID(),
           kind: "image",
@@ -1968,6 +2358,11 @@ export function LiveTalkPanel({
           mimeType: attachment.mimeType || blob.type || "image/jpeg",
           source: "upload",
           dataBase64: encodedFrame,
+        };
+        latestImagePreviewRef.current = {
+          fileName: attachment.fileName,
+          mimeType: attachment.mimeType || blob.type || "image/jpeg",
+          previewUrl: imagePreviewUrl,
         };
       } else if (attachment.kind === "video") {
         encodedFrame = await captureVideoFrameAsJpegBase64(blob);
@@ -1994,11 +2389,78 @@ export function LiveTalkPanel({
             },
           }),
         );
+        recordLiveContextUsage(`The user uploaded a source image: ${attachment.fileName}`, 1);
         setTurns((current) => [...current, { id: crypto.randomUUID(), role: "user", content: `Sent image: ${attachment.fileName}` }]);
         moveVideoShareTurnToEnd();
+      } else if (attachment.kind === "video") {
+        recordLiveContextUsage(`The user sent a video frame: ${attachment.fileName}`, 1);
       }
       setStatus(`${attachment.fileName} sent to live talk.`);
+      armVideoShareIdleTimer();
       return true;
+    };
+
+    const buildLiveTranscriptMarkdown = () =>
+      turnsRef.current
+        .filter((turn) => turn.role === "user" || turn.role === "assistant")
+        .map((turn) => {
+          const speaker = turn.role === "user" ? "User" : "Assistant";
+          const imageSummary = turn.images?.length ? `\n[${turn.images.length} image${turn.images.length === 1 ? "" : "s"} attached]` : "";
+          return `### ${speaker}\n${turn.content.trim() || "[audio/image turn]"}${imageSummary}`;
+        })
+        .join("\n\n");
+
+    const disconnectForContextLimit = async () => {
+      if (contextLimitHandlingRef.current) return;
+      contextLimitHandlingRef.current = true;
+      setStatus("Live context exceeded 16k tokens. Summarizing before disconnect...");
+      try {
+        const transcript = buildLiveTranscriptMarkdown();
+        const response = await apiClient.askAi({
+          prompt: [
+            "Summarize the important content from this live chat so it can be preserved at the end of the note.",
+            "Keep decisions, user instructions, generated-image descriptions, note changes, open questions, and next steps.",
+            "Use concise markdown bullets.",
+            "",
+            "Live chat transcript:",
+            transcript || "No transcript text was captured.",
+          ].join("\n"),
+          title: noteTitleRef.current,
+          bodyMarkdown: noteBodyMarkdownRef.current,
+          mode: "chat",
+          availableNotes: noteCatalogRef.current,
+        });
+        const summary = [
+          `## Live chat summary (${new Date().toLocaleString()})`,
+          "",
+          response.answer.trim(),
+        ].join("\n");
+        onAppendToCurrentNoteRef.current(summary);
+        const notice = "Live context passed 16k tokens. I saved a summary at the end of the note and disconnected live talk.";
+        setTurns((current) => [
+          ...current,
+          {
+            id: crypto.randomUUID(),
+            role: "assistant",
+            content: notice,
+          },
+        ]);
+        showHistoryNotice(notice);
+        setStatus(notice);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to summarize live context before disconnect.";
+        onError(message);
+        setStatus(`Live context passed 16k tokens. Disconnecting without summary: ${message}`);
+      } finally {
+        onDisconnectRequestRef.current();
+      }
+    };
+
+    const recordLiveContextUsage = (text: string, imageCount = 0) => {
+      liveContextTokensRef.current += estimateTokenCount(text) + imageCount * 1200;
+      if (liveContextTokensRef.current > LIVE_CONTEXT_TOKEN_LIMIT) {
+        void disconnectForContextLimit();
+      }
     };
 
     const runGenerateImageTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
@@ -2029,6 +2491,7 @@ export function LiveTalkPanel({
           bodyMarkdown: noteBodyMarkdownRef.current,
           mode: "image",
           attachments,
+          availableNotes: noteCatalogRef.current,
         });
 
         if (cancelledToolCallIdsRef.current.has(callId)) {
@@ -2066,6 +2529,11 @@ export function LiveTalkPanel({
             mimeType: latestGeneratedImage.mimeType,
             source: "folder",
             dataBase64: latestGeneratedImage.dataBase64,
+          };
+          latestImagePreviewRef.current = {
+            fileName: latestGeneratedImage.fileName,
+            mimeType: latestGeneratedImage.mimeType,
+            previewUrl: latestGeneratedImage.url,
           };
         }
 
@@ -2114,6 +2582,7 @@ export function LiveTalkPanel({
         title: noteTitleRef.current,
         bodyMarkdown: noteBodyMarkdownRef.current,
         mode: "chat",
+        availableNotes: noteCatalogRef.current,
       });
 
       if (cancelledToolCallIdsRef.current.has(callId)) {
@@ -2149,6 +2618,156 @@ export function LiveTalkPanel({
       };
     };
 
+    const runOpenNoteTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const noteId = typeof call.args?.note_id === "string" ? call.args.note_id.trim() : "";
+      const title = typeof call.args?.title === "string" ? call.args.title.trim() : "";
+      const opened = onOpenNoteRef.current({
+        ...(noteId ? { noteId } : {}),
+        ...(title ? { title } : {}),
+      });
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "open_note",
+        response: {
+          ok: opened,
+          note_id: noteId || null,
+          title: title || null,
+          message: opened ? "Opened the requested note." : "The requested note was not found.",
+        },
+      };
+    };
+
+    const runScrollNoteTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const target = typeof call.args?.target === "string" ? call.args.target.trim() : "";
+      const lineNumber = typeof call.args?.line_number === "number" && Number.isFinite(call.args.line_number) ? Math.max(1, Math.floor(call.args.line_number)) : undefined;
+      const pixels = typeof call.args?.pixels === "number" && Number.isFinite(call.args.pixels) ? Math.max(1, Math.floor(call.args.pixels)) : undefined;
+      const ok = ["top", "middle", "bottom", "line", "up", "down"].includes(target)
+        ? onScrollNoteRef.current({
+            target: target as "top" | "middle" | "bottom" | "line" | "up" | "down",
+            ...(lineNumber ? { lineNumber } : {}),
+            ...(pixels ? { pixels } : {}),
+          })
+        : false;
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "scroll_note",
+        response: {
+          ok,
+          target: target || null,
+          line_number: lineNumber ?? null,
+          pixels: pixels ?? null,
+          message: ok ? "Scrolled the note." : "The note could not be scrolled.",
+        },
+      };
+    };
+
+    const runFindNoteTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const query = typeof call.args?.query === "string" ? call.args.query.trim() : "";
+      const occurrence = typeof call.args?.occurrence === "string" ? call.args.occurrence.trim() : "";
+      const ok = query
+        ? onFindInNoteRef.current({
+            query,
+            ...(occurrence === "first" || occurrence === "next" || occurrence === "previous" ? { occurrence } : {}),
+          })
+        : false;
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "find_note",
+        response: {
+          ok,
+          query: query || null,
+          occurrence: occurrence || null,
+          message: ok ? "Found the requested text in the note." : "The text was not found in the note.",
+        },
+      };
+    };
+
+    const runUploadCurrentImageTool = async (call: { id?: string; name?: string }) => {
+      const image = latestImagePreviewRef.current;
+      if (!image || !onUploadImageToCurrentFolder) {
+        return {
+          id: typeof call.id === "string" ? call.id : "",
+          name: call.name ?? "upload_current_image",
+          response: {
+            ok: false,
+            error: "No current image is available to upload.",
+          },
+        };
+      }
+
+      await onUploadImageToCurrentFolder(image);
+      setStatus("Uploaded current image to the current folder.");
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "upload_current_image",
+        response: {
+          ok: true,
+          file_name: image.fileName,
+          mime_type: image.mimeType,
+          message: "Uploaded the current image to the current folder.",
+        },
+      };
+    };
+
+    const insertLiveImageOnce = async (
+      image: { fileName: string; mimeType: string; previewUrl: string },
+      lineNumber?: number,
+    ) => {
+      const key = `${image.previewUrl}:${lineNumber ?? "cursor"}`;
+      const recentInsert = lastLiveImageInsertRef.current;
+      if (liveImageInsertInFlightRef.current.has(key) || (recentInsert?.key === key && Date.now() - recentInsert.insertedAt < 15000)) {
+        return { inserted: false, duplicate: true };
+      }
+
+      liveImageInsertInFlightRef.current.add(key);
+      try {
+        const inserted = await onInsertGeneratedImageInNoteRef.current(image, lineNumber);
+        if (inserted) {
+          lastLiveImageInsertRef.current = { key, insertedAt: Date.now() };
+        }
+        return { inserted, duplicate: false };
+      } finally {
+        liveImageInsertInFlightRef.current.delete(key);
+      }
+    };
+
+    const runInsertCurrentImageTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const image = latestImagePreviewRef.current;
+      const rawLineNumber = call.args?.line_number;
+      const lineNumber = typeof rawLineNumber === "number" && Number.isFinite(rawLineNumber) ? Math.max(1, Math.floor(rawLineNumber)) : undefined;
+      if (!image) {
+        return {
+          id: typeof call.id === "string" ? call.id : "",
+          name: call.name ?? "insert_current_image",
+          response: {
+            ok: false,
+            error: "No current image is available to insert.",
+          },
+        };
+      }
+
+      const { inserted, duplicate } = await insertLiveImageOnce(image, lineNumber);
+      setStatus(inserted ? "Inserted current image into the note." : duplicate ? "Skipped duplicate image insert." : "Current image was not inserted.");
+      return {
+        id: typeof call.id === "string" ? call.id : "",
+        name: call.name ?? "insert_current_image",
+        response: {
+          ok: inserted || duplicate,
+          file_name: image.fileName,
+          mime_type: image.mimeType,
+          line_number: lineNumber ?? null,
+          duplicate_suppressed: duplicate,
+          message: inserted
+            ? lineNumber
+              ? `Inserted the current image before line ${lineNumber}.`
+              : "Inserted the current image into the note."
+            : duplicate
+              ? "Skipped a duplicate image insert for the same current image."
+            : "The current image was not inserted.",
+        },
+      };
+    };
+
     const runListAvailableCamerasTool = async (call: { id?: string; name?: string }) => {
       const cameras = await listSources();
       return {
@@ -2167,7 +2786,9 @@ export function LiveTalkPanel({
 
     const runStartCameraShareTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
       const deviceId = typeof call.args?.device_id === "string" && call.args.device_id.trim() ? call.args.device_id.trim() : undefined;
-      const started = await startCameraShare(deviceId);
+      const requestedMode = typeof call.args?.mode === "string" ? call.args.mode.toLowerCase() : "";
+      const useVideo = /\b(video|live|continuous|stream)\b/.test(requestedMode);
+      const started = await startCameraShare(deviceId, { video: useVideo });
       return {
         id: typeof call.id === "string" ? call.id : "",
         name: call.name ?? "start_camera_share",
@@ -2175,7 +2796,12 @@ export function LiveTalkPanel({
           ok: started,
           mode: started ? "camera" : null,
           device_id: currentCameraDeviceIdRef.current ?? deviceId ?? null,
-          message: started ? "Camera sharing started." : "Camera sharing was not started.",
+          camera_mode: cameraShareSendModeRef.current,
+          message: started
+            ? cameraShareSendModeRef.current === "video"
+              ? "Camera video sharing started."
+              : "Camera snapshot sharing started."
+            : "Camera sharing was not started.",
         },
       };
     };
@@ -2189,24 +2815,67 @@ export function LiveTalkPanel({
           ok: started,
           mode: started ? "camera" : null,
           device_id: currentCameraDeviceIdRef.current,
+          camera_mode: cameraShareSendModeRef.current,
           message: started ? "Switched to the next camera." : "Camera was not switched.",
         },
       };
     };
 
-    const runCaptureCameraShotTool = async (call: { id?: string; name?: string }) => {
-      const image = await captureCurrentCameraShot();
-      return {
-        id: typeof call.id === "string" ? call.id : "",
-        name: call.name ?? "capture_camera_shot",
-        response: {
-          ok: true,
-          file_name: image.fileName,
-          mime_type: image.mimeType,
-          message: "Captured a still image from the current camera feed.",
-          current_source_image_updated: true,
-        },
-      };
+    const runCaptureCameraShotTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
+      const rawLineNumber = call.args?.line_number;
+      const lineNumber = typeof rawLineNumber === "number" && Number.isFinite(rawLineNumber) ? Math.max(1, Math.floor(rawLineNumber)) : undefined;
+      const captureInsertKey = lineNumber ? `line:${lineNumber}` : "capture-only";
+      const lastRequestAt = lastCameraShotRequestRef.current.get(captureInsertKey) ?? 0;
+      if (cameraShotInsertInFlightRef.current.has(captureInsertKey) || Date.now() - lastRequestAt < 15000) {
+        return {
+          id: typeof call.id === "string" ? call.id : "",
+          name: call.name ?? "capture_camera_shot",
+          response: {
+            ok: true,
+            duplicate_suppressed: true,
+            line_number: lineNumber ?? null,
+            inserted_into_note: false,
+            message: "Skipped a duplicate camera shot request.",
+          },
+        };
+      }
+
+      cameraShotInsertInFlightRef.current.add(captureInsertKey);
+      let completed = false;
+      try {
+        const image = await captureCurrentCameraShot();
+        const { inserted, duplicate } = lineNumber
+          ? await insertLiveImageOnce(
+              {
+                fileName: image.fileName,
+                mimeType: image.mimeType,
+                previewUrl: image.url,
+              },
+              lineNumber,
+            )
+          : { inserted: false, duplicate: false };
+        const response = {
+          id: typeof call.id === "string" ? call.id : "",
+          name: call.name ?? "capture_camera_shot",
+          response: {
+            ok: true,
+            file_name: image.fileName,
+            mime_type: image.mimeType,
+            message: duplicate ? "Skipped a duplicate camera shot insert." : "Captured a still image from the current camera feed.",
+            current_source_image_updated: true,
+            line_number: lineNumber ?? null,
+            inserted_into_note: inserted,
+            duplicate_suppressed: duplicate,
+          },
+        };
+        completed = true;
+        return response;
+      } finally {
+        if (completed) {
+          lastCameraShotRequestRef.current.set(captureInsertKey, Date.now());
+        }
+        cameraShotInsertInFlightRef.current.delete(captureInsertKey);
+      }
     };
 
     const runStartScreenShareTool = async (call: { id?: string; name?: string; args?: Record<string, unknown> }) => {
@@ -2259,6 +2928,16 @@ export function LiveTalkPanel({
                 return await runGenerateImageTool(call);
               case "suggest_note_edits":
                 return await runSuggestNoteEditsTool(call);
+              case "open_note":
+                return await runOpenNoteTool(call);
+              case "scroll_note":
+                return await runScrollNoteTool(call);
+              case "find_note":
+                return await runFindNoteTool(call);
+              case "upload_current_image":
+                return await runUploadCurrentImageTool(call);
+              case "insert_current_image":
+                return await runInsertCurrentImageTool(call);
               case "list_available_cameras":
                 return await runListAvailableCamerasTool(call);
               case "start_camera_share":
@@ -2368,17 +3047,21 @@ export function LiveTalkPanel({
         if ("serverContent" in payload && payload.serverContent) {
           const serverContent = payload.serverContent;
           if (serverContent.inputTranscription?.text) {
+            recordLiveContextUsage(serverContent.inputTranscription.text);
             updateUserTurn(serverContent.inputTranscription.text);
           }
           const assistantTurnStarted = Boolean(serverContent.outputTranscription?.text || serverContent.modelTurn?.parts?.length);
           if (assistantTurnStarted) {
+            clearVideoShareIdleTimer();
             finalizeUserAudio();
           }
           if (serverContent.outputTranscription?.text) {
+            recordLiveContextUsage(serverContent.outputTranscription.text);
             updateAssistantTurn(serverContent.outputTranscription.text);
           }
           for (const part of serverContent.modelTurn?.parts ?? []) {
             if (part.text) {
+              recordLiveContextUsage(part.text);
               updateAssistantTurn(part.text);
             }
             if (part.inlineData?.data) {
@@ -2446,6 +3129,7 @@ export function LiveTalkPanel({
     return () => {
       closing = true;
       clearReconnectTimer();
+      clearVideoShareIdleTimer();
       socketRef.current = null;
       socket.close();
       stopVideoShare();
@@ -2455,6 +3139,7 @@ export function LiveTalkPanel({
       assistantPlaybackMutedUntilRef.current = 0;
       userAudioChunksRef.current = [];
       pendingUserAudioChunksRef.current = [];
+      pendingSpeechCameraImageRef.current = null;
       userAudioActiveRef.current = false;
       userAudioSpeechStartMsRef.current = 0;
       userAudioTrailingSilenceMsRef.current = 0;
@@ -2527,6 +3212,9 @@ export function LiveTalkPanel({
             </div>
           ) : null}
           {orderedTurns.map((turn) => {
+            if (userAudioDisplay.foldedIds.has(turn.id)) {
+              return null;
+            }
             const videoControlsVisible = focusedVideoTurnId === turn.id;
             const videoExpanded = expandedVideoTurnIds.has(turn.id);
             return (
@@ -2653,7 +3341,7 @@ export function LiveTalkPanel({
                     ) : null}
                   </div>
                 ) : null}
-                {turn.audioUrl ? (
+                {turn.audioUrl && (turn.role !== "user" || userAudioDisplay.inlineIds.has(turn.id)) ? (
                   <audio
                     className={`mt-2 h-10 w-full ${turn.role === "user" ? "[color-scheme:dark]" : ""}`}
                     controls
@@ -2664,6 +3352,23 @@ export function LiveTalkPanel({
               </div>
             );
           })}
+          {userAudioDisplay.foldedClips.length > 0 ? (
+            <details className="self-end rounded-[4px] bg-ink px-3 py-2 text-sm text-white" style={{ minWidth: "min(400px, 92%)", maxWidth: "92%" }}>
+              <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.14em] text-white/75">
+                User audio clips ({userAudioDisplay.foldedClips.length})
+              </summary>
+              <div className="mt-3 grid gap-3">
+                {userAudioDisplay.foldedClips.map((clip, index) => (
+                  <div className="rounded-[8px] border border-white/10 bg-white/10 p-2" key={clip.id}>
+                    <div className="mb-2 truncate text-xs text-white/75">
+                      {index + 1}. {clip.label}
+                    </div>
+                    <audio className="h-10 w-full [color-scheme:dark]" controls preload="metadata" src={clip.audioUrl} />
+                  </div>
+                ))}
+              </div>
+            </details>
+          ) : null}
           {historyNotice ? (
             <div className="self-center rounded-[4px] bg-mist/80 px-2 py-1 text-xs text-ink/65" key={historyNotice.id}>
               {historyNotice.content}

@@ -109,12 +109,44 @@ export type TextSubstitution = {
   all?: boolean;
 };
 
+export type AINoteReference = {
+  id: string;
+  title: string;
+  folderName?: string | null;
+};
+
+export type AIResponseAction =
+  | {
+      type: "open_note";
+      noteId?: string;
+      title?: string;
+    }
+  | {
+      type: "scroll_note";
+      target: "top" | "middle" | "bottom" | "line" | "up" | "down";
+      lineNumber?: number;
+      pixels?: number;
+    }
+  | {
+      type: "find_note";
+      query: string;
+      occurrence?: "first" | "next" | "previous";
+    }
+  | {
+      type: "insert_latest_image";
+      lineNumber?: number;
+    }
+  | {
+      type: "upload_latest_image";
+    };
+
 export type AIRequest = {
   prompt: string;
   title: string;
   bodyMarkdown: string;
   selection?: string;
   attachments?: AIRequestAttachment[];
+  availableNotes?: AINoteReference[];
   mode?: AIRequestMode;
 };
 
@@ -129,4 +161,5 @@ export type AIResponse = {
   answer: string;
   substitutions: TextSubstitution[];
   attachments?: AIResponseAttachment[];
+  actions?: AIResponseAction[];
 };

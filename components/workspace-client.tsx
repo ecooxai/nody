@@ -31,8 +31,10 @@ import type {
   AIMessageAttachment,
   AIMediaKind,
   AIMessagePrompt,
+  AINoteReference,
   AIRequestAttachment,
   AIRequestMode,
+  AIResponseAction,
   DocumentRecord,
   FolderAsset,
   FolderRecord,
@@ -56,6 +58,15 @@ type PendingAiEditPreview = {
   stepCount: number;
   firstStep: TextSubstitutionReplayStep;
   skippedCount: number;
+};
+type PendingEditorInsert = {
+  asset: FolderAsset;
+  lineNumber?: number;
+};
+type PendingAiScroll = {
+  lineNumber: number;
+  position: "top" | "middle" | "bottom";
+  restoreView: boolean;
 };
 const RECENT_NOTE_LIMIT = 5;
 const RECENT_NOTE_HISTORY_LIMIT = 20;
@@ -244,6 +255,10 @@ function actionButtonClass(active: boolean) {
     : "bg-white text-ink hover:bg-mist";
 }
 
+function normalizeSearchNeedle(query: string) {
+  return query.trim().toLowerCase();
+}
+
 function IconActionButton({
   active = false,
   children,
@@ -331,6 +346,7 @@ function WorkspaceClientContent() {
   const { pushError } = useErrorToast();
   const deviceId = useMemo(() => getDeviceId(), []);
   const editorRef = useRef<RichEditorHandle>(null);
+  const noteSearchRef = useRef<{ noteId: string; query: string; index: number } | null>(null);
   const cachedDocumentRef = useRef<DocumentRecord | null>(null);
   const [folders, setFolders] = useState<FolderRecord[]>([]);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
@@ -343,6 +359,11 @@ function WorkspaceClientContent() {
   const [selectedFolderId, setSelectedFolderId] = useState<string | null>(null);
   const [expandedFolderIds, setExpandedFolderIds] = useState<string[]>([]);
   const [selectedFolderAsset, setSelectedFolderAsset] = useState<FolderAsset | null>(null);
+  const [activeFolderAssetMenuId, setActiveFolderAssetMenuId] = useState<string | null>(null);
+  const [renamingFolderAssetId, setRenamingFolderAssetId] = useState<string | null>(null);
+  const [folderAssetRenameValue, setFolderAssetRenameValue] = useState("");
+  const [renamingFolderAsset, setRenamingFolderAsset] = useState(false);
+  const [activeAssetPickerMenuId, setActiveAssetPickerMenuId] = useState<string | null>(null);
   const [assetPickerKind, setAssetPickerKind] = useState<FolderAsset["kind"] | null>(null);
   const [assetPickerFolderId, setAssetPickerFolderId] = useState<string | null>(null);
   const [assetInsertionPlacement, setAssetInsertionPlacement] = useState<AssetInsertionPlacement>("cursor");
@@ -361,7 +382,8 @@ function WorkspaceClientContent() {
   const [isEditing, setIsEditing] = useState(false);
   const [pendingAiAttachment, setPendingAiAttachment] = useState<PendingAiAttachment | null>(null);
   const [pendingAiEditPreview, setPendingAiEditPreview] = useState<PendingAiEditPreview | null>(null);
-  const [pendingEditorInsertAsset, setPendingEditorInsertAsset] = useState<FolderAsset | null>(null);
+  const [pendingAiScroll, setPendingAiScroll] = useState<PendingAiScroll | null>(null);
+  const [pendingEditorInsert, setPendingEditorInsert] = useState<PendingEditorInsert | null>(null);
   const [selectedText, setSelectedText] = useState("");
   const [recentOpen, setRecentOpen] = useState(true);
   const [showAllRecent, setShowAllRecent] = useState(false);
@@ -371,6 +393,7 @@ function WorkspaceClientContent() {
   const folderCreateInputRef = useRef<HTMLInputElement>(null);
   const copyResetTimerRef = useRef<number | null>(null);
   const editButtonTimerRef = useRef<number | null>(null);
+  const messagesRef = useRef<AIMessage[]>([]);
   const idleTimerRef = useRef<number | null>(null);
   const wasIdleRef = useRef(false);
   const syncInFlightRef = useRef(false);
@@ -393,16 +416,42 @@ function WorkspaceClientContent() {
   }, []);
 
   useEffect(() => {
-    if (!isEditing || !pendingEditorInsertAsset) return;
-    editorRef.current?.insertAsset(pendingEditorInsertAsset, "cursor");
-    setPendingEditorInsertAsset(null);
-  }, [isEditing, pendingEditorInsertAsset]);
+    if (!isEditing || !pendingEditorInsert) return;
+    if (pendingEditorInsert.lineNumber) {
+      editorRef.current?.insertAssetAtLine(pendingEditorInsert.asset, pendingEditorInsert.lineNumber);
+    } else {
+      editorRef.current?.insertAsset(pendingEditorInsert.asset, "cursor");
+    }
+    setPendingEditorInsert(null);
+  }, [isEditing, pendingEditorInsert]);
 
   useEffect(() => {
     if (!isEditing || !pendingAiEditPreview) return;
     editorShellRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
     editorRef.current?.focusRange(pendingAiEditPreview.firstStep.start, pendingAiEditPreview.firstStep.end);
   }, [isEditing, pendingAiEditPreview]);
+
+  useEffect(() => {
+    if (!isEditing || !pendingAiScroll) return;
+    let restoreTimer: number | null = null;
+    const scrollFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        editorRef.current?.scrollToLine(pendingAiScroll.lineNumber, pendingAiScroll.position);
+        if (pendingAiScroll.restoreView) {
+          restoreTimer = window.setTimeout(() => {
+            setIsEditing(false);
+            setPendingAiScroll(null);
+          }, 700);
+          return;
+        }
+        setPendingAiScroll(null);
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(scrollFrame);
+      if (restoreTimer) window.clearTimeout(restoreTimer);
+    };
+  }, [isEditing, pendingAiScroll]);
 
   const documentsByFolder = useMemo(() => {
     const grouped = new Map<string, DocumentRecord[]>();
@@ -438,6 +487,15 @@ function WorkspaceClientContent() {
   const recentDocuments = useMemo(
     () => recentDocumentIds.map((id) => documents.find((item) => item.id === id)).filter((item): item is DocumentRecord => Boolean(item)),
     [documents, recentDocumentIds],
+  );
+  const aiAvailableNotes = useMemo<AINoteReference[]>(
+    () =>
+      documents.map((item) => ({
+        id: item.id,
+        title: item.title || UNTITLED_NOTE_TITLE,
+        folderName: item.folderId ? folderById.get(item.folderId)?.name ?? null : "Workspace",
+      })),
+    [documents, folderById],
   );
   const visibleRecentDocuments = showAllRecent ? recentDocuments : recentDocuments.slice(0, RECENT_NOTE_LIMIT);
   const selectedFolderName = currentFolder?.name ?? "Workspace";
@@ -536,6 +594,10 @@ function WorkspaceClientContent() {
   }, [document]);
 
   useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
     dirtyStateRef.current = dirty;
   }, [dirty]);
 
@@ -612,6 +674,10 @@ function WorkspaceClientContent() {
       setAiPanelCompact(true);
     }
   };
+
+  useEffect(() => {
+    noteSearchRef.current = null;
+  }, [document.id]);
 
   const expandAiPanelToUserHeight = () => {
     setAiPanelCompact(false);
@@ -911,7 +977,24 @@ function WorkspaceClientContent() {
     });
   };
 
+  const isInUploadFolderPath = (folderId: string | null) => {
+    let cursor = folderId;
+    while (cursor) {
+      const folder = folderById.get(cursor);
+      if (!folder) return false;
+      if (folder.name.toLowerCase() === "upload") return true;
+      cursor = folder.parentFolderId;
+    }
+    return false;
+  };
+
   const ensureUploadFolder = async (parentFolderId: string | null) => {
+    const currentFolder = parentFolderId ? folderById.get(parentFolderId) ?? null : null;
+    if (currentFolder && isInUploadFolderPath(parentFolderId)) {
+      expandFolderPath(parentFolderId);
+      return currentFolder;
+    }
+
     const existing = (foldersByParent.get(parentFolderId) ?? []).find((folder) => folder.name.toLowerCase() === "upload");
     if (existing) {
       expandFolderPath(existing.id);
@@ -990,9 +1073,10 @@ function WorkspaceClientContent() {
         type: attachment.mimeType || blob.type || "image/png",
         lastModified: Date.now(),
       });
-      await uploadFolderAsset(selectedFolderId, file);
+      return await uploadFolderAsset(selectedFolderId, file);
     } catch (error) {
       pushError(error instanceof Error ? error.message : "Failed to upload image to the current folder");
+      return null;
     }
   };
 
@@ -1015,6 +1099,7 @@ function WorkspaceClientContent() {
     setAssetPickerKind(kind);
     setAssetPickerFolderId(selectedFolderId);
     setAssetInsertionPlacement("cursor");
+    setActiveAssetPickerMenuId(null);
     setActiveWindow("create");
   };
 
@@ -1041,7 +1126,7 @@ function WorkspaceClientContent() {
     setActiveWindow("ai");
   };
 
-  const addAiAttachmentToNote = (attachment: AIMessageAttachment) => {
+  const addAiAttachmentToNote = (attachment: AIMessageAttachment, options?: { lineNumber?: number }) => {
     if (attachment.kind !== "image" || !attachment.url) {
       pushError("Only generated images can be inserted into the note.");
       return;
@@ -1059,12 +1144,170 @@ function WorkspaceClientContent() {
     };
 
     if (!isEditing) {
-      setPendingEditorInsertAsset(asset);
+      setPendingEditorInsert({ asset, lineNumber: options?.lineNumber });
       enterEditMode();
       return;
     }
 
+    if (options?.lineNumber) {
+      editorRef.current?.insertAssetAtLine(asset, options.lineNumber);
+      return;
+    }
+
     editorRef.current?.insertAsset(asset, "cursor");
+  };
+
+  const insertAiImageFileIntoNote = async (attachment: { fileName: string; mimeType: string; previewUrl: string }, lineNumber?: number) => {
+    const asset = await uploadAiImageToCurrentFolder(attachment);
+    if (!asset) return false;
+
+    if (!isEditing) {
+      setPendingEditorInsert({ asset, lineNumber });
+      enterEditMode();
+      return true;
+    }
+
+    if (lineNumber) {
+      editorRef.current?.insertAssetAtLine(asset, lineNumber);
+    } else {
+      editorRef.current?.insertAsset(asset, "cursor");
+    }
+    return true;
+  };
+
+  const appendAiSummaryToCurrentNote = (summaryMarkdown: string) => {
+    const trimmedSummary = summaryMarkdown.trim();
+    if (!trimmedSummary) return;
+    const currentBody = documentStateRef.current.bodyMarkdown;
+    const separator = currentBody.trim() ? "\n\n" : "";
+    updateDocument({
+      bodyMarkdown: ensureTrailingNewlines(`${currentBody.replace(/\s+$/g, "")}${separator}${trimmedSummary}`),
+    });
+  };
+
+  const latestGeneratedImageAttachment = (preferred: AIMessageAttachment[] = []) =>
+    [...messagesRef.current.flatMap((message) => (message.role === "assistant" ? message.attachments ?? [] : [])), ...preferred]
+      .reverse()
+      .find((attachment) => attachment.kind === "image" && attachment.origin === "generated" && Boolean(attachment.url)) ?? null;
+
+  const openNoteByAiAction = (action: { noteId?: string; title?: string }) => {
+    const normalizedTitle = action.title?.trim().toLowerCase();
+    const target =
+      documents.find((item) => action.noteId && item.id === action.noteId) ??
+      documents.find((item) => normalizedTitle && (item.title || UNTITLED_NOTE_TITLE).trim().toLowerCase() === normalizedTitle);
+
+    if (!target) {
+      pushError(action.title ? `Note not found: ${action.title}` : "The note requested by AI was not found.");
+      return false;
+    }
+
+    selectDocument(target);
+    noteSearchRef.current = null;
+    return true;
+  };
+
+  const scrollNoteByAiAction = (action: { target: "top" | "middle" | "bottom" | "line" | "up" | "down"; lineNumber?: number; pixels?: number }) => {
+    if (action.target === "up" || action.target === "down") {
+      const pixels = Math.max(1, Math.floor(action.pixels ?? 300));
+      editorRef.current?.scrollByPixels(action.target === "up" ? -pixels : pixels);
+      return true;
+    }
+
+    const lineCount = Math.max(1, document.bodyMarkdown.split("\n").length);
+    const scrollToEditorLine = (lineNumber: number, position: "top" | "middle" | "bottom") => {
+      const restoreView = !isEditing;
+      setPendingAiScroll({ lineNumber, position, restoreView });
+      if (restoreView) {
+        setEditButtonVisible(false);
+        setIsEditing(true);
+        return;
+      }
+      editorRef.current?.scrollToLine(lineNumber, position);
+    };
+
+    if (action.target === "line") {
+      const lineNumber = Math.max(1, Math.floor(action.lineNumber ?? 1));
+      scrollToEditorLine(lineNumber, "top");
+      return true;
+    }
+
+    const position = action.target;
+    const lineNumber =
+      position === "bottom" ? lineCount : position === "middle" ? Math.ceil(lineCount / 2) : 1;
+    scrollToEditorLine(lineNumber, position);
+    return true;
+  };
+
+  const findNoteByAiAction = (action: { query: string; occurrence?: "first" | "next" | "previous" }) => {
+    const query = action.query.trim();
+    if (!query) return false;
+    const needle = normalizeSearchNeedle(query);
+    const body = document.bodyMarkdown.toLowerCase();
+    const matches: Array<{ start: number; end: number }> = [];
+    let index = body.indexOf(needle);
+    while (index >= 0) {
+      matches.push({ start: index, end: index + needle.length });
+      index = body.indexOf(needle, index + needle.length);
+    }
+    if (matches.length === 0) {
+      pushError(`No match found for: ${query}`);
+      return false;
+    }
+
+    const occurrence = action.occurrence ?? "next";
+    const searchState = noteSearchRef.current;
+    let targetIndex = 0;
+    if (occurrence === "previous") {
+      targetIndex = searchState?.query === needle ? (searchState.index - 1 + matches.length) % matches.length : matches.length - 1;
+    } else if (occurrence === "next") {
+      targetIndex = searchState?.query === needle ? (searchState.index + 1) % matches.length : 0;
+    } else if (occurrence === "first") {
+      targetIndex = 0;
+    }
+    const target = matches[targetIndex];
+    noteSearchRef.current = { noteId: document.id, query: needle, index: targetIndex };
+    editorRef.current?.focusRange(target.start, target.end);
+    return true;
+  };
+
+  const handleAiActions = async (actions: AIResponseAction[] | undefined, generatedAttachments: AIMessageAttachment[]) => {
+    if (!actions?.length) return;
+
+    for (const action of actions) {
+      if (action.type === "open_note") {
+        openNoteByAiAction(action);
+        continue;
+      }
+
+      if (action.type === "scroll_note") {
+        scrollNoteByAiAction(action);
+        continue;
+      }
+
+      if (action.type === "find_note") {
+        findNoteByAiAction(action);
+        continue;
+      }
+
+      const latestImage = latestGeneratedImageAttachment(generatedAttachments);
+      if (!latestImage?.url) {
+        pushError("No generated image is available for that AI action.");
+        continue;
+      }
+
+      if (action.type === "upload_latest_image") {
+        await uploadAiImageToCurrentFolder({
+          fileName: latestImage.fileName,
+          mimeType: latestImage.mimeType,
+          previewUrl: latestImage.url,
+        });
+        continue;
+      }
+
+      if (action.type === "insert_latest_image") {
+        addAiAttachmentToNote(latestImage, { lineNumber: action.lineNumber });
+      }
+    }
   };
 
   const askAi = async ({
@@ -1116,6 +1359,7 @@ function WorkspaceClientContent() {
         mode,
         selection: selectedText.trim() || undefined,
         attachments,
+        availableNotes: aiAvailableNotes,
       }, {
         onDelta: (delta) => {
           setMessages((current) =>
@@ -1174,6 +1418,7 @@ function WorkspaceClientContent() {
           if (reply.substitutions.length > 0) {
             applyAiEdits(reply.substitutions);
           }
+          await handleAiActions(reply.actions, generatedAttachments);
         },
       });
       return true;
@@ -1219,6 +1464,69 @@ function WorkspaceClientContent() {
 
   const openFolderAsset = (asset: FolderAsset) => {
     setSelectedFolderAsset(asset);
+    setActiveFolderAssetMenuId(null);
+    setActiveAssetPickerMenuId(null);
+  };
+
+  const getFolderPathSegments = (folderId: string | null) => {
+    const segments: string[] = [];
+    const seen = new Set<string>();
+    let cursor = folderId;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      const folder = folderById.get(cursor);
+      if (!folder) break;
+      segments.unshift(folder.name);
+      cursor = folder.parentFolderId;
+    }
+    return segments;
+  };
+
+  const getFolderAssetDirectPath = (asset: FolderAsset) => {
+    const segments = [...getFolderPathSegments(asset.folderId), asset.fileName];
+    return `/folder/${segments.map((segment) => encodeURIComponent(segment)).join("/")}`;
+  };
+
+  const normalizeFolderAssetFileName = (fileName: string) => {
+    const trimmed = fileName.trim();
+    if (!trimmed || trimmed.length > 180 || /[\\/]/.test(trimmed)) return null;
+    return trimmed;
+  };
+
+  const beginFolderAssetRename = (asset: FolderAsset) => {
+    setRenamingFolderAssetId(asset.id);
+    setFolderAssetRenameValue(asset.fileName);
+    setActiveFolderAssetMenuId(asset.id);
+    setActiveAssetPickerMenuId(asset.id);
+  };
+
+  const cancelFolderAssetRename = () => {
+    setRenamingFolderAssetId(null);
+    setFolderAssetRenameValue("");
+  };
+
+  const renameFolderAsset = async (asset: FolderAsset) => {
+    const fileName = normalizeFolderAssetFileName(folderAssetRenameValue);
+    if (!fileName) {
+      pushError("Use a file name without slashes.");
+      return;
+    }
+    if (fileName === asset.fileName) {
+      cancelFolderAssetRename();
+      return;
+    }
+
+    setRenamingFolderAsset(true);
+    try {
+      const updated = await apiClient.renameFolderAsset(asset.id, fileName);
+      setFolderAssets((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      setSelectedFolderAsset((current) => (current?.id === updated.id ? updated : current));
+      cancelFolderAssetRename();
+    } catch (error) {
+      pushError(error instanceof Error ? error.message : "Failed to rename file");
+    } finally {
+      setRenamingFolderAsset(false);
+    }
   };
 
   const toggleAndSelectFolder = (folderId: string) => {
@@ -1239,7 +1547,7 @@ function WorkspaceClientContent() {
   const copyPreviewUrl = async () => {
     if (!selectedFolderAsset) return;
     try {
-      const fullUrl = new URL(selectedFolderAsset.url, window.location.origin).toString();
+      const fullUrl = new URL(getFolderAssetDirectPath(selectedFolderAsset), window.location.origin).toString();
       await navigator.clipboard.writeText(fullUrl);
       setPreviewUrlCopied(true);
       if (copyResetTimerRef.current) window.clearTimeout(copyResetTimerRef.current);
@@ -1260,37 +1568,162 @@ function WorkspaceClientContent() {
     }
   }, [selectedFolderAsset?.url]);
 
-  const renderFolderAssetRow = (asset: FolderAsset, depth = 0) => {
-    const active = selectedFolderAsset?.id === asset.id;
+  const insertFolderAssetFromPicker = (asset: FolderAsset) => {
+    editorRef.current?.insertAsset(asset, assetInsertionPlacement);
+    setActiveWindow(null);
+    setAssetPickerKind(null);
+    setActiveAssetPickerMenuId(null);
+  };
+
+  const renderFolderAssetMiniMenu = (
+    asset: FolderAsset,
+    options: { selectLabel?: string; onSelect?: () => void },
+  ) => {
+    const renaming = renamingFolderAssetId === asset.id;
     return (
-      <button
-        key={asset.id}
-        className={`grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl px-3 py-2 text-left text-sm transition ${
-          active ? "bg-ink/5" : "bg-white hover:bg-mist"
-        }`}
-        style={{ paddingLeft: `${12 + depth * 14}px` }}
-        type="button"
-        onClick={() => openFolderAsset(asset)}
-      >
-        <div className="flex min-w-0 items-center gap-2">
-          <svg aria-hidden="true" className="h-4 w-4 shrink-0 text-ink/55" fill="none" viewBox="0 0 24 24">
-            <path
-              d="M6.5 4.5h5.7L17 9.3V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 5 19V6A1.5 1.5 0 0 1 6.5 4.5Z"
-              stroke="currentColor"
-              strokeLinejoin="round"
-              strokeWidth="1.5"
+      <div className="grid gap-2 rounded-2xl bg-black/[0.035] p-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            className="rounded-full bg-ink px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-ink/90"
+            onClick={() => openFolderAsset(asset)}
+            type="button"
+          >
+            View
+          </button>
+          {options.onSelect ? (
+            <button
+              className="rounded-full bg-white px-3 py-1.5 text-xs font-semibold text-ink transition hover:bg-mist"
+              onClick={options.onSelect}
+              type="button"
+            >
+              {options.selectLabel ?? "Select"}
+            </button>
+          ) : null}
+          <button
+            className="rounded-full bg-white px-3 py-1.5 text-xs font-semibold text-ink transition hover:bg-mist"
+            onClick={() => beginFolderAssetRename(asset)}
+            type="button"
+          >
+            Rename
+          </button>
+        </div>
+        {renaming ? (
+          <form
+            className="flex items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void renameFolderAsset(asset);
+            }}
+          >
+            <input
+              autoFocus
+              className="min-w-0 flex-1 rounded-xl bg-white px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:bg-white"
+              disabled={renamingFolderAsset}
+              onChange={(event) => setFolderAssetRenameValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  cancelFolderAssetRename();
+                }
+              }}
+              value={folderAssetRenameValue}
             />
-            <path d="M12 4.5V9h4.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
-          </svg>
-          <span className="min-w-0 truncate font-medium text-ink">{asset.fileName}</span>
-        </div>
-        <div className="flex shrink-0 items-center gap-2 text-[10px] font-medium uppercase tracking-[0.14em] text-ink/55">
-          <span className="rounded-full bg-black/[0.04] px-2 py-1">{formatAssetKind(asset.kind)}</span>
-          <span>{formatBytes(asset.sizeBytes)}</span>
-        </div>
-      </button>
+            <button
+              className="rounded-xl bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={renamingFolderAsset || !folderAssetRenameValue.trim()}
+              type="submit"
+            >
+              OK
+            </button>
+            <button
+              className="rounded-xl bg-white px-3 py-2 text-sm font-semibold text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={renamingFolderAsset}
+              onClick={cancelFolderAssetRename}
+              type="button"
+            >
+              Cancel
+            </button>
+          </form>
+        ) : null}
+        <div className="truncate px-1 text-xs text-ink/45">{getFolderAssetDirectPath(asset)}</div>
+        {asset.kind === "image" ? (
+          <button
+            className="w-fit overflow-hidden rounded-xl bg-white text-left"
+            onClick={() => openFolderAsset(asset)}
+            type="button"
+          >
+            <img alt={asset.fileName} className="h-20 w-28 object-cover" src={asset.url} />
+          </button>
+        ) : null}
+      </div>
     );
   };
+
+  const renderFolderAssetRow = (asset: FolderAsset, depth = 0) => {
+    const active = selectedFolderAsset?.id === asset.id || activeFolderAssetMenuId === asset.id;
+    return (
+      <div key={asset.id} className="grid gap-1" style={{ paddingLeft: `${depth * 14}px` }}>
+        <button
+          className={`grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl px-3 py-2 text-left text-sm transition ${
+            active ? "bg-ink/5" : "bg-white hover:bg-mist"
+          }`}
+          type="button"
+          onClick={() => {
+            setActiveFolderAssetMenuId((current) => (current === asset.id ? null : asset.id));
+            setActiveAssetPickerMenuId(null);
+          }}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <svg aria-hidden="true" className="h-4 w-4 shrink-0 text-ink/55" fill="none" viewBox="0 0 24 24">
+              <path
+                d="M6.5 4.5h5.7L17 9.3V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 5 19V6A1.5 1.5 0 0 1 6.5 4.5Z"
+                stroke="currentColor"
+                strokeLinejoin="round"
+                strokeWidth="1.5"
+              />
+              <path d="M12 4.5V9h4.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
+            </svg>
+            <span className="min-w-0 truncate font-medium text-ink">{asset.fileName}</span>
+          </div>
+          <div className="flex shrink-0 items-center gap-2 text-[10px] font-medium uppercase tracking-[0.14em] text-ink/55">
+            <span className="rounded-full bg-black/[0.04] px-2 py-1">{formatAssetKind(asset.kind)}</span>
+            <span>{formatBytes(asset.sizeBytes)}</span>
+          </div>
+        </button>
+        {activeFolderAssetMenuId === asset.id ? (
+          <div style={{ paddingLeft: `${12 + depth * 14}px` }}>
+            {renderFolderAssetMiniMenu(asset, {})}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderAssetPickerRow = (asset: FolderAsset) => (
+    <div className="grid gap-1" key={asset.id}>
+      <button
+        className={`flex items-center justify-between gap-3 rounded-2xl px-4 py-3 text-left transition ${
+          activeAssetPickerMenuId === asset.id ? "bg-ink/5" : "bg-white hover:bg-mist"
+        }`}
+        onClick={() => {
+          setActiveAssetPickerMenuId((current) => (current === asset.id ? null : asset.id));
+          setActiveFolderAssetMenuId(null);
+        }}
+        type="button"
+      >
+        <span className="min-w-0 flex-1 truncate font-medium text-ink">{asset.fileName}</span>
+        <span className="text-xs uppercase tracking-[0.18em] text-ink/45">{formatBytes(asset.sizeBytes)}</span>
+      </button>
+      {activeAssetPickerMenuId === asset.id ? (
+        <div className="px-1">
+          {renderFolderAssetMiniMenu(asset, {
+            selectLabel: "Select",
+            onSelect: () => insertFolderAssetFromPicker(asset),
+          })}
+        </div>
+      ) : null}
+    </div>
+  );
 
   const renderFolderNode = (folder: FolderRecord, depth = 0): React.ReactNode => {
     const isOpen = expandedFolderIds.includes(folder.id);
@@ -1545,7 +1978,7 @@ function WorkspaceClientContent() {
                           <div className="min-w-0">
                             <div className="text-xs font-semibold uppercase tracking-[0.24em] text-ink/45">Preview</div>
                             <div className="mt-1 max-w-full truncate text-sm font-medium text-ink">
-                              {shortenMiddle(selectedFolderAsset.url, 10, 10)}
+                              {shortenMiddle(getFolderAssetDirectPath(selectedFolderAsset), 14, 18)}
                             </div>
                           </div>
                           <div className="flex items-center gap-1">
@@ -1864,21 +2297,7 @@ function WorkspaceClientContent() {
                               No files yet.
                             </div>
                           ) : (
-                            assetPickerAssets.map((asset) => (
-                              <button
-                                className="flex items-center justify-between gap-3 rounded-2xl bg-white px-4 py-3 text-left transition hover:bg-mist"
-                                key={asset.id}
-                                onClick={() => {
-                                  editorRef.current?.insertAsset(asset, assetInsertionPlacement);
-                                  setActiveWindow(null);
-                                  setAssetPickerKind(null);
-                                }}
-                                type="button"
-                              >
-                                <span className="min-w-0 flex-1 truncate font-medium text-ink">{asset.fileName}</span>
-                                <span className="text-xs uppercase tracking-[0.18em] text-ink/45">{formatBytes(asset.sizeBytes)}</span>
-                              </button>
-                            ))
+                            assetPickerAssets.map((asset) => renderAssetPickerRow(asset))
                           )}
                         </div>
                       </div>
@@ -2006,9 +2425,12 @@ function WorkspaceClientContent() {
                       currentFolderFiles={aiCurrentFolderFiles}
                       currentFolderName={selectedFolderName}
                       currentNoteBodyMarkdown={document.bodyMarkdown}
+                      currentNoteId={document.id}
                       currentNoteTitle={document.title}
                       messages={messages}
+                      noteCatalog={aiAvailableNotes}
                       onAddAttachmentToNote={addAiAttachmentToNote}
+                      onAppendToCurrentNote={appendAiSummaryToCurrentNote}
                       onApply={applyAiEdits}
                       onAsk={askAi}
                       onCreatePrompt={async (value) => {
@@ -2033,6 +2455,10 @@ function WorkspaceClientContent() {
                       providerSettings={settings}
                       selectedText={selectedText}
                       storedPanelHeight={loadAiPanelHeight()}
+                      onInsertGeneratedImageInNote={insertAiImageFileIntoNote}
+                      onFindInNote={findNoteByAiAction}
+                      onOpenNote={openNoteByAiAction}
+                      onScrollNote={scrollNoteByAiAction}
                       onPanelHeightChange={saveAiPanelHeight}
                       onUploadImageToCurrentFolder={uploadAiImageToCurrentFolder}
                     />
