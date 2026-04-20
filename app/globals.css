@@ -81,7 +81,7 @@ body::-webkit-scrollbar {
 
 .markdown-preview .note-embedded-image,
 .markdown-preview .markdown-inline-image {
-  @apply max-h-[200px] max-w-[200px] rounded-xl object-cover;
+  @apply h-[200px] w-auto rounded-xl object-contain;
 }
 
 .markdown-preview .note-embedded-video {

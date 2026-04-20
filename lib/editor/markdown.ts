@@ -67,10 +67,19 @@ function restorePlaceholders(value: string, blocks: string[]) {
 }
 
 function sanitizeAllowedHtml(value: string) {
-  return value
+  const sanitized = value
     .replace(/\son\w+=(?:"[^"]*"|'[^']*')/gi, "")
     .replace(/\sstyle=(?:"[^"]*"|'[^']*')/gi, "")
     .replace(/<script\b[\s\S]*?<\/script>/gi, "");
+  return addLazyLoadingToImages(sanitized);
+}
+
+function addLazyLoadingToImages(value: string) {
+  return value.replace(/<img\b[^>]*>/gi, (match) => {
+    if (/\sloading=(?:"[^"]*"|'[^']*')/i.test(match)) return match;
+    const closing = match.endsWith("/>") ? " />" : ">";
+    return `${match.replace(/\s*\/?>$/, "")} loading="lazy"${closing}`;
+  });
 }
 
 function convertInlineHtmlToMarkdown(value: string): string {
@@ -141,7 +150,7 @@ function inlineMarkdownToHtml(value: string) {
         const safeUrl = escapeAttribute(url);
         const safeAlt = escapeAttribute(alt);
         const titleAttribute = title ? ` title="${escapeAttribute(title)}"` : "";
-        return `<img class="markdown-inline-image" src="${safeUrl}" alt="${safeAlt}"${titleAttribute} />`;
+        return `<img class="markdown-inline-image" src="${safeUrl}" alt="${safeAlt}"${titleAttribute} loading="lazy" />`;
       })
       .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, label: string, url: string) => {
         const safeUrl = escapeAttribute(url);

@@ -1272,9 +1272,9 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                           }}
                           title={preview.tagText}
                         >
-                          <div className="flex max-w-[200px] shrink-0 items-start justify-start overflow-hidden">
+                          <div className="flex shrink-0 items-start justify-start overflow-hidden">
                             {preview.kind === "image" ? (
-                              <img alt="" className="max-h-[200px] max-w-[200px] rounded-xl object-cover" src={preview.src} />
+                              <img alt="" className="h-[200px] w-auto rounded-xl object-contain" loading="lazy" src={preview.src} />
                             ) : preview.kind === "audio" ? (
                               <audio className="mt-2 h-10 w-[200px]" controls preload="metadata" src={preview.src} />
                             ) : (

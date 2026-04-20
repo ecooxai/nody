@@ -67,6 +67,11 @@ type LiveSessionState = {
   status: string;
 };
 
+const LIVE_MIC_SPEECH_RMS_THRESHOLD = 0.006;
+const LIVE_MIC_SPEECH_START_MS = 80;
+const LIVE_MIC_TRAILING_AUDIO_MS = 450;
+const LIVE_MIC_TURN_END_SILENCE_MS = 850;
+
 export type LiveSendAttachment = {
   kind: AIMediaKind;
   fileName: string;
@@ -807,7 +812,7 @@ export function LiveTalkPanel({
   const socketSessionIdRef = useRef(0);
   const userTurnIdRef = useRef<string | null>(null);
   const userAudioChunksRef = useRef<Uint8Array[]>([]);
-  const pendingUserAudioChunksRef = useRef<Array<{ encodedAudio: string; bytes: Uint8Array }>>([]);
+  const pendingUserAudioChunksRef = useRef<Uint8Array[]>([]);
   const userAudioActiveRef = useRef(false);
   const userAudioSpeechStartMsRef = useRef(0);
   const userAudioTrailingSilenceMsRef = useRef(0);
@@ -1383,11 +1388,14 @@ export function LiveTalkPanel({
               }),
             );
           };
+          const hasSpeech = rms >= LIVE_MIC_SPEECH_RMS_THRESHOLD;
 
-          if (rms >= 0.018 && !userAudioActiveRef.current) {
-            pendingUserAudioChunksRef.current.push({ encodedAudio, bytes: audioBytes });
+          sendAudioChunk(encodedAudio);
+
+          if (hasSpeech && !userAudioActiveRef.current) {
+            pendingUserAudioChunksRef.current.push(audioBytes);
             userAudioSpeechStartMsRef.current += chunkDurationMs;
-            if (userAudioSpeechStartMsRef.current < 180) {
+            if (userAudioSpeechStartMsRef.current < LIVE_MIC_SPEECH_START_MS) {
               return;
             }
             userAudioSelectionContextRef.current = sendSelectedTextContext(socketConnection);
@@ -1396,31 +1404,28 @@ export function LiveTalkPanel({
             userAudioActiveRef.current = true;
             userAudioTrailingSilenceMsRef.current = 0;
             for (const chunk of pendingUserAudioChunksRef.current) {
-              sendAudioChunk(chunk.encodedAudio);
-              userAudioChunksRef.current.push(chunk.bytes);
+              userAudioChunksRef.current.push(chunk);
             }
             pendingUserAudioChunksRef.current = [];
             userAudioSpeechStartMsRef.current = 0;
             return;
           }
 
-          if (rms >= 0.018 && userAudioActiveRef.current) {
+          if (hasSpeech && userAudioActiveRef.current) {
             userAudioTrailingSilenceMsRef.current = 0;
-            sendAudioChunk(encodedAudio);
             userAudioChunksRef.current.push(audioBytes);
             return;
           }
 
-          if (userAudioActiveRef.current && userAudioTrailingSilenceMsRef.current < 450) {
+          if (userAudioActiveRef.current && userAudioTrailingSilenceMsRef.current < LIVE_MIC_TRAILING_AUDIO_MS) {
             userAudioTrailingSilenceMsRef.current += chunkDurationMs;
-            sendAudioChunk(encodedAudio);
             userAudioChunksRef.current.push(audioBytes);
             return;
           }
 
           if (userAudioActiveRef.current) {
             userAudioTrailingSilenceMsRef.current += chunkDurationMs;
-            if (userAudioTrailingSilenceMsRef.current >= 850) {
+            if (userAudioTrailingSilenceMsRef.current >= LIVE_MIC_TURN_END_SILENCE_MS) {
               userAudioActiveRef.current = false;
               userAudioSpeechStartMsRef.current = 0;
               userAudioTrailingSilenceMsRef.current = 0;
