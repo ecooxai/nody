@@ -274,7 +274,7 @@ export async function syncDocument(
 export async function getSettings(db: DB, userId: string): Promise<ProviderSettings | null> {
   const row = await db
     .prepare(
-      "SELECT provider, api_url, api_key, model, COALESCE(live_model, '') AS live_model, COALESCE(image_model, '') AS image_model, COALESCE(live_echo_cancellation, 1) AS live_echo_cancellation, COALESCE(live_noise_suppression, 0) AS live_noise_suppression, COALESCE(live_auto_gain_control, 0) AS live_auto_gain_control, COALESCE(live_silence_trim, 1) AS live_silence_trim, COALESCE(live_speech_threshold, 0.007) AS live_speech_threshold, COALESCE(live_trim_sensitivity, 0.18) AS live_trim_sensitivity FROM provider_settings WHERE user_id = ?",
+      "SELECT provider, api_url, api_key, model, COALESCE(live_model, '') AS live_model, COALESCE(image_model, '') AS image_model, COALESCE(live_echo_cancellation, 1) AS live_echo_cancellation, COALESCE(live_noise_suppression, 0) AS live_noise_suppression, COALESCE(live_standby_enabled, 1) AS live_standby_enabled, COALESCE(live_auto_gain_control, 0) AS live_auto_gain_control, COALESCE(live_silence_trim, 1) AS live_silence_trim, COALESCE(live_speech_threshold, 0.007) AS live_speech_threshold, COALESCE(live_trim_sensitivity, 0.18) AS live_trim_sensitivity FROM provider_settings WHERE user_id = ?",
     )
     .bind(userId)
     .first<Record<string, unknown>>();
@@ -299,6 +299,7 @@ export async function getSettings(db: DB, userId: string): Promise<ProviderSetti
     liveRecording: {
       echoCancellation: Boolean(Number(row.live_echo_cancellation)),
       noiseSuppression: Boolean(Number(row.live_noise_suppression)),
+      standbyEnabled: Boolean(Number(row.live_standby_enabled)),
     },
   };
 }
@@ -308,7 +309,7 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
   const liveRecording = { ...defaultLiveRecordingSettings, ...(settings.liveRecording ?? {}) };
   await db
     .prepare(
-      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_model, image_model, live_echo_cancellation, live_noise_suppression, live_auto_gain_control, live_silence_trim, live_speech_threshold, live_trim_sensitivity, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_model = excluded.live_model, image_model = excluded.image_model, live_echo_cancellation = excluded.live_echo_cancellation, live_noise_suppression = excluded.live_noise_suppression, live_auto_gain_control = excluded.live_auto_gain_control, live_silence_trim = excluded.live_silence_trim, live_speech_threshold = excluded.live_speech_threshold, live_trim_sensitivity = excluded.live_trim_sensitivity, updated_at = excluded.updated_at",
+      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_model, image_model, live_echo_cancellation, live_noise_suppression, live_standby_enabled, live_auto_gain_control, live_silence_trim, live_speech_threshold, live_trim_sensitivity, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_model = excluded.live_model, image_model = excluded.image_model, live_echo_cancellation = excluded.live_echo_cancellation, live_noise_suppression = excluded.live_noise_suppression, live_standby_enabled = excluded.live_standby_enabled, live_auto_gain_control = excluded.live_auto_gain_control, live_silence_trim = excluded.live_silence_trim, live_speech_threshold = excluded.live_speech_threshold, live_trim_sensitivity = excluded.live_trim_sensitivity, updated_at = excluded.updated_at",
     )
     .bind(
       userId,
@@ -320,6 +321,7 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
       settings.imageModel ?? "",
       liveRecording.echoCancellation ? 1 : 0,
       liveRecording.noiseSuppression ? 1 : 0,
+      liveRecording.standbyEnabled ? 1 : 0,
       0,
       0,
       0.007,

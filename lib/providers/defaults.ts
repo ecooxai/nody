@@ -3,6 +3,7 @@ import type { LiveRecordingSettings, ProviderName, ProviderSettings } from "@/sh
 export const defaultLiveRecordingSettings: LiveRecordingSettings = {
   echoCancellation: true,
   noiseSuppression: false,
+  standbyEnabled: true,
 };
 
 export const providerDefaults: Record<

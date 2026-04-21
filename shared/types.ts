@@ -4,6 +4,7 @@ export type AIMediaKind = "image" | "audio" | "video";
 export type LiveRecordingSettings = {
   echoCancellation: boolean;
   noiseSuppression: boolean;
+  standbyEnabled: boolean;
 };
 
 export type DocumentAsset = {

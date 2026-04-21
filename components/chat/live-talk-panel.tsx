@@ -63,15 +63,28 @@ type LiveMessage =
     };
 
 type LiveSessionState = {
+  listening: boolean;
+  standby: boolean;
   connecting: boolean;
   ready: boolean;
   status: string;
 };
 
 const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.45;
-const LIVE_RECORDING_NO_ECHO_GAIN = 3;
+const LIVE_RECORDING_SEND_GAIN = 3;
 const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
+const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
+const LIVE_STANDBY_PREROLL_MS = 2_000;
+const LIVE_STANDBY_BUFFER_LIMIT_MS = 8_000;
+const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
+const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
+const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
+const LIVE_STANDBY_VOICE_TRIGGER_MS = 2_000;
+const LIVE_STANDBY_NOISE_UPDATE_DB = 4;
+const LIVE_SPEECH_END_TRIGGER_DB = 6;
+const LIVE_SPEECH_END_MIN_SPEECH_MS = 350;
+const LIVE_SPEECH_END_TRAILING_SILENCE_MS = 900;
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 
 export type LiveSendAttachment = {
@@ -133,6 +146,19 @@ type LiveImageContext = {
   source: "upload" | "folder";
   dataBase64: string;
 };
+
+type PendingLiveAction =
+  | {
+      kind: "text";
+      text: string;
+      options?: { displayText?: string };
+    }
+  | {
+      kind: "attachment";
+      attachment: LiveSendAttachment;
+      resolve: (value: boolean) => void;
+      reject: (error: unknown) => void;
+    };
 
 const LIVE_IMAGE_GENERATION_NOTICE = "i'll generate image now";
 const LIVE_CONTEXT_TOKEN_LIMIT = 16_000;
@@ -273,7 +299,8 @@ function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
 }
 
 function getLiveRecordingCaptureGain(settings: LiveRecordingSettings) {
-  return settings.echoCancellation ? 1 : LIVE_RECORDING_NO_ECHO_GAIN;
+  void settings;
+  return LIVE_RECORDING_SEND_GAIN;
 }
 
 function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
@@ -825,9 +852,11 @@ export function LiveTalkPanel({
   sessionRequested: boolean;
   speechPrompt?: string;
 }) {
+  const initialLiveRecordingSettings = normalizeLiveRecordingSettings(providerSettings.liveRecording);
   const [connecting, setConnecting] = useState(false);
   const [ready, setReady] = useState(false);
   const [status, setStatus] = useState("Open the Live tab to start a session.");
+  const [socketRequested, setSocketRequested] = useState(() => !initialLiveRecordingSettings.standbyEnabled);
   const [turns, setTurns] = useState<LiveTurn[]>([]);
   const [previewImage, setPreviewImage] = useState<LiveGeneratedImage | null>(null);
   const [connectionRevision, setConnectionRevision] = useState(0);
@@ -861,11 +890,14 @@ export function LiveTalkPanel({
   const assistantPlaybackMutedUntilRef = useRef(0);
   const liveAssistantTurnIdRef = useRef<string | null>(null);
   const readyRef = useRef(false);
+  const connectingRef = useRef(false);
   const activeRef = useRef(active);
-  const microphoneCaptureEnabledRef = useRef(active && (microphoneEnabled ?? true));
+  const sessionRequestedRef = useRef(sessionRequested);
+  const socketRequestedRef = useRef(!initialLiveRecordingSettings.standbyEnabled);
+  const microphoneCaptureEnabledRef = useRef(sessionRequested && active && (microphoneEnabled ?? true));
   const microphoneEnabledRef = useRef(microphoneEnabled ?? true);
   const preferredMicrophoneDeviceIdRef = useRef<string | null>(microphoneDeviceId ?? null);
-  const liveRecordingSettingsRef = useRef<LiveRecordingSettings>(normalizeLiveRecordingSettings(providerSettings.liveRecording));
+  const liveRecordingSettingsRef = useRef<LiveRecordingSettings>(initialLiveRecordingSettings);
   const requestMicrophoneRef = useRef<() => Promise<MediaStream | null>>(async () => null);
   const resetMicrophoneRef = useRef(() => {});
   const noteContext = useMemo(
@@ -893,8 +925,11 @@ export function LiveTalkPanel({
   const userAudioChunksRef = useRef<Uint8Array[]>([]);
   const pendingUserAudioChunksRef = useRef<Uint8Array[]>([]);
   const pendingUserAudioBase64ChunksRef = useRef<string[]>([]);
+  const pendingUserAudioChunkDurationsRef = useRef<number[]>([]);
+  const pendingUserAudioDurationMsRef = useRef(0);
   const userAudioActiveRef = useRef(false);
   const userAudioSentToModelRef = useRef(false);
+  const userAudioStreamEndedRef = useRef(false);
   const userAudioSpeechDurationMsRef = useRef(0);
   const userAudioSpeechStartMsRef = useRef(0);
   const userAudioTrailingSilenceMsRef = useRef(0);
@@ -929,9 +964,21 @@ export function LiveTalkPanel({
   const userAudioPromptContextRef = useRef("");
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const assistantReplyTimeoutRef = useRef<number | null>(null);
   const pendingGeneratedImageScrollRef = useRef(false);
   const liveContextTokensRef = useRef(0);
   const contextLimitHandlingRef = useRef(false);
+  const standbyPreRollRef = useRef<Array<{ bytes: Uint8Array; base64: string; durationMs: number }>>([]);
+  const standbyPreRollDurationMsRef = useRef(0);
+  const standbyNoiseFloorDbRef = useRef<number | null>(null);
+  const standbyNoiseCalibrationMsRef = useRef(0);
+  const standbySpeechBoostMsRef = useRef(0);
+  const voiceActivationPendingRef = useRef(false);
+  const queuedLiveActionsRef = useRef<PendingLiveAction[]>([]);
+  const performLiveTextSendRef = useRef<(text: string, options?: { displayText?: string }) => boolean>(() => false);
+  const performLiveAttachmentSendRef = useRef<(attachment: LiveSendAttachment) => Promise<boolean>>(async () => false);
+  const prepareSpeechTurnRef = useRef<(socketConnection: WebSocket) => void>(() => {});
+  const flushPendingSpeechAudioRef = useRef<() => void>(() => {});
 
   const showHistoryNotice = useCallback((content: string) => {
     if (historyNoticeTimerRef.current) {
@@ -971,6 +1018,115 @@ export function LiveTalkPanel({
         return;
       }
       resumeLiveSpeechRecordingRef.current();
+    }
+  }, []);
+
+  const clearAssistantReplyTimeout = useCallback(() => {
+    if (assistantReplyTimeoutRef.current) {
+      window.clearTimeout(assistantReplyTimeoutRef.current);
+      assistantReplyTimeoutRef.current = null;
+    }
+  }, []);
+
+  const standbyStatusMessage = useCallback(() => {
+    return liveRecordingSettingsRef.current.standbyEnabled
+      ? "Standby listening. Speak louder for about 2 seconds or send a message to reconnect."
+      : "Live talk disconnected.";
+  }, []);
+
+  const resetStandbyVoiceActivationState = useCallback((options?: { resetNoiseFloor?: boolean }) => {
+    if (options?.resetNoiseFloor) {
+      standbyNoiseFloorDbRef.current = null;
+      standbyNoiseCalibrationMsRef.current = 0;
+    } else if (standbyNoiseFloorDbRef.current !== null) {
+      standbyNoiseCalibrationMsRef.current = LIVE_STANDBY_NOISE_CALIBRATION_MS;
+    }
+    standbySpeechBoostMsRef.current = 0;
+  }, []);
+
+  const finalizeSpeechCaptureState = useCallback(() => {
+    finalizeUserAudioRef.current();
+    clearAssistantReplyTimeout();
+    standbyPreRollRef.current = [];
+    standbyPreRollDurationMsRef.current = 0;
+    resetStandbyVoiceActivationState();
+    voiceActivationPendingRef.current = false;
+  }, [clearAssistantReplyTimeout, resetStandbyVoiceActivationState]);
+
+  const enterStandby = useCallback((message?: string) => {
+    if (!sessionRequestedRef.current) return;
+    clearAssistantReplyTimeout();
+    setConnecting(false);
+    setReady(false);
+    setSocketRequested(false);
+    finalizeSpeechCaptureState();
+    setStatus(message ?? standbyStatusMessage());
+  }, [clearAssistantReplyTimeout, finalizeSpeechCaptureState, standbyStatusMessage]);
+
+  const armAssistantReplyTimeout = useCallback(() => {
+    clearAssistantReplyTimeout();
+    if (!sessionRequestedRef.current || !liveRecordingSettingsRef.current.standbyEnabled) return;
+    assistantReplyTimeoutRef.current = window.setTimeout(() => {
+      assistantReplyTimeoutRef.current = null;
+      enterStandby("No AI reply for 20 seconds. Back in standby listening.");
+    }, LIVE_STANDBY_REPLY_TIMEOUT_MS);
+  }, [clearAssistantReplyTimeout, enterStandby]);
+
+  const buildConnectionAudioNotice = useCallback(() => {
+    return liveRecordingSettingsRef.current.echoCancellation ? "" : "Echo cancellation is disabled for this live connection.";
+  }, []);
+
+  const queueLiveAction = useCallback((action: PendingLiveAction) => {
+    queuedLiveActionsRef.current.push(action);
+  }, []);
+
+  const flushQueuedLiveActions = useCallback(async () => {
+    if (queuedLiveActionsRef.current.length === 0) return;
+    const pending = [...queuedLiveActionsRef.current];
+    queuedLiveActionsRef.current = [];
+    for (const action of pending) {
+      if (action.kind === "text") {
+        const sent = performLiveTextSendRef.current(action.text, action.options);
+        if (!sent) {
+          queuedLiveActionsRef.current.unshift(action);
+          break;
+        }
+        continue;
+      }
+      try {
+        const sent = await performLiveAttachmentSendRef.current(action.attachment);
+        action.resolve(sent);
+        if (!sent) {
+          queueLiveAction(action);
+          break;
+        }
+      } catch (error) {
+        action.reject(error);
+      }
+    }
+  }, [queueLiveAction]);
+
+  const requestSocketConnection = useCallback((message?: string) => {
+    if (!sessionRequestedRef.current) {
+      return false;
+    }
+    if (readyRef.current || connectingRef.current || socketRequestedRef.current) {
+      return true;
+    }
+    setSocketRequested(true);
+    setStatus(message ?? "Connecting to Gemini Live...");
+    return true;
+  }, []);
+
+  const appendStandbyPreRoll = useCallback((bytes: Uint8Array, base64: string, durationMs: number) => {
+    standbyPreRollRef.current.push({ bytes, base64, durationMs });
+    standbyPreRollDurationMsRef.current += durationMs;
+    while (
+      standbyPreRollRef.current.length > 0 &&
+      standbyPreRollDurationMsRef.current > LIVE_STANDBY_PREROLL_MS
+    ) {
+      const shifted = standbyPreRollRef.current.shift();
+      standbyPreRollDurationMsRef.current = Math.max(0, standbyPreRollDurationMsRef.current - (shifted?.durationMs ?? 0));
     }
   }, []);
 
@@ -1054,6 +1210,18 @@ export function LiveTalkPanel({
   }, [ready]);
 
   useEffect(() => {
+    connectingRef.current = connecting;
+  }, [connecting]);
+
+  useEffect(() => {
+    sessionRequestedRef.current = sessionRequested;
+  }, [sessionRequested]);
+
+  useEffect(() => {
+    socketRequestedRef.current = socketRequested;
+  }, [socketRequested]);
+
+  useEffect(() => {
     noteContextRef.current = noteContext;
     noteCatalogRef.current = noteCatalog;
     noteTitleRef.current = currentNoteTitle;
@@ -1080,6 +1248,10 @@ export function LiveTalkPanel({
       if (historyNoticeTimerRef.current) {
         window.clearTimeout(historyNoticeTimerRef.current);
         historyNoticeTimerRef.current = null;
+      }
+      if (assistantReplyTimeoutRef.current) {
+        window.clearTimeout(assistantReplyTimeoutRef.current);
+        assistantReplyTimeoutRef.current = null;
       }
     },
     [],
@@ -1113,17 +1285,33 @@ export function LiveTalkPanel({
   }, [noteContext, ready, sessionRequested]);
 
   useEffect(() => {
+    liveRecordingSettingsRef.current = normalizeLiveRecordingSettings(providerSettings.liveRecording);
+    if (!sessionRequested) {
+      setSocketRequested(false);
+      return;
+    }
+    if (!liveRecordingSettingsRef.current.standbyEnabled) {
+      setSocketRequested(true);
+      return;
+    }
+    if (!readyRef.current && !connectingRef.current && !voiceActivationPendingRef.current && queuedLiveActionsRef.current.length === 0) {
+      setSocketRequested(false);
+      setStatus(standbyStatusMessage());
+    }
+  }, [providerSettings.liveRecording, sessionRequested, standbyStatusMessage]);
+
+  useEffect(() => {
     activeRef.current = active;
     microphoneEnabledRef.current = microphoneEnabled ?? true;
     preferredMicrophoneDeviceIdRef.current = microphoneDeviceId ?? null;
     liveRecordingSettingsRef.current = normalizeLiveRecordingSettings(providerSettings.liveRecording);
-    const shouldCapture = active && (microphoneEnabled ?? true);
+    const shouldCapture = sessionRequested && active && (microphoneEnabled ?? true);
     microphoneCaptureEnabledRef.current = shouldCapture;
     if (!shouldCapture) {
       resetMicrophoneRef.current();
       return;
     }
-    if (socketRef.current?.readyState === WebSocket.OPEN) {
+    if (socketRef.current?.readyState === WebSocket.OPEN || liveRecordingSettingsRef.current.standbyEnabled) {
       resetMicrophoneRef.current();
       void requestMicrophoneRef.current();
     }
@@ -1131,8 +1319,10 @@ export function LiveTalkPanel({
     active,
     microphoneDeviceId,
     microphoneEnabled,
+    providerSettings.liveRecording,
     providerSettings.liveRecording?.echoCancellation,
     providerSettings.liveRecording?.noiseSuppression,
+    sessionRequested,
   ]);
 
   useEffect(() => {
@@ -1168,8 +1358,10 @@ export function LiveTalkPanel({
   }, [speechPrompt]);
 
   useEffect(() => {
-    onSessionStateChange?.({ connecting, ready, status });
-  }, [connecting, onSessionStateChange, ready, status]);
+    const listening = sessionRequested;
+    const standby = listening && !ready && !connecting;
+    onSessionStateChange?.({ listening, standby, connecting, ready, status });
+  }, [connecting, onSessionStateChange, ready, sessionRequested, status]);
 
   const toggleVideoTurnZoom = (turnId: string) => {
     setExpandedVideoTurnIds((current) => {
@@ -1346,92 +1538,58 @@ export function LiveTalkPanel({
     });
   }, [generatedHistoryImages, onHistoryTargetsChange, orderedTurns]);
 
+  const sendTextToLive = useCallback((text: string, options?: { displayText?: string }) => {
+    const trimmedText = text.trim();
+    if (!trimmedText || !sessionRequestedRef.current) {
+      return false;
+    }
+    if (readyRef.current && socketRef.current?.readyState === WebSocket.OPEN) {
+      return performLiveTextSendRef.current(trimmedText, options);
+    }
+    queueLiveAction({
+      kind: "text",
+      text: trimmedText,
+      options,
+    });
+    return requestSocketConnection("Connecting to Gemini Live...");
+  }, [queueLiveAction, requestSocketConnection]);
+
+  const sendAttachmentToLive = useCallback(async (attachment: LiveSendAttachment) => {
+    if (!sessionRequestedRef.current) {
+      return false;
+    }
+    if (readyRef.current && socketRef.current?.readyState === WebSocket.OPEN) {
+      return performLiveAttachmentSendRef.current(attachment);
+    }
+    return await new Promise<boolean>((resolve, reject) => {
+      queueLiveAction({
+        kind: "attachment",
+        attachment,
+        resolve,
+        reject,
+      });
+      if (!requestSocketConnection("Connecting to Gemini Live...")) {
+        reject(new Error("Live talk is not enabled."));
+      }
+    });
+  }, [queueLiveAction, requestSocketConnection]);
+
   useEffect(() => {
     if (!onRegisterSend) return;
-    onRegisterSend(sendLiveHandleRef.current);
+    if (!sessionRequested) {
+      onRegisterSend(null);
+      return;
+    }
+    const handle: LiveSendHandle = {
+      sendText: sendTextToLive,
+      sendAttachment: sendAttachmentToLive,
+    };
+    sendLiveHandleRef.current = handle;
+    onRegisterSend(handle);
     return () => onRegisterSend(null);
-  }, [onRegisterSend]);
-
-  useEffect(
-    () => () => {
-      audioUrlsRef.current.forEach((audioUrl) => URL.revokeObjectURL(audioUrl));
-      audioUrlsRef.current = [];
-      generatedImageUrlsRef.current.forEach((imageUrl) => URL.revokeObjectURL(imageUrl));
-      generatedImageUrlsRef.current = [];
-    },
-    [],
-  );
+  }, [onRegisterSend, sendAttachmentToLive, sendTextToLive, sessionRequested]);
 
   useEffect(() => {
-    const clearReconnectTimer = () => {
-      if (reconnectTimerRef.current) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-    };
-
-    if (!sessionRequested) {
-      clearReconnectTimer();
-      setConnecting(false);
-      setReady(false);
-      setStatus("Live talk disconnected.");
-      return;
-    }
-
-    if (!providerSettings.apiKey) {
-      clearReconnectTimer();
-      setConnecting(false);
-      setReady(false);
-      setStatus("Save your Gemini API key to start live talk.");
-      return;
-    }
-
-    const model = (providerSettings.liveModel || "").trim() || "gemini-3.1-flash-live-preview";
-    if (!model) {
-      clearReconnectTimer();
-      setConnecting(false);
-      setReady(false);
-      setStatus("Set a Gemini live model in provider settings first.");
-      return;
-    }
-
-    const url = buildLiveWebSocketUrl(providerSettings.apiUrl, providerSettings.apiKey);
-    setConnecting(true);
-    setReady(false);
-    setStatus("Connecting to Gemini Live...");
-    const socket = new WebSocket(url);
-    const socketSessionId = socketSessionIdRef.current + 1;
-    socketSessionIdRef.current = socketSessionId;
-    socketRef.current = socket;
-    let closing = false;
-
-    const scheduleReconnect = (message: string) => {
-      if (reconnectTimerRef.current) {
-        return;
-      }
-      setConnecting(false);
-      setReady(false);
-      setStatus(`${message} Reconnecting...`);
-      reconnectTimerRef.current = window.setTimeout(() => {
-        reconnectTimerRef.current = null;
-        setConnectionRevision((current) => current + 1);
-      }, 1500);
-    };
-
-    const createAudioContext = () => {
-      if (audioContextRef.current) return audioContextRef.current;
-      const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-      if (!AudioContextCtor) return null;
-      const context = new AudioContextCtor();
-      audioContextRef.current = context;
-      const gain = context.createGain();
-      gain.gain.value = LIVE_ASSISTANT_PLAYBACK_GAIN;
-      gain.connect(context.destination);
-      assistantPlaybackGainRef.current = gain;
-      nextAudioTimeRef.current = context.currentTime;
-      return context;
-    };
-
     const resetMicrophone = () => {
       pauseLiveSpeechRecordingRef.current = () => {};
       resumeLiveSpeechRecordingRef.current = () => {};
@@ -1449,6 +1607,18 @@ export function LiveTalkPanel({
       microphoneStreamDeviceIdRef.current = null;
       microphoneAudioContextRef.current?.close().catch(() => undefined);
       microphoneAudioContextRef.current = null;
+      standbyPreRollRef.current = [];
+      standbyPreRollDurationMsRef.current = 0;
+      resetStandbyVoiceActivationState({ resetNoiseFloor: true });
+    };
+
+    const trimPendingUserAudio = () => {
+      while (pendingUserAudioChunksRef.current.length > 0 && pendingUserAudioDurationMsRef.current > LIVE_STANDBY_BUFFER_LIMIT_MS) {
+        pendingUserAudioChunksRef.current.shift();
+        pendingUserAudioBase64ChunksRef.current.shift();
+        pendingUserAudioDurationMsRef.current -= pendingUserAudioChunkDurationsRef.current.shift() ?? 0;
+      }
+      pendingUserAudioDurationMsRef.current = Math.max(0, pendingUserAudioDurationMsRef.current);
     };
 
     const requestMicrophone = async () => {
@@ -1516,41 +1686,125 @@ export function LiveTalkPanel({
             };
 
             processor.onaudioprocess = (event) => {
-              const socketConnection = socketRef.current;
               if (!microphoneCaptureEnabledRef.current || microphoneStreamingPausedRef.current || !stream.active) return;
-              if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) return;
               const inputChannel = event.inputBuffer.numberOfChannels > 0 ? event.inputBuffer.getChannelData(0) : null;
               if (!inputChannel || inputChannel.length === 0) return;
 
-              if (!userAudioSentToModelRef.current) {
-                const selectionContext = sendSelectedTextContext(socketConnection);
-                const promptContext = sendSpeechPromptContext(socketConnection);
-                userAudioSelectionContextRef.current = selectionContext;
-                userAudioPromptContextRef.current = promptContext;
-                const cameraImage = sendCameraSnapshotForTurn("speech");
-                const screenImage = sendScreenSnapshotForTurn("speech");
-                const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
-                ensureUserTurn({
-                  content: [selectionContext, promptContext].filter(Boolean).join("\n\n"),
-                  images: turnImages,
-                });
-                userAudioSentToModelRef.current = true;
-                armVideoShareIdleTimer();
-              }
               const resampled = resampleFloat32Array(inputChannel, audioContext.sampleRate, LIVE_AUDIO_STREAM_SAMPLE_RATE);
               if (resampled.length === 0) return;
+              const durationMs = (resampled.length / LIVE_AUDIO_STREAM_SAMPLE_RATE) * 1000;
               const pcm16Bytes = float32ToPcm16Bytes(resampled);
-              userAudioChunksRef.current.push(pcm16Bytes);
-              socketConnection.send(
-                JSON.stringify({
-                  realtimeInput: {
-                    audio: {
-                      data: float32ToBase64Pcm16(resampled),
-                      mimeType: `audio/pcm;rate=${LIVE_AUDIO_STREAM_SAMPLE_RATE}`,
+              const base64Pcm16 = float32ToBase64Pcm16(resampled);
+              appendStandbyPreRoll(pcm16Bytes, base64Pcm16, durationMs);
+              let sumSquares = 0;
+              for (let index = 0; index < resampled.length; index += 1) {
+                const sample = resampled[index] ?? 0;
+                sumSquares += sample * sample;
+              }
+              const rms = Math.sqrt(sumSquares / resampled.length);
+              const currentDb = 20 * Math.log10(Math.max(rms, 1e-6));
+
+              const socketConnection = socketRef.current;
+              if (readyRef.current && socketConnection?.readyState === WebSocket.OPEN) {
+                if (userAudioStreamEndedRef.current) {
+                  return;
+                }
+                if (voiceActivationPendingRef.current && pendingUserAudioBase64ChunksRef.current.length > 0) {
+                  flushPendingSpeechAudioRef.current();
+                  return;
+                }
+                if (!userAudioSentToModelRef.current) {
+                  prepareSpeechTurnRef.current(socketConnection);
+                }
+                userAudioChunksRef.current.push(pcm16Bytes);
+                userAudioActiveRef.current = true;
+                socketConnection.send(
+                  JSON.stringify({
+                    realtimeInput: {
+                      audio: {
+                        data: base64Pcm16,
+                        mimeType: `audio/pcm;rate=${LIVE_AUDIO_STREAM_SAMPLE_RATE}`,
+                      },
                     },
-                  },
-                }),
-              );
+                  }),
+                );
+                if (liveRecordingSettingsRef.current.standbyEnabled) {
+                  const noiseFloorDb = standbyNoiseFloorDbRef.current;
+                  const speechActive = noiseFloorDb === null || currentDb >= noiseFloorDb + LIVE_SPEECH_END_TRIGGER_DB;
+                  if (speechActive) {
+                    userAudioSpeechDurationMsRef.current += durationMs;
+                    userAudioTrailingSilenceMsRef.current = 0;
+                  } else {
+                    userAudioTrailingSilenceMsRef.current += durationMs;
+                    const smoothing = currentDb <= noiseFloorDb + LIVE_STANDBY_NOISE_UPDATE_DB ? 0.04 : 0.002;
+                    standbyNoiseFloorDbRef.current = noiseFloorDb * (1 - smoothing) + currentDb * smoothing;
+                  }
+
+                  if (
+                    userAudioSpeechDurationMsRef.current >= LIVE_SPEECH_END_MIN_SPEECH_MS &&
+                    userAudioTrailingSilenceMsRef.current >= LIVE_SPEECH_END_TRAILING_SILENCE_MS
+                  ) {
+                    socketConnection.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+                    userAudioStreamEndedRef.current = true;
+                    userAudioTrailingSilenceMsRef.current = 0;
+                    armAssistantReplyTimeout();
+                  }
+                }
+                return;
+              }
+
+              if (!liveRecordingSettingsRef.current.standbyEnabled) {
+                return;
+              }
+
+              if (voiceActivationPendingRef.current || (socketRequestedRef.current && pendingUserAudioBase64ChunksRef.current.length > 0)) {
+                pendingUserAudioChunksRef.current.push(pcm16Bytes);
+                pendingUserAudioBase64ChunksRef.current.push(base64Pcm16);
+                pendingUserAudioChunkDurationsRef.current.push(durationMs);
+                pendingUserAudioDurationMsRef.current += durationMs;
+                trimPendingUserAudio();
+                userAudioChunksRef.current.push(pcm16Bytes);
+                return;
+              }
+
+              const currentNoiseFloorDb = standbyNoiseFloorDbRef.current;
+              if (currentNoiseFloorDb === null) {
+                standbyNoiseFloorDbRef.current = currentDb;
+                standbyNoiseCalibrationMsRef.current = durationMs;
+                standbySpeechBoostMsRef.current = 0;
+                return;
+              }
+
+              if (standbyNoiseCalibrationMsRef.current < LIVE_STANDBY_NOISE_CALIBRATION_MS) {
+                standbyNoiseCalibrationMsRef.current += durationMs;
+                standbyNoiseFloorDbRef.current = currentNoiseFloorDb * 0.75 + currentDb * 0.25;
+                standbySpeechBoostMsRef.current = 0;
+                return;
+              }
+
+              const volumeLiftDb = currentDb - currentNoiseFloorDb;
+              if (volumeLiftDb >= LIVE_STANDBY_VOICE_TRIGGER_DB) {
+                standbySpeechBoostMsRef.current += durationMs * (volumeLiftDb >= LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB ? 2 : 1);
+              } else {
+                standbySpeechBoostMsRef.current = Math.max(0, standbySpeechBoostMsRef.current - durationMs);
+                const smoothing = volumeLiftDb <= LIVE_STANDBY_NOISE_UPDATE_DB ? 0.08 : 0.005;
+                standbyNoiseFloorDbRef.current = currentNoiseFloorDb * (1 - smoothing) + currentDb * smoothing;
+              }
+
+              if (standbySpeechBoostMsRef.current < LIVE_STANDBY_VOICE_TRIGGER_MS) {
+                return;
+              }
+
+              voiceActivationPendingRef.current = true;
+              standbySpeechBoostMsRef.current = 0;
+              pendingUserAudioChunksRef.current = standbyPreRollRef.current.map((chunk) => chunk.bytes);
+              pendingUserAudioBase64ChunksRef.current = standbyPreRollRef.current.map((chunk) => chunk.base64);
+              pendingUserAudioChunkDurationsRef.current = standbyPreRollRef.current.map((chunk) => chunk.durationMs);
+              pendingUserAudioDurationMsRef.current = standbyPreRollRef.current.reduce((total, chunk) => total + chunk.durationMs, 0);
+              userAudioChunksRef.current = [...pendingUserAudioChunksRef.current];
+              userAudioSpeechDurationMsRef.current = LIVE_SPEECH_END_MIN_SPEECH_MS;
+              userAudioTrailingSilenceMsRef.current = 0;
+              void requestSocketConnection("Speech detected. Connecting to Gemini Live...");
             };
           } catch {
             setStatus("Live microphone streaming is not supported in this browser. Text live chat still works.");
@@ -1562,9 +1816,7 @@ export function LiveTalkPanel({
             () => {
               if (!microphoneCaptureEnabledRef.current) return;
               resetMicrophone();
-              if (socketRef.current?.readyState === WebSocket.OPEN) {
-                window.setTimeout(() => void requestMicrophoneRef.current(), 300);
-              }
+              window.setTimeout(() => void requestMicrophoneRef.current(), 300);
             },
             { once: true },
           );
@@ -1582,6 +1834,127 @@ export function LiveTalkPanel({
 
     requestMicrophoneRef.current = requestMicrophone;
     resetMicrophoneRef.current = resetMicrophone;
+    if (
+      microphoneCaptureEnabledRef.current &&
+      (socketRef.current?.readyState === WebSocket.OPEN || liveRecordingSettingsRef.current.standbyEnabled)
+    ) {
+      void requestMicrophone();
+    }
+
+    return () => {
+      requestMicrophoneRef.current = async () => null;
+      resetMicrophoneRef.current = () => {};
+      resetMicrophone();
+    };
+  }, [appendStandbyPreRoll, armAssistantReplyTimeout, requestSocketConnection, resetStandbyVoiceActivationState]);
+
+  useEffect(
+    () => () => {
+      audioUrlsRef.current.forEach((audioUrl) => URL.revokeObjectURL(audioUrl));
+      audioUrlsRef.current = [];
+      generatedImageUrlsRef.current.forEach((imageUrl) => URL.revokeObjectURL(imageUrl));
+      generatedImageUrlsRef.current = [];
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const clearReconnectTimer = () => {
+      if (reconnectTimerRef.current) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+    };
+
+    if (!sessionRequested) {
+      clearReconnectTimer();
+      clearAssistantReplyTimeout();
+      setConnecting(false);
+      setReady(false);
+      setSocketRequested(false);
+      queuedLiveActionsRef.current.forEach((action) => {
+        if (action.kind === "attachment") {
+          action.reject(new Error("Live talk was turned off."));
+        }
+      });
+      queuedLiveActionsRef.current = [];
+      finalizeSpeechCaptureState();
+      performLiveTextSendRef.current = () => false;
+      performLiveAttachmentSendRef.current = async () => false;
+      prepareSpeechTurnRef.current = () => {};
+      flushPendingSpeechAudioRef.current = () => {};
+      onRegisterVideoControls?.(null);
+      setStatus("Live talk disconnected.");
+      return;
+    }
+
+    if (!socketRequested) {
+      clearReconnectTimer();
+      clearAssistantReplyTimeout();
+      setConnecting(false);
+      setReady(false);
+      performLiveTextSendRef.current = () => false;
+      performLiveAttachmentSendRef.current = async () => false;
+      prepareSpeechTurnRef.current = () => {};
+      flushPendingSpeechAudioRef.current = () => {};
+      onRegisterVideoControls?.(null);
+      setStatus(standbyStatusMessage());
+      return;
+    }
+
+    if (!providerSettings.apiKey) {
+      clearReconnectTimer();
+      setConnecting(false);
+      setReady(false);
+      setStatus("Save your Gemini API key to start live talk.");
+      return;
+    }
+
+    const model = (providerSettings.liveModel || "").trim() || "gemini-3.1-flash-live-preview";
+    if (!model) {
+      clearReconnectTimer();
+      setConnecting(false);
+      setReady(false);
+      setStatus("Set a Gemini live model in provider settings first.");
+      return;
+    }
+
+    const url = buildLiveWebSocketUrl(providerSettings.apiUrl, providerSettings.apiKey);
+    setConnecting(true);
+    setReady(false);
+    setStatus("Connecting to Gemini Live...");
+    const socket = new WebSocket(url);
+    const socketSessionId = socketSessionIdRef.current + 1;
+    socketSessionIdRef.current = socketSessionId;
+    socketRef.current = socket;
+    let closing = false;
+
+    const scheduleReconnect = (message: string) => {
+      if (reconnectTimerRef.current) {
+        return;
+      }
+      setConnecting(false);
+      setReady(false);
+      setStatus(`${message} Reconnecting...`);
+      reconnectTimerRef.current = window.setTimeout(() => {
+        reconnectTimerRef.current = null;
+        setConnectionRevision((current) => current + 1);
+      }, 1500);
+    };
+
+    const createAudioContext = () => {
+      if (audioContextRef.current) return audioContextRef.current;
+      const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (!AudioContextCtor) return null;
+      const context = new AudioContextCtor();
+      audioContextRef.current = context;
+      const gain = context.createGain();
+      gain.gain.value = LIVE_ASSISTANT_PLAYBACK_GAIN;
+      gain.connect(context.destination);
+      assistantPlaybackGainRef.current = gain;
+      nextAudioTimeRef.current = context.currentTime;
+      return context;
+    };
 
     const ensureUserTurn = (defaults?: { content?: string; images?: LiveGeneratedImage[] }) => {
       const existingId = userTurnIdRef.current;
@@ -1706,10 +2079,13 @@ export function LiveTalkPanel({
       userAudioChunksRef.current = [];
       pendingUserAudioChunksRef.current = [];
       pendingUserAudioBase64ChunksRef.current = [];
+      pendingUserAudioChunkDurationsRef.current = [];
+      pendingUserAudioDurationMsRef.current = 0;
       pendingSpeechCameraImageRef.current = null;
       userAudioSpeechStartMsRef.current = 0;
       userAudioActiveRef.current = false;
       userAudioSentToModelRef.current = false;
+      userAudioStreamEndedRef.current = false;
       userAudioSpeechDurationMsRef.current = 0;
       userAudioTrailingSilenceMsRef.current = 0;
     };
@@ -2198,6 +2574,51 @@ export function LiveTalkPanel({
       return image;
     };
 
+    prepareSpeechTurnRef.current = (socketConnection: WebSocket) => {
+      if (userAudioSentToModelRef.current) return;
+      const selectionContext = sendSelectedTextContext(socketConnection);
+      const promptContext = sendSpeechPromptContext(socketConnection);
+      userAudioSelectionContextRef.current = selectionContext;
+      userAudioPromptContextRef.current = promptContext;
+      const cameraImage = sendCameraSnapshotForTurn("speech");
+      const screenImage = sendScreenSnapshotForTurn("speech");
+      const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+      ensureUserTurn({
+        content: [selectionContext, promptContext].filter(Boolean).join("\n\n"),
+        images: turnImages,
+      });
+      userAudioSentToModelRef.current = true;
+      userAudioStreamEndedRef.current = false;
+      userAudioActiveRef.current = true;
+      armVideoShareIdleTimer();
+    };
+
+    flushPendingSpeechAudioRef.current = () => {
+      const socketConnection = socketRef.current;
+      if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN || pendingUserAudioBase64ChunksRef.current.length === 0) {
+        return;
+      }
+      prepareSpeechTurnRef.current(socketConnection);
+      for (const chunk of pendingUserAudioBase64ChunksRef.current) {
+        socketConnection.send(
+          JSON.stringify({
+            realtimeInput: {
+              audio: {
+                data: chunk,
+                mimeType: `audio/pcm;rate=${LIVE_AUDIO_STREAM_SAMPLE_RATE}`,
+              },
+            },
+          }),
+        );
+      }
+      pendingUserAudioChunksRef.current = [];
+      pendingUserAudioBase64ChunksRef.current = [];
+      pendingUserAudioChunkDurationsRef.current = [];
+      pendingUserAudioDurationMsRef.current = 0;
+      voiceActivationPendingRef.current = false;
+      userAudioSpeechDurationMsRef.current = Math.max(userAudioSpeechDurationMsRef.current, LIVE_SPEECH_END_MIN_SPEECH_MS);
+    };
+
     const startVideoShare = async (
       stream: MediaStream,
       mode: "camera" | "screen",
@@ -2462,6 +2883,7 @@ export function LiveTalkPanel({
       moveVideoShareTurnToEnd();
       setStatus("Sent.");
       armVideoShareIdleTimer();
+      armAssistantReplyTimeout();
       return true;
     };
 
@@ -2515,6 +2937,7 @@ export function LiveTalkPanel({
         );
         setStatus(`${attachment.fileName} sent to live talk.`);
         armVideoShareIdleTimer();
+        armAssistantReplyTimeout();
         recordLiveContextUsage(`Sent audio clip: ${attachment.fileName}`, turnImages.length);
         return true;
       }
@@ -2572,8 +2995,12 @@ export function LiveTalkPanel({
       }
       setStatus(`${attachment.fileName} sent to live talk.`);
       armVideoShareIdleTimer();
+      armAssistantReplyTimeout();
       return true;
     };
+
+    performLiveTextSendRef.current = sendLiveText;
+    performLiveAttachmentSendRef.current = sendLiveAttachment;
 
     const buildLiveTranscriptMarkdown = () =>
       turnsRef.current
@@ -3164,12 +3591,6 @@ export function LiveTalkPanel({
       showHistoryNotice("Tool response sent to Gemini.");
     };
 
-    const liveSendHandle: LiveSendHandle = {
-      sendAttachment: sendLiveAttachment,
-      sendText: sendLiveText,
-    };
-    sendLiveHandleRef.current = liveSendHandle;
-    onRegisterSend?.(liveSendHandle);
     onRegisterVideoControls?.({
       listSources,
       startCameraShare,
@@ -3184,11 +3605,11 @@ export function LiveTalkPanel({
         createAudioContext();
         sendSetup();
         setConnecting(false);
-        setStatus("Connected. Seeding the current note...");
-        microphoneCaptureEnabledRef.current = activeRef.current && microphoneEnabledRef.current;
-        if (microphoneCaptureEnabledRef.current) {
-          void requestMicrophone();
+        const audioNotice = buildConnectionAudioNotice();
+        if (audioNotice) {
+          showHistoryNotice(audioNotice);
         }
+        setStatus(audioNotice ? `Connected. ${audioNotice}` : "Connected. Seeding the current note...");
       } catch (error) {
         onError(error instanceof Error ? error.message : "Failed to start live talk.");
       }
@@ -3213,6 +3634,8 @@ export function LiveTalkPanel({
         if ("setupComplete" in payload) {
           setReady(true);
           setStatus("Live talk ready.");
+          flushPendingSpeechAudioRef.current();
+          await flushQueuedLiveActions();
           return;
         }
 
@@ -3224,6 +3647,7 @@ export function LiveTalkPanel({
           }
           const assistantTurnStarted = Boolean(serverContent.outputTranscription?.text || serverContent.modelTurn?.parts?.length);
           if (assistantTurnStarted) {
+            clearAssistantReplyTimeout();
             clearVideoShareIdleTimer();
             finalizeUserAudio();
           }
@@ -3305,41 +3729,37 @@ export function LiveTalkPanel({
       socketRef.current = null;
       socket.close();
       stopVideoShare();
-      microphoneCaptureEnabledRef.current = false;
-      resetMicrophone();
       nextAudioTimeRef.current = 0;
       assistantPlaybackMutedUntilRef.current = 0;
-      userAudioChunksRef.current = [];
-      pendingUserAudioChunksRef.current = [];
       pendingSpeechCameraImageRef.current = null;
-      userAudioActiveRef.current = false;
-      userAudioSpeechStartMsRef.current = 0;
-      userAudioTrailingSilenceMsRef.current = 0;
       assistantAudioChunksRef.current = [];
       cancelledToolCallIdsRef.current.clear();
       liveAssistantTurnIdRef.current = null;
-      userTurnIdRef.current = null;
-      sendLiveHandleRef.current = {
-        sendText: () => false,
-        sendAttachment: async () => false,
-      };
+      prepareSpeechTurnRef.current = () => {};
+      flushPendingSpeechAudioRef.current = () => {};
+      performLiveTextSendRef.current = () => false;
+      performLiveAttachmentSendRef.current = async () => false;
       captureVideoShareShotRef.current = async () => {};
-      onRegisterSend?.(null);
       onRegisterVideoControls?.(null);
     };
   }, [
     beginWebappPlayback,
+    buildConnectionAudioNotice,
+    clearAssistantReplyTimeout,
     connectionRevision,
     endWebappPlayback,
+    finalizeSpeechCaptureState,
+    flushQueuedLiveActions,
     onImageGenerationStateChange,
     onError,
-    onRegisterSend,
     onRegisterVideoControls,
     providerSettings.apiKey,
     providerSettings.apiUrl,
     providerSettings.liveModel,
     providerSettings.model,
     sessionRequested,
+    socketRequested,
+    standbyStatusMessage,
     showHistoryNotice,
   ]);
 

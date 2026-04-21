@@ -14,13 +14,14 @@ import {
   type LiveVideoSource,
 } from "@/components/chat/live-talk-panel";
 import { Panel } from "@/components/ui/panel";
+import { defaultLiveRecordingSettings } from "@/lib/providers/defaults";
 import {
   loadPreferredLiveCameraDeviceId,
   loadPreferredMicrophoneDeviceId,
   savePreferredLiveCameraDeviceId,
   savePreferredMicrophoneDeviceId,
 } from "@/lib/storage/local-cache";
-import type { ProviderSettings } from "@/shared/types";
+import type { LiveRecordingSettings, ProviderSettings } from "@/shared/types";
 import type {
   AIMessage,
   AIMessageAttachment,
@@ -69,6 +70,8 @@ type TopbarGeneratedImage = {
 };
 
 type LiveSessionState = {
+  listening: boolean;
+  standby: boolean;
   connecting: boolean;
   ready: boolean;
   status: string;
@@ -81,17 +84,20 @@ type MicrophoneSource = {
 
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 const AUDIO_RECORDING_BITS_PER_SECOND = 128_000;
-const AUDIO_RECORDING_NORMALIZED_PEAK = 0.86;
-const AUDIO_RECORDING_MAX_NORMALIZE_GAIN = 5;
+const AUDIO_RECORDING_SEND_GAIN = 3;
 
 function isLocalSystemAudioInput(label?: string | null) {
   return Boolean(label && LOCAL_AUDIO_INPUT_LABEL_PATTERN.test(label));
 }
 
-function buildSpeechMicAudioConstraints(): MediaTrackConstraints {
+function normalizeLiveRecordingSettings(settings?: Partial<LiveRecordingSettings>): LiveRecordingSettings {
+  return { ...defaultLiveRecordingSettings, ...(settings ?? {}) };
+}
+
+function buildSpeechMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
   return {
-    echoCancellation: false,
-    noiseSuppression: false,
+    echoCancellation: settings.echoCancellation,
+    noiseSuppression: settings.noiseSuppression,
     autoGainControl: false,
     channelCount: { ideal: 1 },
     sampleRate: { ideal: 48000 },
@@ -393,10 +399,9 @@ async function normalizeRecordingBlob(blob: Blob) {
       return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
     }
 
-    const gain = Math.min(AUDIO_RECORDING_MAX_NORMALIZE_GAIN, Math.max(1, AUDIO_RECORDING_NORMALIZED_PEAK / peak));
     const normalized = new Float32Array(mono.length);
     for (let index = 0; index < mono.length; index += 1) {
-      normalized[index] = Math.max(-1, Math.min(1, (mono[index] ?? 0) * gain));
+      normalized[index] = Math.max(-1, Math.min(1, (mono[index] ?? 0) * AUDIO_RECORDING_SEND_GAIN));
     }
 
     return {
@@ -580,6 +585,7 @@ export function AIChatPanel({
 }) {
   const supportsMedia = provider === "gemini";
   const supportsLive = provider === "gemini" && Boolean(providerSettings.apiKey) && Boolean(providerSettings.liveModel || providerSettings.model);
+  const liveRecordingSettings = normalizeLiveRecordingSettings(providerSettings.liveRecording);
   const availablePrompts = [...builtInPrompts, ...prompts];
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
   const [folderPickerOpen, setFolderPickerOpen] = useState(false);
@@ -607,6 +613,8 @@ export function AIChatPanel({
   const [activeTab, setActiveTab] = useState<"chat" | "live">(() => (supportsLive ? "live" : "chat"));
   const [liveConnectionRequested, setLiveConnectionRequested] = useState(() => supportsLive);
   const [liveSessionState, setLiveSessionState] = useState<LiveSessionState>({
+    listening: supportsLive,
+    standby: supportsLive,
     connecting: false,
     ready: false,
     status: "Open the Live tab to start a session.",
@@ -712,7 +720,7 @@ export function AIChatPanel({
   const compactComposerChrome = historyExpanded;
   const composerChromeScale = compactComposerChrome ? 0.5 : 1;
   const composerChromeFrameHeight = composerChromeHeight ? composerChromeHeight * composerChromeScale : undefined;
-  const liveConnectButtonActive = activeTab === "live" && supportsLive && liveConnectionRequested;
+  const liveConnectButtonActive = activeTab === "live" && supportsLive && liveSessionState.listening;
   const liveConnectButtonReady = liveConnectButtonActive && liveSessionState.ready;
   const showLatestMessageShortcut = activeTab === "live" ? liveLatestMessageAvailable : chatLatestMessageAvailable;
   const showGeneratedImageShortcut =
@@ -723,7 +731,7 @@ export function AIChatPanel({
       : cameraPreviewVisible || cameraPreparing || cameraRecording || Boolean(latestChatCameraAttachmentId);
   const liveCameraShortcutFlashing = activeTab === "live" && liveVideoShareMode === "camera" && liveHistoryTargets.hasCamera;
   const selectedTextForReadAloud = selectedText?.trim() ?? "";
-  const liveDisconnected = activeTab === "live" && !liveSessionState.ready;
+  const liveDisconnected = activeTab === "live" && !liveSessionState.listening;
   const composerMenuOpen = microphoneMenuOpen || liveVideoMenuOpen;
 
   const triggerLatestMessageShortcutFlash = useCallback(() => {
@@ -1153,7 +1161,7 @@ export function AIChatPanel({
       throw new Error("Audio recording is not supported in this browser.");
     }
 
-    const audioConstraints = buildSpeechMicAudioConstraints();
+    const audioConstraints = buildSpeechMicAudioConstraints(liveRecordingSettings);
     if (deviceId) {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -1479,6 +1487,7 @@ export function AIChatPanel({
     options?: {
       mode?: AIRequestMode;
       preserveComposer?: boolean;
+      displayPrompt?: string;
     },
   ) => {
     try {
@@ -1503,6 +1512,7 @@ export function AIChatPanel({
         messageAttachments: items.map(buildMessageAttachment),
         prompts: selectedMessagePrompts,
         mode: options?.mode ?? "chat",
+        displayPrompt: options?.displayPrompt,
       });
       if (submittedPrompt) {
         setPrompt("");
@@ -1901,7 +1911,10 @@ export function AIChatPanel({
             clearPromptTextDraft();
           } else {
             const recordedAttachment = createFileAttachment(file, "audio");
-            await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment], { preserveComposer: true });
+            await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment], {
+              preserveComposer: true,
+              displayPrompt: "Sent audio recording.",
+            });
           }
           resolve();
         } catch (error) {
@@ -2398,16 +2411,16 @@ export function AIChatPanel({
           ) : null}
           {activeTab === "live" && supportsLive ? (
             <button
-              aria-label={liveConnectionRequested ? "Disconnect live talk" : "Connect live talk"}
+              aria-label={liveConnectButtonActive ? "Turn off live standby" : "Enable live standby"}
               className={`flex h-8 w-8 items-center justify-center rounded-[4px] border transition ${
                 liveConnectButtonReady
                   ? "border-[#bb3e2d] bg-[#bb3e2d] text-white hover:border-[#a93526] hover:bg-[#a93526]"
                   : liveConnectButtonActive
-                    ? "border-[#1f6f78] bg-[#1f6f78] text-white hover:border-[#195d65] hover:bg-[#195d65]"
+                    ? "border-[#2563eb] bg-[#2563eb] text-white hover:border-[#1d4ed8] hover:bg-[#1d4ed8]"
                   : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
               }`}
               onClick={() => setLiveConnectionRequested((current) => !current)}
-              title={liveConnectionRequested ? "Disconnect live talk" : "Connect live talk"}
+              title={liveConnectButtonActive ? "Turn off live standby" : "Enable live standby"}
               type="button"
             >
               <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -2505,7 +2518,11 @@ export function AIChatPanel({
           activeTab === "live"
             ? liveSessionState.ready
               ? "Live talk on, speak with AI now."
-              : liveSessionState.status
+              : liveSessionState.listening
+                ? liveSessionState.standby
+                  ? "Standby listening. Speak or type to reconnect."
+                  : liveSessionState.status
+                : liveSessionState.status
             : supportsMedia
               ? "Ask Gemini about this note. Press Enter to send, Shift+Enter for a new line."
               : "Send the whole document or ask questions. Press Enter to send, Shift+Enter for a new line."

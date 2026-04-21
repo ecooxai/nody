@@ -70,6 +70,7 @@ describe("D1 schema", () => {
     expect(providerColumns).toContain("image_model");
     expect(providerColumns).toContain("live_echo_cancellation");
     expect(providerColumns).toContain("live_noise_suppression");
+    expect(providerColumns).toContain("live_standby_enabled");
     expect(providerColumns).toContain("live_auto_gain_control");
     expect(providerColumns).toContain("live_silence_trim");
     expect(providerColumns).toContain("live_speech_threshold");
@@ -85,5 +86,6 @@ describe("D1 schema", () => {
     expect(migrationNames).toContain("0008_live_recording_settings.sql");
     expect(migrationNames).toContain("0009_raise_live_speech_threshold.sql");
     expect(migrationNames).toContain("0010_raise_live_speech_threshold_again.sql");
+    expect(migrationNames).toContain("0011_live_standby_enabled.sql");
   });
 });

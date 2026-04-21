@@ -14,6 +14,7 @@ describe("provider defaults", () => {
     expect(settings.liveRecording).toMatchObject({
       echoCancellation: true,
       noiseSuppression: false,
+      standbyEnabled: true,
     });
   });
 });

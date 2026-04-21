@@ -138,6 +138,25 @@ export function ProviderSettingsForm({
               type="checkbox"
             />
           </label>
+          <label className="grid gap-1 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
+            <div className="flex items-center justify-between gap-3">
+              <span>Standby live listening</span>
+              <input
+                checked={liveRecording.standbyEnabled}
+                className="h-4 w-4"
+                onChange={(event) =>
+                  setValue({
+                    ...value,
+                    liveRecording: { ...liveRecording, standbyEnabled: event.target.checked },
+                  })
+                }
+                type="checkbox"
+              />
+            </div>
+            <span className="text-xs text-ink/55">
+              When enabled, live talk falls back to standby after 20 seconds with no AI reply, keeps listening locally, and reconnects after about 2 seconds of speech that rises above the background level.
+            </span>
+          </label>
         </div>
       </div>
       <Button
