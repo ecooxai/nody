@@ -83,6 +83,9 @@ const LIVE_SPEECH_NOISE_GATE_OPEN_RMS = 0.018;
 const LIVE_SPEECH_NOISE_GATE_MIN_GAIN = 0.25;
 const LIVE_RECORDER_MIN_SIGNAL_RMS = 0.0005;
 const LIVE_RECORDER_MIN_SIGNAL_PEAK = 0.005;
+const LIVE_USER_PLAYBACK_TARGET_RMS = 0.22;
+const LIVE_USER_PLAYBACK_PEAK_CEILING = 0.95;
+const LIVE_USER_PLAYBACK_MAX_GAIN = 30;
 const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
 const LIVE_STANDBY_PREROLL_MS = 2_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 8_000;
@@ -512,6 +515,26 @@ function amplifySpeechSamples(samples: Float32Array, gain: number) {
   return amplified;
 }
 
+function normalizeUserPlaybackSamples(samples: Float32Array, minimumGain = LIVE_RECORDING_SEND_GAIN) {
+  if (samples.length === 0) return samples;
+
+  let sumSquares = 0;
+  let peak = 0;
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = samples[index] ?? 0;
+    sumSquares += sample * sample;
+    peak = Math.max(peak, Math.abs(sample));
+  }
+
+  if (peak <= 0) return samples;
+
+  const rms = Math.sqrt(sumSquares / samples.length);
+  const rmsGain = rms > 0 ? LIVE_USER_PLAYBACK_TARGET_RMS / rms : LIVE_USER_PLAYBACK_MAX_GAIN;
+  const peakGain = LIVE_USER_PLAYBACK_PEAK_CEILING / peak;
+  const gain = Math.min(LIVE_USER_PLAYBACK_MAX_GAIN, peakGain, Math.max(minimumGain, rmsGain));
+  return amplifySpeechSamples(samples, gain);
+}
+
 async function recorderBlobToSpeechWavUrl(blob: Blob) {
   const context = createSpeechAudioContext();
   if (!context) {
@@ -534,7 +557,7 @@ async function recorderBlobToSpeechWavUrl(blob: Blob) {
     }
 
     const cleaned = cleanSpeechSamples(mono, decoded.sampleRate);
-    const amplified = amplifySpeechSamples(cleaned, LIVE_RECORDING_SEND_GAIN);
+    const amplified = normalizeUserPlaybackSamples(cleaned);
     return pcm16ChunksToWavUrl([float32ToPcm16Bytes(amplified)], decoded.sampleRate);
   } catch {
     return null;
@@ -568,6 +591,22 @@ async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000
   } finally {
     context.close().catch(() => undefined);
   }
+}
+
+function pcm16ChunksToPlaybackWavUrl(chunks: Uint8Array[], sampleRate: number) {
+  const sampleCount = chunks.reduce((total, chunk) => total + Math.floor(chunk.byteLength / 2), 0);
+  if (sampleCount === 0) return null;
+
+  const samples = new Float32Array(sampleCount);
+  let offset = 0;
+  for (const chunk of chunks) {
+    const chunkSamples = pcm16ToFloat32Array(chunk);
+    samples.set(chunkSamples, offset);
+    offset += chunkSamples.length;
+  }
+
+  const normalized = normalizeUserPlaybackSamples(samples);
+  return pcm16ChunksToWavUrl([float32ToPcm16Bytes(normalized)], sampleRate);
 }
 
 function pcm16ChunksToWavUrl(chunks: Uint8Array[], sampleRate: number) {
@@ -2411,7 +2450,7 @@ export function LiveTalkPanel({
         void (async () => {
           const recorderBlob = await stopLiveTurnRecorder(recorderSession);
           const recorderAudioUrl = recorderBlob && recorderBlob.size > 0 ? await recorderBlobToSpeechWavUrl(recorderBlob) : null;
-          const audioUrl = recorderAudioUrl ?? pcm16ChunksToWavUrl(fallbackChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE);
+          const audioUrl = recorderAudioUrl ?? pcm16ChunksToPlaybackWavUrl(fallbackChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE);
           if (audioUrl) {
             audioUrlsRef.current.push(audioUrl);
             setTurns((current) =>
