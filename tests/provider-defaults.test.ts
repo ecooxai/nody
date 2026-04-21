@@ -13,7 +13,7 @@ describe("provider defaults", () => {
     expect(settings.imageModel).toBe(providerDefaults.gemini.imageModel);
     expect(settings.liveRecording).toMatchObject({
       echoCancellation: true,
-      noiseSuppression: false,
+      noiseSuppression: true,
       standbyEnabled: true,
     });
   });

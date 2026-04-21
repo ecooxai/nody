@@ -71,9 +71,18 @@ type LiveSessionState = {
 };
 
 const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.45;
-const LIVE_RECORDING_SEND_GAIN = 3;
+const LIVE_RECORDING_SEND_GAIN = 5;
+const LIVE_RECORDING_BITS_PER_SECOND = 192_000;
 const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
+const LIVE_AUDIO_CAPTURE_SAMPLE_RATE = 48000;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
+const LIVE_SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
+const LIVE_SPEECH_LOW_PASS_CUTOFF_HZ = 7000;
+const LIVE_SPEECH_NOISE_GATE_FLOOR_RMS = 0.004;
+const LIVE_SPEECH_NOISE_GATE_OPEN_RMS = 0.018;
+const LIVE_SPEECH_NOISE_GATE_MIN_GAIN = 0.25;
+const LIVE_RECORDER_MIN_SIGNAL_RMS = 0.0005;
+const LIVE_RECORDER_MIN_SIGNAL_PEAK = 0.005;
 const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
 const LIVE_STANDBY_PREROLL_MS = 2_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 8_000;
@@ -162,6 +171,25 @@ type PendingLiveAction =
 
 const LIVE_IMAGE_GENERATION_NOTICE = "i'll generate image now";
 const LIVE_CONTEXT_TOKEN_LIMIT = 16_000;
+
+type SpeechHighPassState = {
+  previousInput: number;
+  previousOutput: number;
+};
+
+type SpeechLowPassState = {
+  previousOutput: number;
+};
+
+type SpeechNoiseGateState = {
+  currentGain: number;
+};
+
+type LiveTurnRecorderSession = {
+  chunks: Blob[];
+  recorder: MediaRecorder;
+  turnId: string;
+};
 
 function formatSelectedTextContext(selection: string) {
   return `user selected:${selection.trim()}\nendselected\n\n`;
@@ -303,20 +331,31 @@ function getLiveRecordingCaptureGain(settings: LiveRecordingSettings) {
   return LIVE_RECORDING_SEND_GAIN;
 }
 
+function isAndroidChromeBrowser() {
+  if (typeof navigator === "undefined") return false;
+  const userAgent = navigator.userAgent.toLowerCase();
+  return userAgent.includes("android") && (userAgent.includes("chrome") || userAgent.includes("chromium"));
+}
+
+function shouldRequestNoiseSuppression(settings: LiveRecordingSettings) {
+  return settings.noiseSuppression || isAndroidChromeBrowser();
+}
+
 function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
   return {
     echoCancellation: settings.echoCancellation,
-    noiseSuppression: settings.noiseSuppression,
+    noiseSuppression: shouldRequestNoiseSuppression(settings),
+    autoGainControl: false,
     channelCount: { ideal: 1 },
-    sampleRate: { ideal: 48000 },
+    sampleRate: { ideal: LIVE_AUDIO_CAPTURE_SAMPLE_RATE },
     sampleSize: { ideal: 16 },
   };
 }
 
-function preferMediaQualityAudio(stream: MediaStream) {
+function preferSpeechQualityAudio(stream: MediaStream) {
   stream.getAudioTracks().forEach((track) => {
     if ("contentHint" in track) {
-      track.contentHint = "music";
+      track.contentHint = "speech";
     }
   });
 }
@@ -325,18 +364,197 @@ function normalizeLiveRecordingSettings(settings?: Partial<LiveRecordingSettings
   return { ...defaultLiveRecordingSettings, ...(settings ?? {}) };
 }
 
-async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000, chunkSize = 3200) {
+function createSpeechAudioContext() {
   const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!AudioContextCtor) {
+  if (!AudioContextCtor) return null;
+  try {
+    return new AudioContextCtor({ sampleRate: LIVE_AUDIO_CAPTURE_SAMPLE_RATE });
+  } catch {
+    return new AudioContextCtor();
+  }
+}
+
+function getPreferredLiveRecordingMimeType() {
+  if (typeof MediaRecorder === "undefined") return null;
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4;codecs=mp4a.40.2",
+    "audio/mp4",
+    "audio/x-m4a",
+    "audio/wav",
+  ];
+
+  for (const candidate of candidates) {
+    if (MediaRecorder.isTypeSupported(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function createSpeechHighPassState(): SpeechHighPassState {
+  return { previousInput: 0, previousOutput: 0 };
+}
+
+function createSpeechLowPassState(): SpeechLowPassState {
+  return { previousOutput: 0 };
+}
+
+function createSpeechNoiseGateState(): SpeechNoiseGateState {
+  return { currentGain: 1 };
+}
+
+function highPassSpeechSamples(samples: Float32Array, sampleRate: number, state?: SpeechHighPassState) {
+  if (samples.length === 0) return samples;
+
+  const filtered = new Float32Array(samples.length);
+  const rc = 1 / (2 * Math.PI * LIVE_SPEECH_HIGH_PASS_CUTOFF_HZ);
+  const dt = 1 / sampleRate;
+  const alpha = rc / (rc + dt);
+  let previousInput = state?.previousInput ?? samples[0] ?? 0;
+  let previousOutput = state?.previousOutput ?? 0;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const currentInput = samples[index] ?? 0;
+    const currentOutput = alpha * (previousOutput + currentInput - previousInput);
+    filtered[index] = currentOutput;
+    previousInput = currentInput;
+    previousOutput = currentOutput;
+  }
+
+  if (state) {
+    state.previousInput = previousInput;
+    state.previousOutput = previousOutput;
+  }
+
+  return filtered;
+}
+
+function lowPassSpeechSamples(samples: Float32Array, sampleRate: number, state?: SpeechLowPassState) {
+  if (samples.length === 0) return samples;
+
+  const filtered = new Float32Array(samples.length);
+  const rc = 1 / (2 * Math.PI * LIVE_SPEECH_LOW_PASS_CUTOFF_HZ);
+  const dt = 1 / sampleRate;
+  const alpha = dt / (rc + dt);
+  let previousOutput = state?.previousOutput ?? samples[0] ?? 0;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const currentInput = samples[index] ?? 0;
+    previousOutput += alpha * (currentInput - previousOutput);
+    filtered[index] = previousOutput;
+  }
+
+  if (state) {
+    state.previousOutput = previousOutput;
+  }
+
+  return filtered;
+}
+
+function gateQuietSpeechNoise(samples: Float32Array, sampleRate: number, state?: SpeechNoiseGateState) {
+  if (samples.length === 0) return samples;
+
+  const gated = new Float32Array(samples.length);
+  const frameSize = Math.max(1, Math.floor(sampleRate * 0.02));
+  let currentGain = state?.currentGain ?? 1;
+
+  for (let offset = 0; offset < samples.length; offset += frameSize) {
+    const end = Math.min(offset + frameSize, samples.length);
+    let sumSquares = 0;
+    for (let index = offset; index < end; index += 1) {
+      const sample = samples[index] ?? 0;
+      sumSquares += sample * sample;
+    }
+
+    const rms = Math.sqrt(sumSquares / Math.max(1, end - offset));
+    const openness = Math.max(
+      0,
+      Math.min(1, (rms - LIVE_SPEECH_NOISE_GATE_FLOOR_RMS) / (LIVE_SPEECH_NOISE_GATE_OPEN_RMS - LIVE_SPEECH_NOISE_GATE_FLOOR_RMS)),
+    );
+    const targetGain = LIVE_SPEECH_NOISE_GATE_MIN_GAIN + (1 - LIVE_SPEECH_NOISE_GATE_MIN_GAIN) * openness;
+
+    for (let index = offset; index < end; index += 1) {
+      currentGain += (targetGain - currentGain) * 0.2;
+      gated[index] = (samples[index] ?? 0) * currentGain;
+    }
+  }
+
+  if (state) {
+    state.currentGain = currentGain;
+  }
+
+  return gated;
+}
+
+function cleanSpeechSamples(
+  samples: Float32Array,
+  sampleRate: number,
+  states?: {
+    highPass?: SpeechHighPassState;
+    lowPass?: SpeechLowPassState;
+    noiseGate?: SpeechNoiseGateState;
+  },
+) {
+  const highPassed = highPassSpeechSamples(samples, sampleRate, states?.highPass);
+  const lowPassed = lowPassSpeechSamples(highPassed, sampleRate, states?.lowPass);
+  return gateQuietSpeechNoise(lowPassed, sampleRate, states?.noiseGate);
+}
+
+function amplifySpeechSamples(samples: Float32Array, gain: number) {
+  const amplified = new Float32Array(samples.length);
+  for (let index = 0; index < samples.length; index += 1) {
+    const lifted = (samples[index] ?? 0) * gain;
+    amplified[index] = Math.tanh(lifted);
+  }
+  return amplified;
+}
+
+async function recorderBlobToSpeechWavUrl(blob: Blob) {
+  const context = createSpeechAudioContext();
+  if (!context) {
+    return null;
+  }
+
+  try {
+    const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+    const mono = audioBufferToMonoFloat32Array(decoded);
+    let sumSquares = 0;
+    let peak = 0;
+    for (let index = 0; index < mono.length; index += 1) {
+      const sample = mono[index] ?? 0;
+      sumSquares += sample * sample;
+      peak = Math.max(peak, Math.abs(sample));
+    }
+    const rms = Math.sqrt(sumSquares / Math.max(1, mono.length));
+    if (rms < LIVE_RECORDER_MIN_SIGNAL_RMS || peak < LIVE_RECORDER_MIN_SIGNAL_PEAK) {
+      return null;
+    }
+
+    const cleaned = cleanSpeechSamples(mono, decoded.sampleRate);
+    const amplified = amplifySpeechSamples(cleaned, LIVE_RECORDING_SEND_GAIN);
+    return pcm16ChunksToWavUrl([float32ToPcm16Bytes(amplified)], decoded.sampleRate);
+  } catch {
+    return null;
+  } finally {
+    context.close().catch(() => undefined);
+  }
+}
+
+async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000, chunkSize = 3200) {
+  const context = createSpeechAudioContext();
+  if (!context) {
     throw new Error("Audio decoding is not supported in this browser.");
   }
 
-  const context = new AudioContextCtor();
   try {
     const sourceBuffer = await blob.arrayBuffer();
     const decoded = await context.decodeAudioData(sourceBuffer.slice(0));
     const mono = audioBufferToMonoFloat32Array(decoded);
-    const resampled = resampleFloat32Array(mono, decoded.sampleRate, sampleRate);
+    const cleaned = cleanSpeechSamples(mono, decoded.sampleRate);
+    const resampled = resampleFloat32Array(cleaned, decoded.sampleRate, sampleRate);
     const chunks: string[] = [];
 
     for (let offset = 0; offset < resampled.length; offset += chunkSize) {
@@ -877,6 +1095,9 @@ export function LiveTalkPanel({
   const microphoneGainRef = useRef<GainNode | null>(null);
   const microphoneProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const microphoneSinkGainRef = useRef<GainNode | null>(null);
+  const microphoneHighPassStateRef = useRef<SpeechHighPassState>(createSpeechHighPassState());
+  const microphoneLowPassStateRef = useRef<SpeechLowPassState>(createSpeechLowPassState());
+  const microphoneNoiseGateStateRef = useRef<SpeechNoiseGateState>(createSpeechNoiseGateState());
   const microphoneStreamingPausedRef = useRef(false);
   const webappPlaybackCountRef = useRef(0);
   const webappPlaybackResumeTimerRef = useRef<number | null>(null);
@@ -923,6 +1144,7 @@ export function LiveTalkPanel({
   const socketSessionIdRef = useRef(0);
   const userTurnIdRef = useRef<string | null>(null);
   const userAudioChunksRef = useRef<Uint8Array[]>([]);
+  const liveTurnRecorderSessionRef = useRef<LiveTurnRecorderSession | null>(null);
   const pendingUserAudioChunksRef = useRef<Uint8Array[]>([]);
   const pendingUserAudioBase64ChunksRef = useRef<string[]>([]);
   const pendingUserAudioChunkDurationsRef = useRef<number[]>([]);
@@ -1607,6 +1829,23 @@ export function LiveTalkPanel({
       microphoneStreamDeviceIdRef.current = null;
       microphoneAudioContextRef.current?.close().catch(() => undefined);
       microphoneAudioContextRef.current = null;
+      const recorderSession = liveTurnRecorderSessionRef.current;
+      if (recorderSession) {
+        recorderSession.recorder.ondataavailable = null;
+        recorderSession.recorder.onerror = null;
+        recorderSession.recorder.onstop = null;
+        try {
+          if (recorderSession.recorder.state !== "inactive") {
+            recorderSession.recorder.stop();
+          }
+        } catch {
+          // Ignore recorder cleanup errors.
+        }
+        liveTurnRecorderSessionRef.current = null;
+      }
+      microphoneHighPassStateRef.current = createSpeechHighPassState();
+      microphoneLowPassStateRef.current = createSpeechLowPassState();
+      microphoneNoiseGateStateRef.current = createSpeechNoiseGateState();
       standbyPreRollRef.current = [];
       standbyPreRollDurationMsRef.current = 0;
       resetStandbyVoiceActivationState({ resetNoiseFloor: true });
@@ -1649,13 +1888,13 @@ export function LiveTalkPanel({
           stream.getTracks().forEach((track) => track.stop());
           throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
         }
-        preferMediaQualityAudio(stream);
+        preferSpeechQualityAudio(stream);
         microphoneStreamRef.current = stream;
         microphoneStreamDeviceIdRef.current = audioTrack?.getSettings().deviceId ?? preferredDeviceId ?? null;
-        const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-        if (AudioContextCtor) {
+        const initialAudioContext = createSpeechAudioContext();
+        if (initialAudioContext) {
           try {
-            const audioContext = microphoneAudioContextRef.current ?? new AudioContextCtor();
+            const audioContext = microphoneAudioContextRef.current ?? initialAudioContext;
             microphoneAudioContextRef.current = audioContext;
             if (audioContext.state === "suspended") {
               void audioContext.resume().catch(() => undefined);
@@ -1664,7 +1903,7 @@ export function LiveTalkPanel({
             const gain = audioContext.createGain();
             const processor = audioContext.createScriptProcessor(LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE, 1, 1);
             const sinkGain = audioContext.createGain();
-            gain.gain.value = getLiveRecordingCaptureGain(liveRecordingSettingsRef.current);
+            gain.gain.value = 1;
             sinkGain.gain.value = 0;
             source.connect(gain);
             gain.connect(processor);
@@ -1692,16 +1931,22 @@ export function LiveTalkPanel({
 
               const resampled = resampleFloat32Array(inputChannel, audioContext.sampleRate, LIVE_AUDIO_STREAM_SAMPLE_RATE);
               if (resampled.length === 0) return;
+              const cleaned = cleanSpeechSamples(resampled, LIVE_AUDIO_STREAM_SAMPLE_RATE, {
+                highPass: microphoneHighPassStateRef.current,
+                lowPass: microphoneLowPassStateRef.current,
+                noiseGate: microphoneNoiseGateStateRef.current,
+              });
+              const processed = amplifySpeechSamples(cleaned, getLiveRecordingCaptureGain(liveRecordingSettingsRef.current));
               const durationMs = (resampled.length / LIVE_AUDIO_STREAM_SAMPLE_RATE) * 1000;
-              const pcm16Bytes = float32ToPcm16Bytes(resampled);
-              const base64Pcm16 = float32ToBase64Pcm16(resampled);
+              const pcm16Bytes = float32ToPcm16Bytes(processed);
+              const base64Pcm16 = float32ToBase64Pcm16(processed);
               appendStandbyPreRoll(pcm16Bytes, base64Pcm16, durationMs);
               let sumSquares = 0;
-              for (let index = 0; index < resampled.length; index += 1) {
-                const sample = resampled[index] ?? 0;
+              for (let index = 0; index < processed.length; index += 1) {
+                const sample = processed[index] ?? 0;
                 sumSquares += sample * sample;
               }
-              const rms = Math.sqrt(sumSquares / resampled.length);
+              const rms = Math.sqrt(sumSquares / processed.length);
               const currentDb = 20 * Math.log10(Math.max(rms, 1e-6));
 
               const socketConnection = socketRef.current;
@@ -1975,6 +2220,103 @@ export function LiveTalkPanel({
       return id;
     };
 
+    const discardLiveTurnRecorder = (session = liveTurnRecorderSessionRef.current) => {
+      if (!session) return;
+      session.recorder.ondataavailable = null;
+      session.recorder.onerror = null;
+      session.recorder.onstop = null;
+      try {
+        if (session.recorder.state !== "inactive") {
+          session.recorder.stop();
+        }
+      } catch {
+        // Ignore recorder cleanup errors.
+      }
+      if (liveTurnRecorderSessionRef.current === session) {
+        liveTurnRecorderSessionRef.current = null;
+      }
+    };
+
+    const stopLiveTurnRecorder = async (session = liveTurnRecorderSessionRef.current) => {
+      if (!session) {
+        return null;
+      }
+
+      return await new Promise<Blob | null>((resolve) => {
+        let settled = false;
+        const { recorder } = session;
+        const mimeType = recorder.mimeType || "audio/webm";
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          recorder.ondataavailable = null;
+          recorder.onerror = null;
+          recorder.onstop = null;
+          if (liveTurnRecorderSessionRef.current === session) {
+            liveTurnRecorderSessionRef.current = null;
+          }
+          resolve(session.chunks.length > 0 ? new Blob(session.chunks, { type: mimeType }) : null);
+        };
+
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            session.chunks.push(event.data);
+          }
+        };
+        recorder.onerror = () => finish();
+        recorder.onstop = () => finish();
+
+        try {
+          if (recorder.state === "inactive") {
+            finish();
+            return;
+          }
+          recorder.requestData();
+          recorder.stop();
+        } catch {
+          finish();
+        }
+      });
+    };
+
+    const startLiveTurnRecorder = (turnId: string) => {
+      if (typeof MediaRecorder === "undefined") return;
+      const stream = microphoneStreamRef.current;
+      if (!stream?.active) return;
+      const existingSession = liveTurnRecorderSessionRef.current;
+      if (existingSession?.recorder.state === "recording" && existingSession.turnId === turnId) return;
+
+      discardLiveTurnRecorder(existingSession);
+      const mimeType = getPreferredLiveRecordingMimeType();
+      if (!mimeType) return;
+
+      try {
+        const recorder = new MediaRecorder(stream, {
+          audioBitsPerSecond: LIVE_RECORDING_BITS_PER_SECOND,
+          mimeType,
+        });
+        const session: LiveTurnRecorderSession = {
+          chunks: [],
+          recorder,
+          turnId,
+        };
+        recorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            session.chunks.push(event.data);
+          }
+        };
+        recorder.onerror = () => {
+          if (liveTurnRecorderSessionRef.current === session) {
+            liveTurnRecorderSessionRef.current = null;
+          }
+        };
+        liveTurnRecorderSessionRef.current = session;
+        recorder.start(250);
+      } catch {
+        liveTurnRecorderSessionRef.current = null;
+      }
+    };
+
     const sendSelectedTextContext = (socketConnection: WebSocket) => {
       const selection = currentSelectedTextRef.current.trim();
       if (!selection) return "";
@@ -2063,15 +2405,23 @@ export function LiveTalkPanel({
 
     const finalizeUserAudio = () => {
       const userTurnId = userTurnIdRef.current;
-      if (userTurnId && userAudioChunksRef.current.length > 0) {
-        const audioUrl = pcm16ChunksToWavUrl(userAudioChunksRef.current, LIVE_AUDIO_STREAM_SAMPLE_RATE);
-        if (audioUrl) {
-          audioUrlsRef.current.push(audioUrl);
-          setTurns((current) =>
-            current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
-          );
-          moveVideoShareTurnToEnd();
-        }
+      const fallbackChunks = [...userAudioChunksRef.current];
+      const recorderSession = liveTurnRecorderSessionRef.current;
+      if (userTurnId && (fallbackChunks.length > 0 || recorderSession)) {
+        void (async () => {
+          const recorderBlob = await stopLiveTurnRecorder(recorderSession);
+          const recorderAudioUrl = recorderBlob && recorderBlob.size > 0 ? await recorderBlobToSpeechWavUrl(recorderBlob) : null;
+          const audioUrl = recorderAudioUrl ?? pcm16ChunksToWavUrl(fallbackChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE);
+          if (audioUrl) {
+            audioUrlsRef.current.push(audioUrl);
+            setTurns((current) =>
+              current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
+            );
+            moveVideoShareTurnToEnd();
+          }
+        })();
+      } else {
+        discardLiveTurnRecorder();
       }
       userTurnIdRef.current = null;
       userAudioSelectionContextRef.current = "";
@@ -2583,10 +2933,11 @@ export function LiveTalkPanel({
       const cameraImage = sendCameraSnapshotForTurn("speech");
       const screenImage = sendScreenSnapshotForTurn("speech");
       const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
-      ensureUserTurn({
+      const turnId = ensureUserTurn({
         content: [selectionContext, promptContext].filter(Boolean).join("\n\n"),
         images: turnImages,
       });
+      startLiveTurnRecorder(turnId);
       userAudioSentToModelRef.current = true;
       userAudioStreamEndedRef.current = false;
       userAudioActiveRef.current = true;

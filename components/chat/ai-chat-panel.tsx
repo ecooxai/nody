@@ -83,8 +83,14 @@ type MicrophoneSource = {
 };
 
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
-const AUDIO_RECORDING_BITS_PER_SECOND = 128_000;
-const AUDIO_RECORDING_SEND_GAIN = 3;
+const AUDIO_RECORDING_BITS_PER_SECOND = 192_000;
+const AUDIO_RECORDING_SEND_GAIN = 5;
+const SPEECH_CAPTURE_SAMPLE_RATE = 48_000;
+const SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
+const SPEECH_LOW_PASS_CUTOFF_HZ = 7_000;
+const SPEECH_NOISE_GATE_FLOOR_RMS = 0.004;
+const SPEECH_NOISE_GATE_OPEN_RMS = 0.018;
+const SPEECH_NOISE_GATE_MIN_GAIN = 0.25;
 
 function isLocalSystemAudioInput(label?: string | null) {
   return Boolean(label && LOCAL_AUDIO_INPUT_LABEL_PATTERN.test(label));
@@ -94,21 +100,31 @@ function normalizeLiveRecordingSettings(settings?: Partial<LiveRecordingSettings
   return { ...defaultLiveRecordingSettings, ...(settings ?? {}) };
 }
 
+function isAndroidChromeBrowser() {
+  if (typeof navigator === "undefined") return false;
+  const userAgent = navigator.userAgent.toLowerCase();
+  return userAgent.includes("android") && (userAgent.includes("chrome") || userAgent.includes("chromium"));
+}
+
+function shouldRequestNoiseSuppression(settings: LiveRecordingSettings) {
+  return settings.noiseSuppression || isAndroidChromeBrowser();
+}
+
 function buildSpeechMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
   return {
     echoCancellation: settings.echoCancellation,
-    noiseSuppression: settings.noiseSuppression,
+    noiseSuppression: shouldRequestNoiseSuppression(settings),
     autoGainControl: false,
     channelCount: { ideal: 1 },
-    sampleRate: { ideal: 48000 },
+    sampleRate: { ideal: SPEECH_CAPTURE_SAMPLE_RATE },
     sampleSize: { ideal: 16 },
   };
 }
 
-function preferMediaQualityAudio(stream: MediaStream) {
+function preferSpeechQualityAudio(stream: MediaStream) {
   stream.getAudioTracks().forEach((track) => {
     if ("contentHint" in track) {
-      track.contentHint = "music";
+      track.contentHint = "speech";
     }
   });
 }
@@ -335,6 +351,99 @@ function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
   return mono;
 }
 
+function createSpeechAudioContext() {
+  const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) return null;
+  try {
+    return new AudioContextCtor({ sampleRate: SPEECH_CAPTURE_SAMPLE_RATE });
+  } catch {
+    return new AudioContextCtor();
+  }
+}
+
+function highPassSpeechSamples(samples: Float32Array, sampleRate: number) {
+  if (samples.length === 0) return samples;
+
+  const filtered = new Float32Array(samples.length);
+  const rc = 1 / (2 * Math.PI * SPEECH_HIGH_PASS_CUTOFF_HZ);
+  const dt = 1 / sampleRate;
+  const alpha = rc / (rc + dt);
+  let previousInput = samples[0] ?? 0;
+  let previousOutput = 0;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const currentInput = samples[index] ?? 0;
+    const currentOutput = alpha * (previousOutput + currentInput - previousInput);
+    filtered[index] = currentOutput;
+    previousInput = currentInput;
+    previousOutput = currentOutput;
+  }
+
+  return filtered;
+}
+
+function lowPassSpeechSamples(samples: Float32Array, sampleRate: number) {
+  if (samples.length === 0) return samples;
+
+  const filtered = new Float32Array(samples.length);
+  const rc = 1 / (2 * Math.PI * SPEECH_LOW_PASS_CUTOFF_HZ);
+  const dt = 1 / sampleRate;
+  const alpha = dt / (rc + dt);
+  let previousOutput = samples[0] ?? 0;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const currentInput = samples[index] ?? 0;
+    previousOutput += alpha * (currentInput - previousOutput);
+    filtered[index] = previousOutput;
+  }
+
+  return filtered;
+}
+
+function gateQuietSpeechNoise(samples: Float32Array, sampleRate: number) {
+  if (samples.length === 0) return samples;
+
+  const gated = new Float32Array(samples.length);
+  const frameSize = Math.max(1, Math.floor(sampleRate * 0.02));
+  let currentGain = 1;
+
+  for (let offset = 0; offset < samples.length; offset += frameSize) {
+    const end = Math.min(offset + frameSize, samples.length);
+    let sumSquares = 0;
+    for (let index = offset; index < end; index += 1) {
+      const sample = samples[index] ?? 0;
+      sumSquares += sample * sample;
+    }
+
+    const rms = Math.sqrt(sumSquares / Math.max(1, end - offset));
+    const openness = Math.max(
+      0,
+      Math.min(1, (rms - SPEECH_NOISE_GATE_FLOOR_RMS) / (SPEECH_NOISE_GATE_OPEN_RMS - SPEECH_NOISE_GATE_FLOOR_RMS)),
+    );
+    const targetGain = SPEECH_NOISE_GATE_MIN_GAIN + (1 - SPEECH_NOISE_GATE_MIN_GAIN) * openness;
+
+    for (let index = offset; index < end; index += 1) {
+      currentGain += (targetGain - currentGain) * 0.2;
+      gated[index] = (samples[index] ?? 0) * currentGain;
+    }
+  }
+
+  return gated;
+}
+
+function cleanSpeechSamples(samples: Float32Array, sampleRate: number) {
+  return gateQuietSpeechNoise(lowPassSpeechSamples(highPassSpeechSamples(samples, sampleRate), sampleRate), sampleRate);
+}
+
+function amplifySpeechSamples(samples: Float32Array, gain: number) {
+  const amplified = new Float32Array(samples.length);
+  for (let index = 0; index < samples.length; index += 1) {
+    const lifted = (samples[index] ?? 0) * gain;
+    amplified[index] = Math.tanh(lifted);
+  }
+  return amplified;
+}
+
 function encodeMonoPcm16Wav(samples: Float32Array, sampleRate: number) {
   const dataLength = samples.length * 2;
   const wavBuffer = new ArrayBuffer(44 + dataLength);
@@ -381,12 +490,11 @@ function encodeMonoPcm16Wav(samples: Float32Array, sampleRate: number) {
 }
 
 async function normalizeRecordingBlob(blob: Blob) {
-  const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-  if (!AudioContextCtor) {
+  const context = createSpeechAudioContext();
+  if (!context) {
     return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
   }
 
-  const context = new AudioContextCtor();
   try {
     const decoded = await context.decodeAudioData(await blob.arrayBuffer());
     const mono = audioBufferToMonoFloat32Array(decoded);
@@ -399,13 +507,11 @@ async function normalizeRecordingBlob(blob: Blob) {
       return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
     }
 
-    const normalized = new Float32Array(mono.length);
-    for (let index = 0; index < mono.length; index += 1) {
-      normalized[index] = Math.max(-1, Math.min(1, (mono[index] ?? 0) * AUDIO_RECORDING_SEND_GAIN));
-    }
+    const cleaned = cleanSpeechSamples(mono, decoded.sampleRate);
+    const amplified = amplifySpeechSamples(cleaned, AUDIO_RECORDING_SEND_GAIN);
 
     return {
-      blob: new Blob([encodeMonoPcm16Wav(normalized, decoded.sampleRate)], { type: "audio/wav" }),
+      blob: new Blob([encodeMonoPcm16Wav(amplified, decoded.sampleRate)], { type: "audio/wav" }),
       extension: "wav",
       mimeType: "audio/wav",
     };
@@ -1174,7 +1280,7 @@ export function AIChatPanel({
           stream.getTracks().forEach((track) => track.stop());
           throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
         }
-        preferMediaQualityAudio(stream);
+        preferSpeechQualityAudio(stream);
         return stream;
       } catch (error) {
         if (error instanceof Error && error.message.includes("system or loopback audio source")) {
@@ -1191,7 +1297,7 @@ export function AIChatPanel({
       stream.getTracks().forEach((track) => track.stop());
       throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
     }
-    preferMediaQualityAudio(stream);
+    preferSpeechQualityAudio(stream);
     return stream;
   };
 
