@@ -1,4 +1,9 @@
-import type { ProviderName, ProviderSettings } from "@/shared/types";
+import type { LiveRecordingSettings, ProviderName, ProviderSettings } from "@/shared/types";
+
+export const defaultLiveRecordingSettings: LiveRecordingSettings = {
+  echoCancellation: true,
+  noiseSuppression: false,
+};
 
 export const providerDefaults: Record<
   ProviderName,
@@ -26,5 +31,6 @@ export function createDefaultSettings(): ProviderSettings {
     model: providerDefaults.gemini.model,
     liveModel: providerDefaults.gemini.liveModel,
     imageModel: providerDefaults.gemini.imageModel,
+    liveRecording: { ...defaultLiveRecordingSettings },
   };
 }

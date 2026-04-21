@@ -68,6 +68,12 @@ describe("D1 schema", () => {
     expect(documentColumns).toContain("folder_id");
     expect(providerColumns).toContain("live_model");
     expect(providerColumns).toContain("image_model");
+    expect(providerColumns).toContain("live_echo_cancellation");
+    expect(providerColumns).toContain("live_noise_suppression");
+    expect(providerColumns).toContain("live_auto_gain_control");
+    expect(providerColumns).toContain("live_silence_trim");
+    expect(providerColumns).toContain("live_speech_threshold");
+    expect(providerColumns).toContain("live_trim_sensitivity");
   });
 
   it("records the repair migration", () => {
@@ -76,5 +82,8 @@ describe("D1 schema", () => {
 
     expect(migrationNames).toContain("0004_repair_folders_parent_folder_id.sql");
     expect(migrationNames).toContain("0005_ai_prompts.sql");
+    expect(migrationNames).toContain("0008_live_recording_settings.sql");
+    expect(migrationNames).toContain("0009_raise_live_speech_threshold.sql");
+    expect(migrationNames).toContain("0010_raise_live_speech_threshold_again.sql");
   });
 });

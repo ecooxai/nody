@@ -81,25 +81,30 @@ type MicrophoneSource = {
 
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 const AUDIO_RECORDING_BITS_PER_SECOND = 128_000;
-const AUDIO_RECORDING_INPUT_GAIN = 2.5;
+const AUDIO_RECORDING_NORMALIZED_PEAK = 0.86;
+const AUDIO_RECORDING_MAX_NORMALIZE_GAIN = 5;
 
 function isLocalSystemAudioInput(label?: string | null) {
   return Boolean(label && LOCAL_AUDIO_INPUT_LABEL_PATTERN.test(label));
 }
 
-function isAndroidChrome() {
-  if (typeof navigator === "undefined") return false;
-  const userAgent = navigator.userAgent;
-  return /Android/i.test(userAgent) && /Chrome|Chromium|CriOS/i.test(userAgent) && !/EdgA|Firefox|OPR/i.test(userAgent);
-}
-
 function buildSpeechMicAudioConstraints(): MediaTrackConstraints {
   return {
-    echoCancellation: true,
+    echoCancellation: false,
     noiseSuppression: false,
     autoGainControl: false,
     channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48000 },
+    sampleSize: { ideal: 16 },
   };
+}
+
+function preferMediaQualityAudio(stream: MediaStream) {
+  stream.getAudioTracks().forEach((track) => {
+    if ("contentHint" in track) {
+      track.contentHint = "music";
+    }
+  });
 }
 
 const builtInPrompts: PromptTemplate[] = [
@@ -285,18 +290,12 @@ function buildReadAloudPrompt(text: string) {
 
 function getPreferredRecordingMimeType() {
   if (typeof MediaRecorder === "undefined") return null;
-  const opusCandidates = [
+  const candidates = [
     "audio/webm;codecs=opus",
     "audio/webm",
-  ];
-  const mp4Candidates = [
     "audio/mp4;codecs=mp4a.40.2",
     "audio/mp4",
     "audio/x-m4a",
-  ];
-  const candidates = [
-    ...(isAndroidChrome() ? opusCandidates : mp4Candidates),
-    ...(isAndroidChrome() ? mp4Candidates : opusCandidates),
     "audio/wav",
   ];
 
@@ -313,6 +312,103 @@ function recordingExtensionForMimeType(mimeType: string) {
   if (mimeType.includes("mp4") || mimeType.includes("m4a")) return "m4a";
   if (mimeType.includes("wav")) return "wav";
   return "webm";
+}
+
+function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
+  if (buffer.numberOfChannels <= 1) {
+    return new Float32Array(buffer.getChannelData(0));
+  }
+
+  const mono = new Float32Array(buffer.length);
+  for (let channelIndex = 0; channelIndex < buffer.numberOfChannels; channelIndex += 1) {
+    const channel = buffer.getChannelData(channelIndex);
+    for (let sampleIndex = 0; sampleIndex < buffer.length; sampleIndex += 1) {
+      mono[sampleIndex] += (channel[sampleIndex] ?? 0) / buffer.numberOfChannels;
+    }
+  }
+  return mono;
+}
+
+function encodeMonoPcm16Wav(samples: Float32Array, sampleRate: number) {
+  const dataLength = samples.length * 2;
+  const wavBuffer = new ArrayBuffer(44 + dataLength);
+  const view = new DataView(wavBuffer);
+  let offset = 0;
+
+  const writeString = (value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset, value.charCodeAt(index));
+      offset += 1;
+    }
+  };
+
+  writeString("RIFF");
+  view.setUint32(offset, 36 + dataLength, true);
+  offset += 4;
+  writeString("WAVE");
+  writeString("fmt ");
+  view.setUint32(offset, 16, true);
+  offset += 4;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint16(offset, 1, true);
+  offset += 2;
+  view.setUint32(offset, sampleRate, true);
+  offset += 4;
+  view.setUint32(offset, sampleRate * 2, true);
+  offset += 4;
+  view.setUint16(offset, 2, true);
+  offset += 2;
+  view.setUint16(offset, 16, true);
+  offset += 2;
+  writeString("data");
+  view.setUint32(offset, dataLength, true);
+  offset += 4;
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, samples[index] ?? 0));
+    view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    offset += 2;
+  }
+
+  return wavBuffer;
+}
+
+async function normalizeRecordingBlob(blob: Blob) {
+  const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextCtor) {
+    return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
+  }
+
+  const context = new AudioContextCtor();
+  try {
+    const decoded = await context.decodeAudioData(await blob.arrayBuffer());
+    const mono = audioBufferToMonoFloat32Array(decoded);
+    let peak = 0;
+    for (let index = 0; index < mono.length; index += 1) {
+      peak = Math.max(peak, Math.abs(mono[index] ?? 0));
+    }
+
+    if (peak <= 0) {
+      return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
+    }
+
+    const gain = Math.min(AUDIO_RECORDING_MAX_NORMALIZE_GAIN, Math.max(1, AUDIO_RECORDING_NORMALIZED_PEAK / peak));
+    const normalized = new Float32Array(mono.length);
+    for (let index = 0; index < mono.length; index += 1) {
+      normalized[index] = Math.max(-1, Math.min(1, (mono[index] ?? 0) * gain));
+    }
+
+    return {
+      blob: new Blob([encodeMonoPcm16Wav(normalized, decoded.sampleRate)], { type: "audio/wav" }),
+      extension: "wav",
+      mimeType: "audio/wav",
+    };
+  } catch {
+    return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
+  } finally {
+    context.close().catch(() => undefined);
+  }
 }
 
 function getPreferredVideoMimeType() {
@@ -552,11 +648,6 @@ export function AIChatPanel({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
-  const recordingAmplifiedStreamRef = useRef<MediaStream | null>(null);
-  const recordingAudioContextRef = useRef<AudioContext | null>(null);
-  const recordingAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const recordingAudioGainRef = useRef<GainNode | null>(null);
-  const recordingAudioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTargetRef = useRef<"chat" | "live">("chat");
   const recordHoldActiveRef = useRef(false);
@@ -996,11 +1087,6 @@ export function AIChatPanel({
     () => () => {
       attachmentsRef.current.forEach(revokeAttachmentPreview);
       mediaRecorderRef.current?.stop?.();
-      recordingAmplifiedStreamRef.current?.getTracks().forEach((track) => track.stop());
-      recordingAudioSourceRef.current?.disconnect();
-      recordingAudioGainRef.current?.disconnect();
-      recordingAudioDestinationRef.current?.disconnect();
-      recordingAudioContextRef.current?.close().catch(() => undefined);
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
       if (microphoneLongPressTimerRef.current) {
         window.clearTimeout(microphoneLongPressTimerRef.current);
@@ -1021,45 +1107,8 @@ export function AIChatPanel({
   );
 
   const stopRecordingStream = () => {
-    recordingAmplifiedStreamRef.current?.getTracks().forEach((track) => track.stop());
-    recordingAmplifiedStreamRef.current = null;
-    recordingAudioSourceRef.current?.disconnect();
-    recordingAudioSourceRef.current = null;
-    recordingAudioGainRef.current?.disconnect();
-    recordingAudioGainRef.current = null;
-    recordingAudioDestinationRef.current?.disconnect();
-    recordingAudioDestinationRef.current = null;
-    recordingAudioContextRef.current?.close().catch(() => undefined);
-    recordingAudioContextRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
-  };
-
-  const createAmplifiedRecordingStream = async (stream: MediaStream) => {
-    const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextCtor) {
-      return stream;
-    }
-
-    const context = new AudioContextCtor();
-    if (context.state === "suspended") {
-      await context.resume().catch(() => undefined);
-    }
-
-    const source = context.createMediaStreamSource(stream);
-    const gain = context.createGain();
-    const destination = context.createMediaStreamDestination();
-    gain.gain.value = AUDIO_RECORDING_INPUT_GAIN;
-    source.connect(gain);
-    gain.connect(destination);
-
-    recordingAudioContextRef.current = context;
-    recordingAudioSourceRef.current = source;
-    recordingAudioGainRef.current = gain;
-    recordingAudioDestinationRef.current = destination;
-    recordingAmplifiedStreamRef.current = destination.stream;
-
-    return destination.stream;
   };
 
   const clearMicrophoneLongPressTimer = () => {
@@ -1117,6 +1166,7 @@ export function AIChatPanel({
           stream.getTracks().forEach((track) => track.stop());
           throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
         }
+        preferMediaQualityAudio(stream);
         return stream;
       } catch (error) {
         if (error instanceof Error && error.message.includes("system or loopback audio source")) {
@@ -1133,6 +1183,7 @@ export function AIChatPanel({
       stream.getTracks().forEach((track) => track.stop());
       throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
     }
+    preferMediaQualityAudio(stream);
     return stream;
   };
 
@@ -1389,6 +1440,12 @@ export function AIChatPanel({
     setPromptPickerOpen(false);
     resetPromptEditor();
     setPrompt("");
+  };
+
+  const clearPromptTextDraft = () => {
+    setPrompt("");
+    setPromptPickerOpen(false);
+    resetPromptEditor();
   };
 
   const savePromptTemplate = async () => {
@@ -1821,11 +1878,11 @@ export function AIChatPanel({
       recorder.onstop = async () => {
         try {
           const mimeType = recorder.mimeType || "audio/webm";
-          const extension = recordingExtensionForMimeType(mimeType);
-          const blob = new Blob(recordedChunksRef.current, { type: mimeType });
+          const originalBlob = new Blob(recordedChunksRef.current, { type: mimeType });
+          const normalizedRecording = await normalizeRecordingBlob(originalBlob);
           recordedChunksRef.current = [];
-          const file = new File([blob], `recording-${Date.now()}.${extension}`, {
-            type: mimeType,
+          const file = new File([normalizedRecording.blob], `recording-${Date.now()}.${normalizedRecording.extension}`, {
+            type: normalizedRecording.mimeType,
             lastModified: Date.now(),
           });
           if (recordingTargetRef.current === "live") {
@@ -1841,6 +1898,7 @@ export function AIChatPanel({
             if (!sent) {
               throw new Error("Couldn't send the recording to live talk.");
             }
+            clearPromptTextDraft();
           } else {
             const recordedAttachment = createFileAttachment(file, "audio");
             await submitPrompt([...attachmentsRef.current, recordedAttachment], [recordedAttachment], { preserveComposer: true });
@@ -1896,7 +1954,6 @@ export function AIChatPanel({
     try {
       const stream = await requestMicrophoneStream(selectedMicrophoneId);
       mediaStreamRef.current = stream;
-      const recordingStream = await createAmplifiedRecordingStream(stream);
       const resolvedDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId ?? null;
       if (resolvedDeviceId && resolvedDeviceId !== selectedMicrophoneId) {
         setSelectedMicrophoneId(resolvedDeviceId);
@@ -1904,7 +1961,7 @@ export function AIChatPanel({
         setSelectedMicrophoneId(null);
       }
       recordedChunksRef.current = [];
-      const recorder = new MediaRecorder(recordingStream, { audioBitsPerSecond: AUDIO_RECORDING_BITS_PER_SECOND, mimeType });
+      const recorder = new MediaRecorder(stream, { audioBitsPerSecond: AUDIO_RECORDING_BITS_PER_SECOND, mimeType });
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           recordedChunksRef.current.push(event.data);
@@ -3326,6 +3383,7 @@ export function AIChatPanel({
             onInsertGeneratedImageInNote={onInsertGeneratedImageInNote}
             onFindInNote={onFindInNote}
             onLatestMessageStateChange={handleLiveLatestMessageStateChange}
+            onLiveSpeechSent={clearPromptTextDraft}
             onOpenNote={onOpenNote}
             onScrollNote={onScrollNote}
             onRegisterHistoryControls={setLiveHistoryControls}

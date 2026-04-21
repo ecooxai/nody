@@ -1,6 +1,11 @@
 export type ProviderName = "openai" | "gemini";
 export type AIMediaKind = "image" | "audio" | "video";
 
+export type LiveRecordingSettings = {
+  echoCancellation: boolean;
+  noiseSuppression: boolean;
+};
+
 export type DocumentAsset = {
   id: string;
   kind: AIMediaKind;
@@ -48,6 +53,7 @@ export type ProviderSettings = {
   model: string;
   liveModel: string;
   imageModel: string;
+  liveRecording: LiveRecordingSettings;
 };
 
 export type SyncPayload = {

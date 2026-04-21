@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Panel } from "@/components/ui/panel";
-import { providerDefaults } from "@/lib/providers/defaults";
+import { defaultLiveRecordingSettings, providerDefaults } from "@/lib/providers/defaults";
 import type { ProviderName, ProviderSettings } from "@/shared/types";
 
 export function ProviderSettingsForm({
@@ -22,6 +22,7 @@ export function ProviderSettingsForm({
   }, [initialValue]);
 
   const updateProvider = (provider: ProviderName) => {
+    const liveRecording = { ...defaultLiveRecordingSettings, ...(value.liveRecording ?? {}) };
     setValue({
       provider,
       apiUrl: providerDefaults[provider].apiUrl,
@@ -29,8 +30,10 @@ export function ProviderSettingsForm({
       model: providerDefaults[provider].model,
       liveModel: providerDefaults[provider].liveModel,
       imageModel: providerDefaults[provider].imageModel,
+      liveRecording,
     });
   };
+  const liveRecording = { ...defaultLiveRecordingSettings, ...(value.liveRecording ?? {}) };
 
   return (
     <Panel>
@@ -102,6 +105,40 @@ export function ProviderSettingsForm({
             </label>
           </>
         ) : null}
+        <div className="mt-2 grid gap-3 border-t border-ink/10 pt-4">
+          <div>
+            <h3 className="text-sm font-semibold">Live recording</h3>
+            <p className="text-xs text-ink/55">Browser support varies by device. Unsupported audio constraints are ignored by the browser.</p>
+          </div>
+          <label className="flex items-center justify-between gap-3 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
+            <span>Echo cancellation</span>
+            <input
+              checked={liveRecording.echoCancellation}
+              className="h-4 w-4"
+              onChange={(event) =>
+                setValue({
+                  ...value,
+                  liveRecording: { ...liveRecording, echoCancellation: event.target.checked },
+                })
+              }
+              type="checkbox"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
+            <span>Noise reduction</span>
+            <input
+              checked={liveRecording.noiseSuppression}
+              className="h-4 w-4"
+              onChange={(event) =>
+                setValue({
+                  ...value,
+                  liveRecording: { ...liveRecording, noiseSuppression: event.target.checked },
+                })
+              }
+              type="checkbox"
+            />
+          </label>
+        </div>
       </div>
       <Button
         className="mt-4 !bg-ink !text-white hover:!bg-ink/90"

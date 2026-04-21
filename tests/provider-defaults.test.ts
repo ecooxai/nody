@@ -11,5 +11,9 @@ describe("provider defaults", () => {
     expect(settings.model).toBe(providerDefaults.gemini.model);
     expect(settings.liveModel).toBe(providerDefaults.gemini.liveModel);
     expect(settings.imageModel).toBe(providerDefaults.gemini.imageModel);
+    expect(settings.liveRecording).toMatchObject({
+      echoCancellation: true,
+      noiseSuppression: false,
+    });
   });
 });

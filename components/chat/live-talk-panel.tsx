@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { apiClient } from "@/lib/api/client";
 import { stripMarkdown } from "@/lib/editor/markdown";
-import type { AIMediaKind, AINoteReference, ProviderSettings, TextSubstitution } from "@/shared/types";
+import { defaultLiveRecordingSettings } from "@/lib/providers/defaults";
+import type { AIMediaKind, AINoteReference, LiveRecordingSettings, ProviderSettings, TextSubstitution } from "@/shared/types";
 
 type LiveGeneratedImage = {
   id: string;
@@ -67,13 +68,10 @@ type LiveSessionState = {
   status: string;
 };
 
-const LIVE_MIC_SPEECH_RMS_THRESHOLD = 0.008;
-const LIVE_MIC_SPEECH_START_MS = 220;
-const LIVE_MIC_MIN_TURN_SPEECH_MS = 900;
-const LIVE_MIC_TRAILING_AUDIO_MS = 450;
-const LIVE_MIC_TURN_END_SILENCE_MS = 850;
 const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.45;
-const LIVE_MIC_INPUT_GAIN = 2.5;
+const LIVE_RECORDING_NO_ECHO_GAIN = 3;
+const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
+const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 
 export type LiveSendAttachment = {
@@ -236,7 +234,7 @@ function resampleFloat32Array(input: Float32Array, inputRate: number, outputRate
   return output;
 }
 
-function float32ToBase64Pcm16(input: Float32Array) {
+function float32ToPcm16Bytes(input: Float32Array) {
   const bytes = new Uint8Array(input.length * 2);
   const view = new DataView(bytes.buffer);
 
@@ -245,22 +243,18 @@ function float32ToBase64Pcm16(input: Float32Array) {
     view.setInt16(index * 2, clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff, true);
   }
 
+  return bytes;
+}
+
+function float32ToBase64Pcm16(input: Float32Array) {
+  const bytes = float32ToPcm16Bytes(input);
+
   let binary = "";
   const chunkSize = 0x8000;
   for (let offset = 0; offset < bytes.length; offset += chunkSize) {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
   }
   return btoa(binary);
-}
-
-function amplifyFloat32Samples(input: Float32Array, gain: number) {
-  if (gain === 1) return input;
-
-  const output = new Float32Array(input.length);
-  for (let index = 0; index < input.length; index += 1) {
-    output[index] = Math.max(-1, Math.min(1, (input[index] ?? 0) * gain));
-  }
-  return output;
 }
 
 function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
@@ -278,13 +272,30 @@ function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
   return mono;
 }
 
-function buildLiveMicAudioConstraints(): MediaTrackConstraints {
+function getLiveRecordingCaptureGain(settings: LiveRecordingSettings) {
+  return settings.echoCancellation ? 1 : LIVE_RECORDING_NO_ECHO_GAIN;
+}
+
+function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
   return {
-    echoCancellation: true,
-    noiseSuppression: false,
-    autoGainControl: false,
+    echoCancellation: settings.echoCancellation,
+    noiseSuppression: settings.noiseSuppression,
     channelCount: { ideal: 1 },
+    sampleRate: { ideal: 48000 },
+    sampleSize: { ideal: 16 },
   };
+}
+
+function preferMediaQualityAudio(stream: MediaStream) {
+  stream.getAudioTracks().forEach((track) => {
+    if ("contentHint" in track) {
+      track.contentHint = "music";
+    }
+  });
+}
+
+function normalizeLiveRecordingSettings(settings?: Partial<LiveRecordingSettings>): LiveRecordingSettings {
+  return { ...defaultLiveRecordingSettings, ...(settings ?? {}) };
 }
 
 async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000, chunkSize = 3200) {
@@ -772,6 +783,7 @@ export function LiveTalkPanel({
   onImageGenerationStateChange,
   onInsertGeneratedImageInNote,
   onLatestMessageStateChange,
+  onLiveSpeechSent,
   onOpenNote,
   onFindInNote,
   onScrollNote,
@@ -802,6 +814,7 @@ export function LiveTalkPanel({
   onImageGenerationStateChange?: ((generating: boolean) => void) | undefined;
   onInsertGeneratedImageInNote: (attachment: { fileName: string; mimeType: string; previewUrl: string }, lineNumber?: number) => Promise<boolean>;
   onLatestMessageStateChange?: ((available: boolean) => void) | undefined;
+  onLiveSpeechSent?: (() => void) | undefined;
   onOpenNote: (target: { noteId?: string; title?: string }) => boolean;
   onFindInNote: (target: { query: string; occurrence?: "first" | "next" | "previous" }) => boolean;
   onScrollNote: (target: { target: "top" | "middle" | "bottom" | "line" | "up" | "down"; lineNumber?: number; pixels?: number }) => boolean;
@@ -832,8 +845,15 @@ export function LiveTalkPanel({
   const microphoneStreamDeviceIdRef = useRef<string | null>(null);
   const microphoneAudioContextRef = useRef<AudioContext | null>(null);
   const microphoneSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const microphoneGainRef = useRef<GainNode | null>(null);
   const microphoneProcessorRef = useRef<ScriptProcessorNode | null>(null);
-  const microphoneSinkRef = useRef<GainNode | null>(null);
+  const microphoneSinkGainRef = useRef<GainNode | null>(null);
+  const microphoneStreamingPausedRef = useRef(false);
+  const webappPlaybackCountRef = useRef(0);
+  const webappPlaybackResumeTimerRef = useRef<number | null>(null);
+  const webappPlayingMediaElementsRef = useRef<Set<HTMLMediaElement>>(new Set());
+  const pauseLiveSpeechRecordingRef = useRef(() => {});
+  const resumeLiveSpeechRecordingRef = useRef(() => {});
   const assistantPlaybackGainRef = useRef<GainNode | null>(null);
   const onFindInNoteRef = useRef(onFindInNote);
   const onScrollNoteRef = useRef(onScrollNote);
@@ -845,6 +865,7 @@ export function LiveTalkPanel({
   const microphoneCaptureEnabledRef = useRef(active && (microphoneEnabled ?? true));
   const microphoneEnabledRef = useRef(microphoneEnabled ?? true);
   const preferredMicrophoneDeviceIdRef = useRef<string | null>(microphoneDeviceId ?? null);
+  const liveRecordingSettingsRef = useRef<LiveRecordingSettings>(normalizeLiveRecordingSettings(providerSettings.liveRecording));
   const requestMicrophoneRef = useRef<() => Promise<MediaStream | null>>(async () => null);
   const resetMicrophoneRef = useRef(() => {});
   const noteContext = useMemo(
@@ -860,6 +881,7 @@ export function LiveTalkPanel({
   const onDisconnectRequestRef = useRef(onDisconnectRequest);
   const onInsertGeneratedImageInNoteRef = useRef(onInsertGeneratedImageInNote);
   const onOpenNoteRef = useRef(onOpenNote);
+  const onLiveSpeechSentRef = useRef(onLiveSpeechSent);
   const onVideoShareStateChangeRef = useRef(onVideoShareStateChange);
   const speechPromptRef = useRef(speechPrompt ?? "");
   const sendLiveHandleRef = useRef<LiveSendHandle>({
@@ -926,9 +948,76 @@ export function LiveTalkPanel({
     }, 5000);
   }, []);
 
+  const beginWebappPlayback = useCallback(() => {
+    if (webappPlaybackResumeTimerRef.current) {
+      window.clearTimeout(webappPlaybackResumeTimerRef.current);
+      webappPlaybackResumeTimerRef.current = null;
+    }
+    webappPlaybackCountRef.current += 1;
+    pauseLiveSpeechRecordingRef.current();
+  }, []);
+
+  const endWebappPlayback = useCallback(() => {
+    webappPlaybackCountRef.current = Math.max(0, webappPlaybackCountRef.current - 1);
+    if (webappPlaybackCountRef.current === 0) {
+      const resumeDelayMs = Math.max(0, assistantPlaybackMutedUntilRef.current - performance.now());
+      if (resumeDelayMs > 0) {
+        webappPlaybackResumeTimerRef.current = window.setTimeout(() => {
+          webappPlaybackResumeTimerRef.current = null;
+          if (webappPlaybackCountRef.current === 0) {
+            resumeLiveSpeechRecordingRef.current();
+          }
+        }, resumeDelayMs);
+        return;
+      }
+      resumeLiveSpeechRecordingRef.current();
+    }
+  }, []);
+
   useEffect(() => {
     turnsRef.current = turns;
   }, [turns]);
+
+  useEffect(() => {
+    const isAudibleMediaElement = (target: EventTarget | null): target is HTMLMediaElement =>
+      target instanceof HTMLMediaElement && !target.muted && target.volume > 0;
+
+    const handleMediaPlaybackStart = (event: Event) => {
+      const element = event.target;
+      if (!isAudibleMediaElement(element) || webappPlayingMediaElementsRef.current.has(element)) return;
+      webappPlayingMediaElementsRef.current.add(element);
+      beginWebappPlayback();
+    };
+
+    const handleMediaPlaybackStop = (event: Event) => {
+      const element = event.target;
+      if (!(element instanceof HTMLMediaElement) || !webappPlayingMediaElementsRef.current.delete(element)) return;
+      endWebappPlayback();
+    };
+
+    document.addEventListener("play", handleMediaPlaybackStart, true);
+    document.addEventListener("playing", handleMediaPlaybackStart, true);
+    document.addEventListener("pause", handleMediaPlaybackStop, true);
+    document.addEventListener("ended", handleMediaPlaybackStop, true);
+    document.addEventListener("emptied", handleMediaPlaybackStop, true);
+    document.addEventListener("abort", handleMediaPlaybackStop, true);
+
+    return () => {
+      document.removeEventListener("play", handleMediaPlaybackStart, true);
+      document.removeEventListener("playing", handleMediaPlaybackStart, true);
+      document.removeEventListener("pause", handleMediaPlaybackStop, true);
+      document.removeEventListener("ended", handleMediaPlaybackStop, true);
+      document.removeEventListener("emptied", handleMediaPlaybackStop, true);
+      document.removeEventListener("abort", handleMediaPlaybackStop, true);
+      const playingElements = webappPlayingMediaElementsRef.current.size;
+      webappPlayingMediaElementsRef.current.clear();
+      webappPlaybackCountRef.current = Math.max(0, webappPlaybackCountRef.current - playingElements);
+      if (webappPlaybackResumeTimerRef.current) {
+        window.clearTimeout(webappPlaybackResumeTimerRef.current);
+        webappPlaybackResumeTimerRef.current = null;
+      }
+    };
+  }, [beginWebappPlayback, endWebappPlayback]);
 
   const clearVideoShareIdleTimer = () => {
     if (videoShareIdleTimerRef.current) {
@@ -1027,6 +1116,7 @@ export function LiveTalkPanel({
     activeRef.current = active;
     microphoneEnabledRef.current = microphoneEnabled ?? true;
     preferredMicrophoneDeviceIdRef.current = microphoneDeviceId ?? null;
+    liveRecordingSettingsRef.current = normalizeLiveRecordingSettings(providerSettings.liveRecording);
     const shouldCapture = active && (microphoneEnabled ?? true);
     microphoneCaptureEnabledRef.current = shouldCapture;
     if (!shouldCapture) {
@@ -1037,7 +1127,13 @@ export function LiveTalkPanel({
       resetMicrophoneRef.current();
       void requestMicrophoneRef.current();
     }
-  }, [active, microphoneDeviceId, microphoneEnabled]);
+  }, [
+    active,
+    microphoneDeviceId,
+    microphoneEnabled,
+    providerSettings.liveRecording?.echoCancellation,
+    providerSettings.liveRecording?.noiseSuppression,
+  ]);
 
   useEffect(() => {
     onVideoShareStateChangeRef.current = onVideoShareStateChange;
@@ -1062,6 +1158,10 @@ export function LiveTalkPanel({
   useEffect(() => {
     onOpenNoteRef.current = onOpenNote;
   }, [onOpenNote]);
+
+  useEffect(() => {
+    onLiveSpeechSentRef.current = onLiveSpeechSent;
+  }, [onLiveSpeechSent]);
 
   useEffect(() => {
     speechPromptRef.current = speechPrompt ?? "";
@@ -1333,12 +1433,17 @@ export function LiveTalkPanel({
     };
 
     const resetMicrophone = () => {
+      pauseLiveSpeechRecordingRef.current = () => {};
+      resumeLiveSpeechRecordingRef.current = () => {};
+      microphoneStreamingPausedRef.current = false;
       microphoneProcessorRef.current?.disconnect();
       microphoneProcessorRef.current = null;
+      microphoneSinkGainRef.current?.disconnect();
+      microphoneSinkGainRef.current = null;
+      microphoneGainRef.current?.disconnect();
+      microphoneGainRef.current = null;
       microphoneSourceRef.current?.disconnect();
       microphoneSourceRef.current = null;
-      microphoneSinkRef.current?.disconnect();
-      microphoneSinkRef.current = null;
       microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
       microphoneStreamRef.current = null;
       microphoneStreamDeviceIdRef.current = null;
@@ -1360,7 +1465,7 @@ export function LiveTalkPanel({
 
       try {
         resetMicrophone();
-        const audioConstraints = buildLiveMicAudioConstraints();
+        const audioConstraints = buildLiveMicAudioConstraints(liveRecordingSettingsRef.current);
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: preferredDeviceId
             ? {
@@ -1374,8 +1479,83 @@ export function LiveTalkPanel({
           stream.getTracks().forEach((track) => track.stop());
           throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
         }
+        preferMediaQualityAudio(stream);
         microphoneStreamRef.current = stream;
         microphoneStreamDeviceIdRef.current = audioTrack?.getSettings().deviceId ?? preferredDeviceId ?? null;
+        const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+        if (AudioContextCtor) {
+          try {
+            const audioContext = microphoneAudioContextRef.current ?? new AudioContextCtor();
+            microphoneAudioContextRef.current = audioContext;
+            if (audioContext.state === "suspended") {
+              void audioContext.resume().catch(() => undefined);
+            }
+            const source = audioContext.createMediaStreamSource(stream);
+            const gain = audioContext.createGain();
+            const processor = audioContext.createScriptProcessor(LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE, 1, 1);
+            const sinkGain = audioContext.createGain();
+            gain.gain.value = getLiveRecordingCaptureGain(liveRecordingSettingsRef.current);
+            sinkGain.gain.value = 0;
+            source.connect(gain);
+            gain.connect(processor);
+            processor.connect(sinkGain);
+            sinkGain.connect(audioContext.destination);
+            microphoneSourceRef.current = source;
+            microphoneGainRef.current = gain;
+            microphoneProcessorRef.current = processor;
+            microphoneSinkGainRef.current = sinkGain;
+
+            pauseLiveSpeechRecordingRef.current = () => {
+              microphoneStreamingPausedRef.current = true;
+            };
+
+            resumeLiveSpeechRecordingRef.current = () => {
+              if (!microphoneCaptureEnabledRef.current || !stream.active) return;
+              if (webappPlaybackCountRef.current > 0 || performance.now() < assistantPlaybackMutedUntilRef.current) return;
+              microphoneStreamingPausedRef.current = false;
+            };
+
+            processor.onaudioprocess = (event) => {
+              const socketConnection = socketRef.current;
+              if (!microphoneCaptureEnabledRef.current || microphoneStreamingPausedRef.current || !stream.active) return;
+              if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) return;
+              const inputChannel = event.inputBuffer.numberOfChannels > 0 ? event.inputBuffer.getChannelData(0) : null;
+              if (!inputChannel || inputChannel.length === 0) return;
+
+              if (!userAudioSentToModelRef.current) {
+                const selectionContext = sendSelectedTextContext(socketConnection);
+                const promptContext = sendSpeechPromptContext(socketConnection);
+                userAudioSelectionContextRef.current = selectionContext;
+                userAudioPromptContextRef.current = promptContext;
+                const cameraImage = sendCameraSnapshotForTurn("speech");
+                const screenImage = sendScreenSnapshotForTurn("speech");
+                const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+                ensureUserTurn({
+                  content: [selectionContext, promptContext].filter(Boolean).join("\n\n"),
+                  images: turnImages,
+                });
+                userAudioSentToModelRef.current = true;
+                armVideoShareIdleTimer();
+              }
+              const resampled = resampleFloat32Array(inputChannel, audioContext.sampleRate, LIVE_AUDIO_STREAM_SAMPLE_RATE);
+              if (resampled.length === 0) return;
+              const pcm16Bytes = float32ToPcm16Bytes(resampled);
+              userAudioChunksRef.current.push(pcm16Bytes);
+              socketConnection.send(
+                JSON.stringify({
+                  realtimeInput: {
+                    audio: {
+                      data: float32ToBase64Pcm16(resampled),
+                      mimeType: `audio/pcm;rate=${LIVE_AUDIO_STREAM_SAMPLE_RATE}`,
+                    },
+                  },
+                }),
+              );
+            };
+          } catch {
+            setStatus("Live microphone streaming is not supported in this browser. Text live chat still works.");
+          }
+        }
         stream.getAudioTracks().forEach((track) => {
           track.addEventListener(
             "ended",
@@ -1389,181 +1569,10 @@ export function LiveTalkPanel({
             { once: true },
           );
         });
-        const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-        if (!AudioContextCtor) {
+        if (microphoneProcessorRef.current) {
           return stream;
         }
-
-        const audioContext = microphoneAudioContextRef.current ?? new AudioContextCtor();
-        microphoneAudioContextRef.current = audioContext;
-        if (audioContext.state === "suspended") {
-          void audioContext.resume().catch(() => undefined);
-        }
-
-        const source = audioContext.createMediaStreamSource(stream);
-        const processor = audioContext.createScriptProcessor(4096, 1, 1);
-        const sink = audioContext.createGain();
-        sink.gain.value = 0;
-
-        processor.onaudioprocess = (event) => {
-          if (!microphoneCaptureEnabledRef.current) return;
-          const socketConnection = socketRef.current;
-          if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) return;
-
-          if (performance.now() < assistantPlaybackMutedUntilRef.current) {
-            if (userAudioActiveRef.current) {
-              userAudioActiveRef.current = false;
-              userAudioSentToModelRef.current = false;
-              userAudioSpeechDurationMsRef.current = 0;
-              userAudioSpeechStartMsRef.current = 0;
-              userAudioTrailingSilenceMsRef.current = 0;
-              finalizeUserAudioRef.current();
-            }
-            pendingUserAudioChunksRef.current = [];
-            pendingUserAudioBase64ChunksRef.current = [];
-            pendingSpeechCameraImageRef.current = null;
-            userAudioSentToModelRef.current = false;
-            userAudioSpeechDurationMsRef.current = 0;
-            userAudioSpeechStartMsRef.current = 0;
-            return;
-          }
-
-          const input = event.inputBuffer.getChannelData(0);
-          const resampled = amplifyFloat32Samples(resampleFloat32Array(input, audioContext.sampleRate, 16000), LIVE_MIC_INPUT_GAIN);
-          if (resampled.length === 0) return;
-          const encodedAudio = float32ToBase64Pcm16(resampled);
-
-          let sumSquares = 0;
-          for (let index = 0; index < resampled.length; index += 1) {
-            const sample = resampled[index] ?? 0;
-            sumSquares += sample * sample;
-          }
-          const rms = Math.sqrt(sumSquares / resampled.length);
-          const chunkDurationMs = (resampled.length / 16000) * 1000;
-          const audioBytes = base64ToUint8Array(encodedAudio);
-          const sendAudioChunk = (chunk: string) => {
-            socketConnection.send(
-              JSON.stringify({
-                realtimeInput: {
-                  audio: {
-                    data: chunk,
-                    mimeType: "audio/pcm;rate=16000",
-                  },
-                },
-              }),
-            );
-          };
-          const sendAudioStreamEnd = () => {
-            socketConnection.send(
-              JSON.stringify({
-                realtimeInput: {
-                  audioStreamEnd: true,
-                },
-              }),
-            );
-          };
-          const hasSpeech = rms >= LIVE_MIC_SPEECH_RMS_THRESHOLD;
-          const sendBufferedAudioToModel = () => {
-            if (userAudioSentToModelRef.current) return;
-            userAudioSelectionContextRef.current = sendSelectedTextContext(socketConnection);
-            userAudioPromptContextRef.current = sendSpeechPromptContext(socketConnection);
-            ensureUserTurn({ content: withActiveSelectionContext("") });
-            pendingSpeechCameraImageRef.current = captureCameraSnapshotForSpeechStart();
-            userAudioSentToModelRef.current = true;
-            for (const chunk of pendingUserAudioBase64ChunksRef.current) {
-              sendAudioChunk(chunk);
-            }
-            for (const chunk of pendingUserAudioChunksRef.current) {
-              userAudioChunksRef.current.push(chunk);
-            }
-            pendingUserAudioChunksRef.current = [];
-            pendingUserAudioBase64ChunksRef.current = [];
-          };
-
-          if (hasSpeech && !userAudioActiveRef.current) {
-            pendingUserAudioChunksRef.current.push(audioBytes);
-            pendingUserAudioBase64ChunksRef.current.push(encodedAudio);
-            userAudioSpeechStartMsRef.current += chunkDurationMs;
-            if (userAudioSpeechStartMsRef.current < LIVE_MIC_SPEECH_START_MS) {
-              return;
-            }
-            userAudioActiveRef.current = true;
-            userAudioTrailingSilenceMsRef.current = 0;
-            userAudioSpeechDurationMsRef.current = userAudioSpeechStartMsRef.current;
-            if (userAudioSpeechDurationMsRef.current >= LIVE_MIC_MIN_TURN_SPEECH_MS) {
-              sendBufferedAudioToModel();
-            }
-            userAudioSpeechStartMsRef.current = 0;
-            return;
-          }
-
-          if (hasSpeech && userAudioActiveRef.current) {
-            userAudioTrailingSilenceMsRef.current = 0;
-            userAudioSpeechDurationMsRef.current += chunkDurationMs;
-            if (!userAudioSentToModelRef.current) {
-              pendingUserAudioChunksRef.current.push(audioBytes);
-              pendingUserAudioBase64ChunksRef.current.push(encodedAudio);
-              if (userAudioSpeechDurationMsRef.current >= LIVE_MIC_MIN_TURN_SPEECH_MS) {
-                sendBufferedAudioToModel();
-              }
-              return;
-            }
-            sendAudioChunk(encodedAudio);
-            userAudioChunksRef.current.push(audioBytes);
-            return;
-          }
-
-          if (userAudioActiveRef.current && userAudioTrailingSilenceMsRef.current < LIVE_MIC_TRAILING_AUDIO_MS) {
-            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
-            if (!userAudioSentToModelRef.current) {
-              pendingUserAudioChunksRef.current.push(audioBytes);
-              pendingUserAudioBase64ChunksRef.current.push(encodedAudio);
-              return;
-            }
-            sendAudioChunk(encodedAudio);
-            userAudioChunksRef.current.push(audioBytes);
-            return;
-          }
-
-          if (userAudioActiveRef.current) {
-            userAudioTrailingSilenceMsRef.current += chunkDurationMs;
-            if (userAudioTrailingSilenceMsRef.current >= LIVE_MIC_TURN_END_SILENCE_MS) {
-              const sentToModel = userAudioSentToModelRef.current;
-              userAudioActiveRef.current = false;
-              userAudioSpeechStartMsRef.current = 0;
-              userAudioTrailingSilenceMsRef.current = 0;
-              if (sentToModel) {
-                const cameraImage = sendCameraSnapshotForTurn("speech");
-                const screenImage = sendScreenSnapshotForTurn("speech");
-                const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
-                if (turnImages.length > 0) {
-                  appendImagesToUserTurn(turnImages, userTurnIdRef.current);
-                }
-                sendAudioStreamEnd();
-              } else if (userAudioSpeechDurationMsRef.current > 0) {
-                setStatus("Ignored short audio.");
-              }
-              finalizeUserAudioRef.current();
-            }
-            return;
-          }
-
-          pendingUserAudioChunksRef.current = [];
-          pendingUserAudioBase64ChunksRef.current = [];
-          pendingSpeechCameraImageRef.current = null;
-          userAudioSentToModelRef.current = false;
-          userAudioSpeechDurationMsRef.current = 0;
-          userAudioSpeechStartMsRef.current = 0;
-        };
-
-        source.connect(processor);
-        processor.connect(sink);
-        sink.connect(audioContext.destination);
-
-        microphoneSourceRef.current = source;
-        microphoneProcessorRef.current = processor;
-        microphoneSinkRef.current = sink;
-
+        setStatus("Live microphone streaming is not supported in this browser. Text live chat still works.");
         return stream;
       } catch (error) {
         setStatus(error instanceof Error ? `${error.message} Text live chat still works.` : "Microphone access was not granted. Text live chat still works.");
@@ -1574,14 +1583,22 @@ export function LiveTalkPanel({
     requestMicrophoneRef.current = requestMicrophone;
     resetMicrophoneRef.current = resetMicrophone;
 
-    const ensureUserTurn = (defaults?: { content?: string }) => {
+    const ensureUserTurn = (defaults?: { content?: string; images?: LiveGeneratedImage[] }) => {
       const existingId = userTurnIdRef.current;
       if (existingId) {
         return existingId;
       }
       const id = crypto.randomUUID();
       userTurnIdRef.current = id;
-      setTurns((current) => [...current, { id, role: "user", content: defaults?.content ?? "" }]);
+      setTurns((current) => [
+        ...current,
+        {
+          id,
+          role: "user",
+          content: defaults?.content ?? "",
+          images: defaults?.images?.length ? defaults.images : undefined,
+        },
+      ]);
       return id;
     };
 
@@ -1673,27 +1690,15 @@ export function LiveTalkPanel({
 
     const finalizeUserAudio = () => {
       const userTurnId = userTurnIdRef.current;
-      if (!userTurnId) {
-        userAudioChunksRef.current = [];
-        pendingUserAudioChunksRef.current = [];
-        pendingUserAudioBase64ChunksRef.current = [];
-        pendingSpeechCameraImageRef.current = null;
-        userAudioSpeechStartMsRef.current = 0;
-        userAudioSelectionContextRef.current = "";
-        userAudioPromptContextRef.current = "";
-        userAudioActiveRef.current = false;
-        userAudioSentToModelRef.current = false;
-        userAudioSpeechDurationMsRef.current = 0;
-        userAudioTrailingSilenceMsRef.current = 0;
-        return;
-      }
-      const audioUrl = pcm16ChunksToWavUrl(userAudioChunksRef.current, 16000);
-      if (audioUrl) {
-        audioUrlsRef.current.push(audioUrl);
-        setTurns((current) =>
-          current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
-        );
-        moveVideoShareTurnToEnd();
+      if (userTurnId && userAudioChunksRef.current.length > 0) {
+        const audioUrl = pcm16ChunksToWavUrl(userAudioChunksRef.current, LIVE_AUDIO_STREAM_SAMPLE_RATE);
+        if (audioUrl) {
+          audioUrlsRef.current.push(audioUrl);
+          setTurns((current) =>
+            current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
+          );
+          moveVideoShareTurnToEnd();
+        }
       }
       userTurnIdRef.current = null;
       userAudioSelectionContextRef.current = "";
@@ -1870,7 +1875,21 @@ export function LiveTalkPanel({
       source.buffer = buffer;
       source.connect(gain ?? context.destination);
       const startAt = Math.max(nextAudioTimeRef.current, context.currentTime);
-      source.start(startAt);
+      let playbackTracked = false;
+      source.onended = () => {
+        if (!playbackTracked) return;
+        playbackTracked = false;
+        endWebappPlayback();
+      };
+      beginWebappPlayback();
+      playbackTracked = true;
+      try {
+        source.start(startAt);
+      } catch {
+        playbackTracked = false;
+        endWebappPlayback();
+        return;
+      }
       nextAudioTimeRef.current = startAt + buffer.duration;
       const mutedUntil = performance.now() + Math.max(0, nextAudioTimeRef.current - context.currentTime) * 1000 + 350;
       assistantPlaybackMutedUntilRef.current = Math.max(assistantPlaybackMutedUntilRef.current, mutedUntil);
@@ -2454,16 +2473,27 @@ export function LiveTalkPanel({
 
       const blob = await loadAttachmentBlob(attachment);
       if (attachment.kind === "audio") {
-        const decodedAudio = await decodeAudioBlobToPcm16ChunksBase64(blob);
-        if (decodedAudio.durationMs < LIVE_MIC_MIN_TURN_SPEECH_MS) {
-          setStatus("Ignored short audio.");
-          return true;
-        }
         const selectionContext = sendSelectedTextContext(socketConnection);
         const promptContext = sendSpeechPromptContext(socketConnection);
         const cameraImage = sendCameraSnapshotForTurn("audio");
         const screenImage = sendScreenSnapshotForTurn("audio");
         const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+        const audioUrl = URL.createObjectURL(blob);
+        audioUrlsRef.current.push(audioUrl);
+        setTurns((current) => [
+          ...current,
+          {
+            id: crypto.randomUUID(),
+            role: "user",
+            content: [selectionContext, promptContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
+            audioUrl,
+            images: turnImages.length > 0 ? turnImages : undefined,
+          },
+        ]);
+        moveVideoShareTurnToEnd();
+        setStatus(`${attachment.fileName} recorded.`);
+
+        const decodedAudio = await decodeAudioBlobToPcm16ChunksBase64(blob);
         for (const chunk of decodedAudio.chunks) {
           socketConnection.send(
             JSON.stringify({
@@ -2483,16 +2513,6 @@ export function LiveTalkPanel({
             },
           }),
         );
-        setTurns((current) => [
-          ...current,
-          {
-            id: crypto.randomUUID(),
-            role: "user",
-            content: [selectionContext, promptContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
-            images: turnImages.length > 0 ? turnImages : undefined,
-          },
-        ]);
-        moveVideoShareTurnToEnd();
         setStatus(`${attachment.fileName} sent to live talk.`);
         armVideoShareIdleTimer();
         recordLiveContextUsage(`Sent audio clip: ${attachment.fileName}`, turnImages.length);
@@ -3308,7 +3328,9 @@ export function LiveTalkPanel({
       onRegisterVideoControls?.(null);
     };
   }, [
+    beginWebappPlayback,
     connectionRevision,
+    endWebappPlayback,
     onImageGenerationStateChange,
     onError,
     onRegisterSend,
