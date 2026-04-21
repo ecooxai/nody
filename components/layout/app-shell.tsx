@@ -1,15 +1,14 @@
 "use client";
 
-import { SignedIn, SignedOut, SignInButton, UserButton } from "@clerk/nextjs";
+import { UserButton, useAuth } from "@clerk/nextjs";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 
-import { Button } from "@/components/ui/button";
 import { clerkClientConfigured } from "@/lib/auth/config";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isWorkspaceRoute = pathname.startsWith("/workspace");
+  const isWorkspaceRoute = pathname?.startsWith("/workspace") ?? false;
 
   return (
     <div className="min-h-screen bg-[radial-gradient(circle_at_top,#fff9ee,white_55%,#e7efe8)] text-ink">
@@ -23,23 +22,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
               Workspace
             </Link>
             {clerkClientConfigured ? (
-              <>
-                <SignedOut>
-                  <SignInButton mode="modal">
-                    <Button type="button">Sign in</Button>
-                  </SignInButton>
-                </SignedOut>
-                <SignedIn>
-                  <UserButton />
-                </SignedIn>
-              </>
-            ) : (
-              <div className="rounded-full bg-white px-3 py-2 text-xs text-ink/60">Local mode</div>
-            )}
+              <ClerkAccessControls />
+            ) : null}
           </div>
         </header>
       )}
       <main className={isWorkspaceRoute ? "w-full px-0 pb-0" : "mx-auto w-full max-w-7xl px-4 pb-10 sm:px-6"}>{children}</main>
     </div>
+  );
+}
+
+function ClerkAccessControls() {
+  const { isLoaded, isSignedIn } = useAuth();
+
+  if (isLoaded && isSignedIn) {
+    return <UserButton />;
+  }
+
+  return (
+    <>
+      <Link className="rounded-full bg-white px-3 py-2 text-xs text-ink transition hover:bg-mist" href="/sign-in">
+        Sign in
+      </Link>
+      <div className="rounded-full bg-white px-3 py-2 text-xs text-ink/60">Local mode</div>
+    </>
   );
 }

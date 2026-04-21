@@ -1,6 +1,6 @@
 "use client";
 
-import { type TouchEvent, type WheelEvent, useCallback, useEffect, useRef, useState } from "react";
+import { type DragEvent, type TouchEvent, type WheelEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   LiveTalkPanel,
@@ -79,6 +79,29 @@ type MicrophoneSource = {
   label: string;
 };
 
+const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
+const AUDIO_RECORDING_BITS_PER_SECOND = 128_000;
+const AUDIO_RECORDING_INPUT_GAIN = 2.5;
+
+function isLocalSystemAudioInput(label?: string | null) {
+  return Boolean(label && LOCAL_AUDIO_INPUT_LABEL_PATTERN.test(label));
+}
+
+function isAndroidChrome() {
+  if (typeof navigator === "undefined") return false;
+  const userAgent = navigator.userAgent;
+  return /Android/i.test(userAgent) && /Chrome|Chromium|CriOS/i.test(userAgent) && !/EdgA|Firefox|OPR/i.test(userAgent);
+}
+
+function buildSpeechMicAudioConstraints(): MediaTrackConstraints {
+  return {
+    echoCancellation: true,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: { ideal: 1 },
+  };
+}
+
 const builtInPrompts: PromptTemplate[] = [
   {
     id: "builtin-translate-en",
@@ -152,6 +175,44 @@ function inferMediaKind(mimeType: string): AIMediaKind | null {
   return null;
 }
 
+function inferMediaKindFromFile(file: File): AIMediaKind | null {
+  const kind = inferMediaKind(file.type);
+  if (kind) return kind;
+
+  const extension = file.name.toLowerCase().split(".").pop();
+  if (!extension) return null;
+  if (["avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "png", "svg", "tif", "tiff", "webp"].includes(extension)) return "image";
+  if (["aac", "flac", "m4a", "mp3", "oga", "ogg", "opus", "wav", "weba"].includes(extension)) return "audio";
+  if (["avi", "m4v", "mkv", "mov", "mp4", "ogv", "webm"].includes(extension)) return "video";
+  return null;
+}
+
+function fallbackMimeType(file: File, kind: AIMediaKind) {
+  if (file.type) return file.type;
+
+  const extension = file.name.toLowerCase().split(".").pop();
+  if (kind === "image") {
+    if (extension === "png") return "image/png";
+    if (extension === "webp") return "image/webp";
+    if (extension === "gif") return "image/gif";
+    if (extension === "svg") return "image/svg+xml";
+    if (extension === "avif") return "image/avif";
+    return "image/jpeg";
+  }
+  if (kind === "audio") {
+    if (extension === "wav") return "audio/wav";
+    if (extension === "mp3") return "audio/mpeg";
+    if (extension === "m4a") return "audio/mp4";
+    if (extension === "ogg" || extension === "oga" || extension === "opus") return "audio/ogg";
+    if (extension === "flac") return "audio/flac";
+    return "audio/webm";
+  }
+  if (extension === "mp4" || extension === "m4v") return "video/mp4";
+  if (extension === "mov") return "video/quicktime";
+  if (extension === "ogv") return "video/ogg";
+  return "video/webm";
+}
+
 function readFileAsBase64(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -177,6 +238,10 @@ function revokeAttachmentPreview(attachment: LocalAttachment) {
 
 function attachmentBadge(kind: AIMediaKind) {
   return kind.charAt(0).toUpperCase() + kind.slice(1);
+}
+
+function dragEventHasFiles(event: DragEvent<HTMLElement>) {
+  return Array.from(event.dataTransfer.types).includes("Files");
 }
 
 function describeLiveAttachment(attachment: LocalAttachment) {
@@ -220,12 +285,18 @@ function buildReadAloudPrompt(text: string) {
 
 function getPreferredRecordingMimeType() {
   if (typeof MediaRecorder === "undefined") return null;
-  const candidates = [
+  const opusCandidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+  ];
+  const mp4Candidates = [
     "audio/mp4;codecs=mp4a.40.2",
     "audio/mp4",
     "audio/x-m4a",
-    "audio/webm;codecs=opus",
-    "audio/webm",
+  ];
+  const candidates = [
+    ...(isAndroidChrome() ? opusCandidates : mp4Candidates),
+    ...(isAndroidChrome() ? mp4Candidates : opusCandidates),
     "audio/wav",
   ];
 
@@ -312,7 +383,7 @@ async function listMicrophoneSources() {
   }
 
   let devices = await navigator.mediaDevices.enumerateDevices();
-  const microphones = devices.filter((device) => device.kind === "audioinput");
+  const microphones = devices.filter((device) => device.kind === "audioinput" && !isLocalSystemAudioInput(device.label));
   if (microphones.some((device) => device.label)) {
     return microphones.map((device, index) => ({
       deviceId: device.deviceId,
@@ -336,7 +407,7 @@ async function listMicrophoneSources() {
   }
 
   return devices
-    .filter((device) => device.kind === "audioinput")
+    .filter((device) => device.kind === "audioinput" && !isLocalSystemAudioInput(device.label))
     .map((device, index) => ({
       deviceId: device.deviceId,
       label: device.label || `Microphone ${index + 1}`,
@@ -419,6 +490,7 @@ export function AIChatPanel({
   const [previewAttachment, setPreviewAttachment] = useState<PreviewAttachment | null>(null);
   const [previewPrompt, setPreviewPrompt] = useState<AIMessagePrompt | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [fileDropActive, setFileDropActive] = useState(false);
   const [composerCondensed, setComposerCondensed] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [cameraPreviewVisible, setCameraPreviewVisible] = useState(false);
@@ -471,6 +543,7 @@ export function AIChatPanel({
   const [selectedMicrophoneId, setSelectedMicrophoneId] = useState<string | null>(() => loadPreferredMicrophoneDeviceId());
   const [preferredLiveCameraDeviceId, setPreferredLiveCameraDeviceId] = useState<string | null>(() => loadPreferredLiveCameraDeviceId());
   const attachmentsRef = useRef<LocalAttachment[]>([]);
+  const fileDropDepthRef = useRef(0);
   const composerItemsRef = useRef<HTMLDivElement>(null);
   const composerChromeRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -479,6 +552,11 @@ export function AIChatPanel({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const recordingAmplifiedStreamRef = useRef<MediaStream | null>(null);
+  const recordingAudioContextRef = useRef<AudioContext | null>(null);
+  const recordingAudioSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const recordingAudioGainRef = useRef<GainNode | null>(null);
+  const recordingAudioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTargetRef = useRef<"chat" | "live">("chat");
   const recordHoldActiveRef = useRef(false);
@@ -918,6 +996,11 @@ export function AIChatPanel({
     () => () => {
       attachmentsRef.current.forEach(revokeAttachmentPreview);
       mediaRecorderRef.current?.stop?.();
+      recordingAmplifiedStreamRef.current?.getTracks().forEach((track) => track.stop());
+      recordingAudioSourceRef.current?.disconnect();
+      recordingAudioGainRef.current?.disconnect();
+      recordingAudioDestinationRef.current?.disconnect();
+      recordingAudioContextRef.current?.close().catch(() => undefined);
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
       if (microphoneLongPressTimerRef.current) {
         window.clearTimeout(microphoneLongPressTimerRef.current);
@@ -938,8 +1021,45 @@ export function AIChatPanel({
   );
 
   const stopRecordingStream = () => {
+    recordingAmplifiedStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recordingAmplifiedStreamRef.current = null;
+    recordingAudioSourceRef.current?.disconnect();
+    recordingAudioSourceRef.current = null;
+    recordingAudioGainRef.current?.disconnect();
+    recordingAudioGainRef.current = null;
+    recordingAudioDestinationRef.current?.disconnect();
+    recordingAudioDestinationRef.current = null;
+    recordingAudioContextRef.current?.close().catch(() => undefined);
+    recordingAudioContextRef.current = null;
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
+  };
+
+  const createAmplifiedRecordingStream = async (stream: MediaStream) => {
+    const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AudioContextCtor) {
+      return stream;
+    }
+
+    const context = new AudioContextCtor();
+    if (context.state === "suspended") {
+      await context.resume().catch(() => undefined);
+    }
+
+    const source = context.createMediaStreamSource(stream);
+    const gain = context.createGain();
+    const destination = context.createMediaStreamDestination();
+    gain.gain.value = AUDIO_RECORDING_INPUT_GAIN;
+    source.connect(gain);
+    gain.connect(destination);
+
+    recordingAudioContextRef.current = context;
+    recordingAudioSourceRef.current = source;
+    recordingAudioGainRef.current = gain;
+    recordingAudioDestinationRef.current = destination;
+    recordingAmplifiedStreamRef.current = destination.stream;
+
+    return destination.stream;
   };
 
   const clearMicrophoneLongPressTimer = () => {
@@ -984,35 +1104,43 @@ export function AIChatPanel({
       throw new Error("Audio recording is not supported in this browser.");
     }
 
-    const baseConstraints = {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    };
-
+    const audioConstraints = buildSpeechMicAudioConstraints();
     if (deviceId) {
       try {
-        return await navigator.mediaDevices.getUserMedia({
+        const stream = await navigator.mediaDevices.getUserMedia({
           audio: {
             deviceId: { exact: deviceId },
-            ...baseConstraints,
+            ...audioConstraints,
           },
         });
-      } catch {
+        if (isLocalSystemAudioInput(stream.getAudioTracks()[0]?.label)) {
+          stream.getTracks().forEach((track) => track.stop());
+          throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
+        }
+        return stream;
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("system or loopback audio source")) {
+          throw error;
+        }
         // Fall back to the browser default microphone when the saved device is unavailable.
       }
     }
 
-    return navigator.mediaDevices.getUserMedia({
-      audio: baseConstraints,
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: audioConstraints,
     });
+    if (isLocalSystemAudioInput(stream.getAudioTracks()[0]?.label)) {
+      stream.getTracks().forEach((track) => track.stop());
+      throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
+    }
+    return stream;
   };
 
   const createFileAttachment = (file: File, kind: AIMediaKind): LocalAttachment => ({
     id: crypto.randomUUID(),
     kind,
     fileName: file.name,
-    mimeType: file.type || "application/octet-stream",
+    mimeType: fallbackMimeType(file, kind),
     source: "upload",
     previewUrl: URL.createObjectURL(file),
     file,
@@ -1090,14 +1218,14 @@ export function AIChatPanel({
     }
 
     const nextAttachments = files.flatMap((file) => {
-      const kind = inferMediaKind(file.type);
+      const kind = inferMediaKindFromFile(file);
       if (!kind) return [];
       return [
         {
           id: crypto.randomUUID(),
           kind,
           fileName: file.name,
-          mimeType: file.type || "application/octet-stream",
+          mimeType: fallbackMimeType(file, kind),
           source: "upload" as const,
           previewUrl: URL.createObjectURL(file),
           file,
@@ -1112,6 +1240,45 @@ export function AIChatPanel({
 
     pendingComposerScrollRef.current = true;
     setAttachments((current) => [...current, ...nextAttachments]);
+  };
+
+  const handleFileDragEnter = (event: DragEvent<HTMLElement>) => {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    fileDropDepthRef.current += 1;
+    setFileDropActive(true);
+  };
+
+  const handleFileDragOver = (event: DragEvent<HTMLElement>) => {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = supportsMedia ? "copy" : "none";
+    setFileDropActive(true);
+  };
+
+  const handleFileDragLeave = (event: DragEvent<HTMLElement>) => {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    fileDropDepthRef.current = Math.max(0, fileDropDepthRef.current - 1);
+    if (fileDropDepthRef.current === 0) {
+      setFileDropActive(false);
+    }
+  };
+
+  const handleFileDrop = (event: DragEvent<HTMLElement>) => {
+    if (!dragEventHasFiles(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    fileDropDepthRef.current = 0;
+    setFileDropActive(false);
+
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length > 0) {
+      appendFiles(files);
+    }
   };
 
   const removeAttachment = (attachmentId: string) => {
@@ -1729,6 +1896,7 @@ export function AIChatPanel({
     try {
       const stream = await requestMicrophoneStream(selectedMicrophoneId);
       mediaStreamRef.current = stream;
+      const recordingStream = await createAmplifiedRecordingStream(stream);
       const resolvedDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId ?? null;
       if (resolvedDeviceId && resolvedDeviceId !== selectedMicrophoneId) {
         setSelectedMicrophoneId(resolvedDeviceId);
@@ -1736,7 +1904,7 @@ export function AIChatPanel({
         setSelectedMicrophoneId(null);
       }
       recordedChunksRef.current = [];
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const recorder = new MediaRecorder(recordingStream, { audioBitsPerSecond: AUDIO_RECORDING_BITS_PER_SECOND, mimeType });
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) {
           recordedChunksRef.current.push(event.data);
@@ -2004,7 +2172,13 @@ export function AIChatPanel({
 
   return (
     <Panel
-      className="relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-1 shadow-none transition-[height] duration-200 ease-out"
+      className={`relative z-0 flex w-full flex-col overflow-visible overscroll-contain border-0 !p-1 shadow-none transition-[height,box-shadow] duration-200 ease-out ${
+        fileDropActive ? "ring-2 ring-[#1f6f78]/45" : ""
+      }`}
+      onDragEnter={handleFileDragEnter}
+      onDragLeave={handleFileDragLeave}
+      onDragOver={handleFileDragOver}
+      onDrop={handleFileDrop}
       onTouchEndCapture={() => {
         lastAiPanelTouchYRef.current = null;
       }}
@@ -2014,6 +2188,16 @@ export function AIChatPanel({
       style={{ height: displayedPanelHeight }}
     >
       <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-7 rounded-full bg-ink/20 blur-xl" />
+      {fileDropActive ? (
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-1 z-20 flex items-center justify-center rounded-[10px] border-2 border-dashed border-[#1f6f78]/55 bg-[#e5f5f7]/70 text-[#1f6f78] backdrop-blur-[2px]"
+        >
+          <svg aria-hidden="true" className="h-12 w-12 drop-shadow-sm" fill="none" viewBox="0 0 24 24">
+            <path d="M12 16V5M8 9l4-4 4 4M5 19h14" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+          </svg>
+        </div>
+      ) : null}
       <div className="flex items-center justify-between gap-2 px-0 py-0">
         <div className="flex min-w-0 items-center gap-2">
           <div className="inline-flex rounded-full bg-white p-0.5 text-xs shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
@@ -2255,7 +2439,7 @@ export function AIChatPanel({
           const files = Array.from(event.clipboardData.items)
             .map((item) => item.getAsFile())
             .filter((file): file is File => Boolean(file))
-            .filter((file) => Boolean(inferMediaKind(file.type)));
+            .filter((file) => Boolean(inferMediaKindFromFile(file)));
           if (files.length === 0) return;
           event.preventDefault();
           appendFiles(files);

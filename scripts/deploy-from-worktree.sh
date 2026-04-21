@@ -48,7 +48,10 @@ rsync -a --delete \
   --exclude 'node_modules/' \
   "$ROOT_DIR"/ "$WORKTREE_DIR"/
 
-ln -s "$NODE_MODULES_DIR" "$WORKTREE_DIR/node_modules"
+if ! cp -al "$NODE_MODULES_DIR" "$WORKTREE_DIR/node_modules" 2>/dev/null; then
+  rm -rf "$WORKTREE_DIR/node_modules"
+  cp -a "$NODE_MODULES_DIR" "$WORKTREE_DIR/node_modules"
+fi
 
 cd "$WORKTREE_DIR"
 npm run "$TARGET_SCRIPT"

@@ -1,6 +1,4 @@
-import { auth } from "@clerk/nextjs/server";
-
-import { clerkServerConfigured, localModeUserId } from "@/lib/auth/config";
+import { getEffectiveUserId } from "@/lib/auth/user";
 
 const methods = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 
@@ -48,15 +46,7 @@ async function forward(request: Request, params: { path: string[] }) {
 
   let userId: string | null = null;
   if (!isMediaRequest) {
-    if (clerkServerConfigured) {
-      const result = await auth();
-      userId = result.userId ?? null;
-    } else {
-      userId = localModeUserId;
-    }
-    if (!userId) {
-      return Response.json({ error: "Unauthorized" }, { status: 401 });
-    }
+    userId = await getEffectiveUserId(request);
   }
 
   const baseUrl = process.env.WORKER_API_BASE_URL;

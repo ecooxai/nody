@@ -67,11 +67,14 @@ type LiveSessionState = {
   status: string;
 };
 
-const LIVE_MIC_SPEECH_RMS_THRESHOLD = 0.012;
+const LIVE_MIC_SPEECH_RMS_THRESHOLD = 0.008;
 const LIVE_MIC_SPEECH_START_MS = 220;
-const LIVE_MIC_MIN_TURN_SPEECH_MS = 2000;
+const LIVE_MIC_MIN_TURN_SPEECH_MS = 900;
 const LIVE_MIC_TRAILING_AUDIO_MS = 450;
 const LIVE_MIC_TURN_END_SILENCE_MS = 850;
+const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.45;
+const LIVE_MIC_INPUT_GAIN = 2.5;
+const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 
 export type LiveSendAttachment = {
   kind: AIMediaKind;
@@ -199,6 +202,29 @@ function resampleFloat32Array(input: Float32Array, inputRate: number, outputRate
   const outputLength = Math.max(1, Math.floor(input.length / ratio));
   const output = new Float32Array(outputLength);
 
+  if (inputRate > outputRate) {
+    for (let index = 0; index < outputLength; index += 1) {
+      const inputStart = index * ratio;
+      const inputEnd = inputStart + ratio;
+      const firstSampleIndex = Math.floor(inputStart);
+      const lastSampleIndex = Math.min(input.length - 1, Math.ceil(inputEnd) - 1);
+      let weightedSum = 0;
+      let weightTotal = 0;
+
+      for (let sampleIndex = firstSampleIndex; sampleIndex <= lastSampleIndex; sampleIndex += 1) {
+        const overlapStart = Math.max(inputStart, sampleIndex);
+        const overlapEnd = Math.min(inputEnd, sampleIndex + 1);
+        const weight = Math.max(0, overlapEnd - overlapStart);
+        weightedSum += (input[sampleIndex] ?? 0) * weight;
+        weightTotal += weight;
+      }
+
+      output[index] = weightTotal > 0 ? weightedSum / weightTotal : 0;
+    }
+
+    return output;
+  }
+
   for (let index = 0; index < outputLength; index += 1) {
     const position = index * ratio;
     const leftIndex = Math.floor(position);
@@ -227,6 +253,16 @@ function float32ToBase64Pcm16(input: Float32Array) {
   return btoa(binary);
 }
 
+function amplifyFloat32Samples(input: Float32Array, gain: number) {
+  if (gain === 1) return input;
+
+  const output = new Float32Array(input.length);
+  for (let index = 0; index < input.length; index += 1) {
+    output[index] = Math.max(-1, Math.min(1, (input[index] ?? 0) * gain));
+  }
+  return output;
+}
+
 function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
   if (buffer.numberOfChannels <= 1) {
     return buffer.getChannelData(0);
@@ -240,6 +276,15 @@ function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
     }
   }
   return mono;
+}
+
+function buildLiveMicAudioConstraints(): MediaTrackConstraints {
+  return {
+    echoCancellation: true,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: { ideal: 1 },
+  };
 }
 
 async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000, chunkSize = 3200) {
@@ -321,6 +366,10 @@ function pcm16ChunksToWavUrl(chunks: Uint8Array[], sampleRate: number) {
 function base64ToObjectUrl(base64: string, mimeType: string) {
   const bytes = base64ToUint8Array(base64);
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+}
+
+function isLocalSystemAudioInput(label?: string | null) {
+  return Boolean(label && LOCAL_AUDIO_INPUT_LABEL_PATTERN.test(label));
 }
 
 function buildLiveWebSocketUrl(apiUrl: string, apiKey: string) {
@@ -785,6 +834,7 @@ export function LiveTalkPanel({
   const microphoneSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const microphoneProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const microphoneSinkRef = useRef<GainNode | null>(null);
+  const assistantPlaybackGainRef = useRef<GainNode | null>(null);
   const onFindInNoteRef = useRef(onFindInNote);
   const onScrollNoteRef = useRef(onScrollNote);
   const nextAudioTimeRef = useRef(0);
@@ -1274,6 +1324,10 @@ export function LiveTalkPanel({
       if (!AudioContextCtor) return null;
       const context = new AudioContextCtor();
       audioContextRef.current = context;
+      const gain = context.createGain();
+      gain.gain.value = LIVE_ASSISTANT_PLAYBACK_GAIN;
+      gain.connect(context.destination);
+      assistantPlaybackGainRef.current = gain;
       nextAudioTimeRef.current = context.currentTime;
       return context;
     };
@@ -1306,22 +1360,22 @@ export function LiveTalkPanel({
 
       try {
         resetMicrophone();
+        const audioConstraints = buildLiveMicAudioConstraints();
         const stream = await navigator.mediaDevices.getUserMedia({
           audio: preferredDeviceId
             ? {
                 deviceId: { exact: preferredDeviceId },
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
+                ...audioConstraints,
               }
-            : {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true,
-              },
+            : audioConstraints,
         });
+        const audioTrack = stream.getAudioTracks()[0];
+        if (isLocalSystemAudioInput(audioTrack?.label)) {
+          stream.getTracks().forEach((track) => track.stop());
+          throw new Error("Choose a physical microphone instead of a system or loopback audio source.");
+        }
         microphoneStreamRef.current = stream;
-        microphoneStreamDeviceIdRef.current = stream.getAudioTracks()[0]?.getSettings().deviceId ?? preferredDeviceId ?? null;
+        microphoneStreamDeviceIdRef.current = audioTrack?.getSettings().deviceId ?? preferredDeviceId ?? null;
         stream.getAudioTracks().forEach((track) => {
           track.addEventListener(
             "ended",
@@ -1343,7 +1397,7 @@ export function LiveTalkPanel({
         const audioContext = microphoneAudioContextRef.current ?? new AudioContextCtor();
         microphoneAudioContextRef.current = audioContext;
         if (audioContext.state === "suspended") {
-          await audioContext.resume();
+          void audioContext.resume().catch(() => undefined);
         }
 
         const source = audioContext.createMediaStreamSource(stream);
@@ -1375,7 +1429,7 @@ export function LiveTalkPanel({
           }
 
           const input = event.inputBuffer.getChannelData(0);
-          const resampled = resampleFloat32Array(input, audioContext.sampleRate, 16000);
+          const resampled = amplifyFloat32Samples(resampleFloat32Array(input, audioContext.sampleRate, 16000), LIVE_MIC_INPUT_GAIN);
           if (resampled.length === 0) return;
           const encodedAudio = float32ToBase64Pcm16(resampled);
 
@@ -1511,8 +1565,8 @@ export function LiveTalkPanel({
         microphoneSinkRef.current = sink;
 
         return stream;
-      } catch {
-        setStatus("Microphone access was not granted. Text live chat still works.");
+      } catch (error) {
+        setStatus(error instanceof Error ? `${error.message} Text live chat still works.` : "Microphone access was not granted. Text live chat still works.");
         return null;
       }
     };
@@ -1802,6 +1856,10 @@ export function LiveTalkPanel({
     const playAudioChunk = (base64Audio: string) => {
       const context = createAudioContext();
       if (!context) return;
+      if (context.state === "suspended") {
+        void context.resume().catch(() => undefined);
+      }
+      const gain = assistantPlaybackGainRef.current;
 
       const samples = pcm16ToFloat32Array(base64ToUint8Array(base64Audio));
       if (samples.length === 0) return;
@@ -1810,7 +1868,7 @@ export function LiveTalkPanel({
       buffer.copyToChannel(samples, 0);
       const source = context.createBufferSource();
       source.buffer = buffer;
-      source.connect(context.destination);
+      source.connect(gain ?? context.destination);
       const startAt = Math.max(nextAudioTimeRef.current, context.currentTime);
       source.start(startAt);
       nextAudioTimeRef.current = startAt + buffer.duration;
@@ -3103,10 +3161,7 @@ export function LiveTalkPanel({
     socket.onopen = async () => {
       try {
         clearReconnectTimer();
-        const context = createAudioContext();
-        if (context?.state === "suspended") {
-          await context.resume();
-        }
+        createAudioContext();
         sendSetup();
         setConnecting(false);
         setStatus("Connected. Seeding the current note...");

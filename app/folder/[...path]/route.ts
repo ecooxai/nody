@@ -1,19 +1,8 @@
-import { auth } from "@clerk/nextjs/server";
-
-import { clerkServerConfigured, localModeUserId } from "@/lib/auth/config";
+import { getEffectiveUserId } from "@/lib/auth/user";
 import type { FolderAsset } from "@/shared/types";
 
-async function getUserId() {
-  if (!clerkServerConfigured) return localModeUserId;
-  const result = await auth();
-  return result.userId ?? null;
-}
-
 async function redirectToFolderAsset(request: Request, path: string[]) {
-  const userId = await getUserId();
-  if (!userId) {
-    return Response.json({ error: "Unauthorized" }, { status: 401 });
-  }
+  const userId = await getEffectiveUserId(request);
 
   const baseUrl = process.env.WORKER_API_BASE_URL;
   if (!baseUrl) {

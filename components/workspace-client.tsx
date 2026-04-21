@@ -1,16 +1,17 @@
 "use client";
 
-import { SignedIn, SignedOut, RedirectToSignIn, UserButton } from "@clerk/nextjs";
+import { UserButton, useAuth } from "@clerk/nextjs";
+import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AIChatPanel } from "@/components/chat/ai-chat-panel";
 import { RichEditor, type RichEditorHandle } from "@/components/editor/rich-editor";
 import { useErrorToast } from "@/components/notifications/error-toast";
-import { ProviderSettingsForm } from "@/components/settings/provider-settings-form";
 import { Panel } from "@/components/ui/panel";
+import { ProviderSettingsForm } from "@/components/settings/provider-settings-form";
 import { apiClient } from "@/lib/api/client";
-import type { EditorCommand } from "@/lib/editor/commands";
 import { clerkClientConfigured } from "@/lib/auth/config";
+import type { EditorCommand } from "@/lib/editor/commands";
 import { createStarterMarkdown, ensureTrailingNewlines, normalizeStoredMarkdown } from "@/lib/editor/markdown";
 import { useServiceWorker } from "@/lib/hooks/use-service-worker";
 import { createDefaultSettings } from "@/lib/providers/defaults";
@@ -1895,7 +1896,9 @@ function WorkspaceClientContent() {
                     </button>
                   ) : null}
                   <div className="hidden rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60 sm:block">{selectedFolderName}</div>
-                  {clerkClientConfigured ? <UserButton /> : <div className="rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60">Local mode</div>}
+                  {clerkClientConfigured ? (
+                    <ClerkAccessControls />
+                  ) : null}
                 </div>
               </div>
 
@@ -2544,18 +2547,22 @@ function WorkspaceClientContent() {
 }
 
 export function WorkspaceClient() {
-  if (!clerkClientConfigured) {
-    return <WorkspaceClientContent />;
+  return <WorkspaceClientContent />;
+}
+
+function ClerkAccessControls() {
+  const { isLoaded, isSignedIn } = useAuth();
+
+  if (isLoaded && isSignedIn) {
+    return <UserButton />;
   }
 
   return (
     <>
-      <SignedOut>
-        <RedirectToSignIn />
-      </SignedOut>
-      <SignedIn>
-        <WorkspaceClientContent />
-      </SignedIn>
+      <Link className="rounded-full bg-white px-3 py-1.5 text-xs text-ink transition hover:bg-mist" href="/sign-in">
+        Sign in
+      </Link>
+      <div className="rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60">Local mode</div>
     </>
   );
 }

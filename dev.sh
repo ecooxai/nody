@@ -4,7 +4,7 @@ set -euo pipefail
 RUN_CHECKS=0
 RUN_WORKER=1
 WORKER_MODE="auto"
-WORKER_URL="http://127.0.0.1:8787/v1/health"
+WORKER_URL="http://[::1]:8787/v1/health"
 ENV_FILE="${NODY_DEV_ENV_FILE:-.env.dev}"
 PROJECT_LOCK_ID="$(pwd | sha256sum | awk '{print $1}')"
 LOCK_DIR="${TMPDIR:-/tmp}/nody-dev-${PROJECT_LOCK_ID}.lock"
@@ -18,7 +18,9 @@ else
   echo "No ${ENV_FILE} found; using built-in local development defaults." >&2
 fi
 
-export WORKER_API_BASE_URL="${WORKER_API_BASE_URL:-http://127.0.0.1:8787/v1}"
+if [[ -z "${WORKER_API_BASE_URL:-}" || "${WORKER_API_BASE_URL}" == "http://127.0.0.1:8787/v1" || "${WORKER_API_BASE_URL}" == "http://localhost:8787/v1" ]]; then
+  export WORKER_API_BASE_URL="http://[::1]:8787/v1"
+fi
 
 usage() {
   cat <<'EOF'
@@ -27,7 +29,7 @@ Usage: ./dev.sh [--check] [--worker] [--no-worker] [--full] [--help]
 Defaults to local dev mode:
   - loads .env.dev when present
   - starts the Next.js dev server
-  - starts the local Cloudflare worker when WORKER_API_BASE_URL points to localhost
+  - starts the local Cloudflare worker when WORKER_API_BASE_URL points to a local loopback address
   - skips the typecheck/test gate
 
 Options:
@@ -70,13 +72,9 @@ while (($#)); do
 done
 
 if [[ "${WORKER_MODE}" == "auto" ]]; then
-  case "${WORKER_API_BASE_URL}" in
-    http://127.0.0.1:8787/v1|http://localhost:8787/v1)
-      ;;
-    *)
-      RUN_WORKER=0
-      ;;
-  esac
+  if [[ "${WORKER_API_BASE_URL}" != "http://[::1]:8787/v1" ]]; then
+    RUN_WORKER=0
+  fi
 fi
 
 if [[ ! -x ./node_modules/.bin/next || ! -x ./node_modules/.bin/wrangler ]]; then
@@ -157,14 +155,14 @@ wait_for_worker() {
 
 if (( RUN_WORKER )); then
   ./node_modules/.bin/wrangler d1 migrations apply nody-db --local --config worker/wrangler.jsonc
-  ./node_modules/.bin/wrangler dev --config worker/wrangler.jsonc --port 8787 &
+  ./node_modules/.bin/wrangler dev --config worker/wrangler.jsonc --port 8787 --ip :: &
   WORKER_PID=$!
   wait_for_worker
 fi
 
 rm -rf .next
 NEXT_STATUS=0
-./node_modules/.bin/next dev --disable-source-maps &
+./node_modules/.bin/next dev --disable-source-maps --hostname :: &
 NEXT_PID=$!
 wait "${NEXT_PID}" || NEXT_STATUS=$?
 NEXT_PID=""

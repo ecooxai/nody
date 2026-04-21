@@ -5,6 +5,7 @@ This file gives coding agents the project-specific context needed to work in thi
 ## Deploy
 
 - Do not use `.env.local` in this repo. Local development uses `.env.dev`; Cloudflare deployment uses `.env.deploy`.
+- For Cloudflare deploys, use `.env.deploy` only. The deploy scripts already source it; do not switch them to `.env.local`.
 - `npm run dev` and `./dev.sh` load `.env.dev` before starting Next.js and the local Worker.
 - Deploy-related npm scripts load `.env.deploy` themselves: `npm run worker:check`, `npm run worker:migrate:remote`, `npm run worker:deploy`, `npm run deploy`, `npm run preview`, and `npm run upload`.
 - Keep `.env.dev`, `.env.deploy`, and every other `.env*` file out of git. Only `.env.example` may be tracked.
