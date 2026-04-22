@@ -87,8 +87,8 @@ const LIVE_USER_PLAYBACK_TARGET_RMS = 0.22;
 const LIVE_USER_PLAYBACK_PEAK_CEILING = 0.95;
 const LIVE_USER_PLAYBACK_MAX_GAIN = 30;
 const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
-const LIVE_STANDBY_PREROLL_MS = 2_000;
-const LIVE_STANDBY_BUFFER_LIMIT_MS = 8_000;
+const LIVE_STANDBY_PREROLL_MS = 5_000;
+const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
 const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
 const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
 const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
@@ -1995,7 +1995,6 @@ export function LiveTalkPanel({
                 }
                 if (voiceActivationPendingRef.current && pendingUserAudioBase64ChunksRef.current.length > 0) {
                   flushPendingSpeechAudioRef.current();
-                  return;
                 }
                 if (!userAudioSentToModelRef.current) {
                   prepareSpeechTurnRef.current(socketConnection);
@@ -2444,20 +2443,25 @@ export function LiveTalkPanel({
 
     const finalizeUserAudio = () => {
       const userTurnId = userTurnIdRef.current;
-      const fallbackChunks = [...userAudioChunksRef.current];
+      const streamedChunks = [...userAudioChunksRef.current];
       const recorderSession = liveTurnRecorderSessionRef.current;
-      if (userTurnId && (fallbackChunks.length > 0 || recorderSession)) {
+      const applyUserAudioUrl = (audioUrl: string | null) => {
+        if (!audioUrl || !userTurnId) return;
+        audioUrlsRef.current.push(audioUrl);
+        setTurns((current) =>
+          current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
+        );
+        moveVideoShareTurnToEnd();
+      };
+
+      if (userTurnId && streamedChunks.length > 0) {
+        discardLiveTurnRecorder(recorderSession);
+        applyUserAudioUrl(pcm16ChunksToPlaybackWavUrl(streamedChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE));
+      } else if (userTurnId && recorderSession) {
         void (async () => {
           const recorderBlob = await stopLiveTurnRecorder(recorderSession);
           const recorderAudioUrl = recorderBlob && recorderBlob.size > 0 ? await recorderBlobToSpeechWavUrl(recorderBlob) : null;
-          const audioUrl = recorderAudioUrl ?? pcm16ChunksToPlaybackWavUrl(fallbackChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE);
-          if (audioUrl) {
-            audioUrlsRef.current.push(audioUrl);
-            setTurns((current) =>
-              current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
-            );
-            moveVideoShareTurnToEnd();
-          }
+          applyUserAudioUrl(recorderAudioUrl);
         })();
       } else {
         discardLiveTurnRecorder();
