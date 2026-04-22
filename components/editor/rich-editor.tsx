@@ -8,6 +8,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
@@ -142,13 +143,47 @@ type EmbeddedMedia = {
 };
 
 type MediaTagPreview = {
+  endIndex: number;
   kind: "image" | "audio" | "video";
+  matchIndex: number;
+  src: string;
+  tagText: string;
+};
+
+type EditorMediaPreview = EmbeddedMedia & {
+  displayEnd: number;
+  displayStart: number;
+  key: string;
+  lineNumber: number;
+  sourceEnd: number;
+  sourceStart: number;
+  sourceText: string;
+};
+
+type OffsetSegment = {
+  displayEnd: number;
+  displayStart: number;
+  kind: "media" | "text";
+  sourceEnd: number;
+  sourceStart: number;
+};
+
+type EditorDisplayModel = {
+  media: EditorMediaPreview[];
+  segments: OffsetSegment[];
+  sourceLineDisplayCounts: number[];
+  sourceLineDisplayStarts: number[];
+  value: string;
 };
 
 const EDITOR_PREVIEW_VERTICAL_GAP_PX = 8;
 const EDITOR_PREVIEW_SIZE_PX = 200;
 const EDITOR_TEXT_LINE_HEIGHT_PX = 28;
 const EDITOR_AUDIO_PREVIEW_HEIGHT_PX = 48;
+const EDITOR_MEDIA_RESERVED_LINE_COUNT = 5;
+const EDITOR_MEDIA_PLACEHOLDER = "\u001f";
+const MEDIA_TAG_PATTERN = /<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi;
+const EDITOR_MEDIA_LINE_PATTERN = /^\s*(<img\b[\s\S]*?>|<video\b[\s\S]*?(?:\/>|>[\s\S]*?<\/video>))\s*$/i;
 
 function compactMediaTags(value: string) {
   return value.replace(/<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi, (match) =>
@@ -158,15 +193,27 @@ function compactMediaTags(value: string) {
 
 function extractMediaTagPreviews(value: string) {
   const previews: MediaTagPreview[] = [];
-  const tagPattern = /<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi;
 
-  for (const match of value.matchAll(tagPattern)) {
+  for (const match of value.matchAll(MEDIA_TAG_PATTERN)) {
     const rawTag = match[0] ?? "";
     const kind = /^<video\b/i.test(rawTag) ? "video" : /^<audio\b/i.test(rawTag) ? "audio" : "image";
-    previews.push({ kind });
+    const src = extractMediaTagSrc(rawTag);
+    const matchIndex = match.index ?? 0;
+    previews.push({
+      endIndex: matchIndex + rawTag.length,
+      kind,
+      matchIndex,
+      src,
+      tagText: compactMediaTags(rawTag),
+    });
   }
 
   return previews;
+}
+
+function extractMediaTagSrc(value: string) {
+  const srcMatch = value.match(/\ssrc=(?:"([^"]+)"|'([^']+)')/i);
+  return srcMatch?.[1] || srcMatch?.[2] || "";
 }
 
 function mediaPreviewVisualHeight(kind: MediaTagPreview["kind"]) {
@@ -201,11 +248,11 @@ function sameLineLayout(left: LineLayout, right: LineLayout) {
   return true;
 }
 
-function measureTextareaLineLayout(textarea: HTMLTextAreaElement, value: string): LineLayout {
+function measureEditorLineLayout(textarea: HTMLTextAreaElement, model: EditorDisplayModel): LineLayout {
   const computed = window.getComputedStyle(textarea);
   const lineHeight = cssPixelValue(computed.lineHeight, EDITOR_TEXT_LINE_HEIGHT_PX);
   const mirror = document.createElement("div");
-  const markers: Array<{ lineNumber: number; element: HTMLSpanElement }> = [];
+  const markers: HTMLSpanElement[] = [];
 
   mirror.style.position = "absolute";
   mirror.style.visibility = "hidden";
@@ -238,12 +285,12 @@ function measureTextareaLineLayout(textarea: HTMLTextAreaElement, value: string)
   mirror.style.wordSpacing = computed.wordSpacing;
   mirror.style.tabSize = computed.tabSize;
 
-  const lines = value.split("\n");
+  const lines = model.value.split("\n");
   for (const [index, line] of lines.entries()) {
     const marker = document.createElement("span");
     marker.textContent = "\u200b";
     mirror.appendChild(marker);
-    markers.push({ lineNumber: index + 1, element: marker });
+    markers[index] = marker;
     mirror.appendChild(document.createTextNode(line));
     if (index < lines.length - 1) {
       mirror.appendChild(document.createTextNode("\n"));
@@ -252,13 +299,16 @@ function measureTextareaLineLayout(textarea: HTMLTextAreaElement, value: string)
 
   document.body.appendChild(mirror);
 
-  const markerTops = markers.map((marker) => marker.element.offsetTop);
+  const markerTops = markers.map((marker) => marker.offsetTop);
   const tops: LineTopMap = {};
-  const heights = markerTops.map((top, index) => {
+  const heights = model.sourceLineDisplayStarts.map((displayLineStart, index) => {
     const lineNumber = index + 1;
+    const top = markerTops[displayLineStart] ?? 0;
+    const nextSourceDisplayLineStart =
+      model.sourceLineDisplayStarts[index + 1] ?? displayLineStart + model.sourceLineDisplayCounts[index];
+    const nextTop = markerTops[nextSourceDisplayLineStart] ?? top + model.sourceLineDisplayCounts[index] * lineHeight;
     tops[lineNumber] = top;
-    const nextTop = markerTops[index + 1];
-    return Math.max(lineHeight, nextTop === undefined ? lineHeight : nextTop - top);
+    return Math.max(lineHeight, nextTop - top);
   });
 
   mirror.remove();
@@ -294,6 +344,183 @@ function inferMimeFromUrl(url: string, kind: AIMediaKind) {
   if (lower.endsWith(".mp4")) return "video/mp4";
   if (lower.endsWith(".mov")) return "video/quicktime";
   return "video/webm";
+}
+
+function parseEditorMediaLine(line: string) {
+  const match = line.match(EDITOR_MEDIA_LINE_PATTERN);
+  const tagText = match?.[1] ? compactMediaTags(match[1]) : "";
+  if (!tagText) return null;
+
+  const kind: "image" | "video" = /^<video\b/i.test(tagText) ? "video" : "image";
+  const src = extractMediaTagSrc(tagText);
+  if (!src) return null;
+
+  return {
+    fileName: fileNameFromUrl(src),
+    kind,
+    mimeType: inferMimeFromUrl(src, kind),
+    src,
+    tagText,
+  };
+}
+
+function buildEditorDisplayModel(sourceValue: string): EditorDisplayModel {
+  const media: EditorMediaPreview[] = [];
+  const segments: OffsetSegment[] = [];
+  const sourceLineDisplayCounts: number[] = [];
+  const sourceLineDisplayStarts: number[] = [];
+  const displayParts: string[] = [];
+  const lines = sourceValue.split("\n");
+  let sourceOffset = 0;
+  let displayOffset = 0;
+  let displayLine = 0;
+
+  const appendSegment = (value: string, sourceStart: number, sourceEnd: number, kind: OffsetSegment["kind"]) => {
+    if (!value && sourceStart === sourceEnd) return;
+    displayParts.push(value);
+    segments.push({
+      displayEnd: displayOffset + value.length,
+      displayStart: displayOffset,
+      kind,
+      sourceEnd,
+      sourceStart,
+    });
+    displayOffset += value.length;
+  };
+
+  for (const [index, line] of lines.entries()) {
+    const lineNumber = index + 1;
+    const hasLineBreak = index < lines.length - 1;
+    const lineSourceStart = sourceOffset;
+    const lineSourceEnd = lineSourceStart + line.length;
+    const parsedMedia = parseEditorMediaLine(line);
+    const displayLineStart = displayLine;
+    sourceLineDisplayStarts.push(displayLineStart);
+
+    if (parsedMedia) {
+      const displayStart = displayOffset;
+      const mediaPlaceholder = `${EDITOR_MEDIA_PLACEHOLDER}${"\n".repeat(EDITOR_MEDIA_RESERVED_LINE_COUNT - 1)}`;
+      appendSegment(mediaPlaceholder, lineSourceStart, lineSourceEnd, "media");
+      const displayEnd = displayOffset;
+      const key = `${lineSourceStart}:${lineSourceEnd}:${parsedMedia.src}`;
+      media.push({
+        id: `${parsedMedia.kind}:${parsedMedia.src}`,
+        kind: parsedMedia.kind,
+        fileName: parsedMedia.fileName,
+        mimeType: parsedMedia.mimeType,
+        assetUrl: parsedMedia.src,
+        previewUrl: parsedMedia.src,
+        displayEnd,
+        displayStart,
+        key,
+        lineNumber,
+        sourceEnd: lineSourceEnd,
+        sourceStart: lineSourceStart,
+        sourceText: line,
+      });
+      sourceLineDisplayCounts.push(EDITOR_MEDIA_RESERVED_LINE_COUNT);
+      displayLine += EDITOR_MEDIA_RESERVED_LINE_COUNT - 1;
+    } else {
+      appendSegment(line, lineSourceStart, lineSourceEnd, "text");
+      sourceLineDisplayCounts.push(1);
+    }
+
+    sourceOffset = lineSourceEnd;
+    if (hasLineBreak) {
+      appendSegment("\n", sourceOffset, sourceOffset + 1, "text");
+      sourceOffset += 1;
+      displayLine += 1;
+    }
+  }
+
+  return {
+    media,
+    segments,
+    sourceLineDisplayCounts,
+    sourceLineDisplayStarts,
+    value: displayParts.join(""),
+  };
+}
+
+function displayOffsetToSourceOffset(model: EditorDisplayModel, offset: number) {
+  const clampedOffset = Math.max(0, Math.min(offset, model.value.length));
+  for (const segment of model.segments) {
+    if (clampedOffset < segment.displayStart || clampedOffset > segment.displayEnd) continue;
+    if (segment.kind === "media") {
+      return clampedOffset <= segment.displayStart ? segment.sourceStart : segment.sourceEnd;
+    }
+    return segment.sourceStart + Math.min(clampedOffset - segment.displayStart, segment.sourceEnd - segment.sourceStart);
+  }
+  const last = model.segments[model.segments.length - 1];
+  return last?.sourceEnd ?? 0;
+}
+
+function sourceOffsetToDisplayOffset(model: EditorDisplayModel, sourceOffset: number) {
+  const maxSourceOffset = model.segments[model.segments.length - 1]?.sourceEnd ?? 0;
+  const clampedOffset = Math.max(0, Math.min(sourceOffset, maxSourceOffset));
+  for (const segment of model.segments) {
+    if (clampedOffset < segment.sourceStart || clampedOffset > segment.sourceEnd) continue;
+    if (segment.kind === "media") {
+      return clampedOffset <= segment.sourceStart ? segment.displayStart : segment.displayEnd;
+    }
+    return segment.displayStart + Math.min(clampedOffset - segment.sourceStart, segment.displayEnd - segment.displayStart);
+  }
+  const last = model.segments[model.segments.length - 1];
+  return last?.displayEnd ?? 0;
+}
+
+function restoreEditorDisplayValue(displayValue: string, previousMedia: EditorMediaPreview[]) {
+  let restored = "";
+  let mediaIndex = 0;
+  let index = 0;
+
+  while (index < displayValue.length) {
+    if (displayValue[index] === EDITOR_MEDIA_PLACEHOLDER && mediaIndex < previousMedia.length) {
+      restored += previousMedia[mediaIndex].sourceText;
+      mediaIndex += 1;
+      index += 1;
+      let skippedReservedBreaks = 0;
+      while (skippedReservedBreaks < EDITOR_MEDIA_RESERVED_LINE_COUNT - 1 && displayValue[index] === "\n") {
+        index += 1;
+        skippedReservedBreaks += 1;
+      }
+      continue;
+    }
+
+    restored += displayValue[index];
+    index += 1;
+  }
+
+  return restored;
+}
+
+function displaySelectionTouchesMedia(model: EditorDisplayModel, start: number, end: number) {
+  const selectionStart = Math.min(start, end);
+  const selectionEnd = Math.max(start, end);
+  if (selectionStart === selectionEnd) return false;
+
+  return model.media.some((media) => selectionStart < media.displayEnd && selectionEnd > media.displayStart);
+}
+
+function displayCaretIsInsideMedia(model: EditorDisplayModel, offset: number) {
+  return model.media.some((media) => offset > media.displayStart && offset < media.displayEnd);
+}
+
+function shouldProtectEditorMediaKey(model: EditorDisplayModel, key: string, start: number, end: number) {
+  const editingKey = key === "Backspace" || key === "Delete" || key === "Enter" || key === "Tab" || key.length === 1;
+  if (displaySelectionTouchesMedia(model, start, end)) return editingKey;
+  if (start !== end) return false;
+
+  if (key === "Backspace") {
+    return model.media.some((media) => start > media.displayStart && start <= media.displayEnd + 1);
+  }
+  if (key === "Delete") {
+    return model.media.some((media) => start >= media.displayStart && start < media.displayEnd);
+  }
+  if (key === "Enter" || key === "Tab" || key.length === 1) {
+    return displayCaretIsInsideMedia(model, start);
+  }
+  return false;
 }
 
 function formatFileSize(bytes: number | null) {
@@ -407,6 +634,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     startedAt: 0,
   });
   const [activeMedia, setActiveMedia] = useState<(EmbeddedMedia & { x: number; y: number }) | null>(null);
+  const [activeEditorMediaKey, setActiveEditorMediaKey] = useState<string | null>(null);
   const [textareaScrollTop, setTextareaScrollTop] = useState(0);
   const [editorLineLayout, setEditorLineLayout] = useState<LineLayout>({ heights: [], tops: {} });
   const [lineStartTops, setLineStartTops] = useState<LineTopMap>({});
@@ -421,6 +649,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const [bodyDraft, setBodyDraft] = useState(() => compactMediaTags(bodyMarkdown));
   const bodyDraftRef = useRef(compactMediaTags(bodyMarkdown));
   const noteBodyMarkdown = useMemo(() => ensureTrailingNewlines(bodyDraft), [bodyDraft]);
+  const editorDisplayModel = useMemo(() => buildEditorDisplayModel(noteBodyMarkdown), [noteBodyMarkdown]);
   const previewHtml = useMemo(() => (editable ? "" : markdownToHtml(noteBodyMarkdown)), [editable, noteBodyMarkdown]);
   const viewerLineHeights = useMemo(
     () => noteBodyMarkdown.split("\n").map((line) => (mediaLineExtraLineCount(line) + 1) * EDITOR_TEXT_LINE_HEIGHT_PX),
@@ -682,7 +911,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
 
     resizeTextareaToContent();
     editorMeasureWidthRef.current = textarea.clientWidth;
-    const nextLayout = measureTextareaLineLayout(textarea, noteBodyMarkdown);
+    const nextLayout = measureEditorLineLayout(textarea, editorDisplayModel);
     setEditorLineLayout((current) => (sameLineLayout(current, nextLayout) ? current : nextLayout));
     setTextareaScrollTop(textarea.scrollTop);
   };
@@ -729,6 +958,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     }
     clearActiveMediaHideTimer();
     setActiveMedia(null);
+    setActiveEditorMediaKey(null);
     window.requestAnimationFrame(() => {
       const textarea = textareaRef.current;
       resizeTextareaToContent();
@@ -736,6 +966,13 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       setTextareaScrollTop(textarea?.scrollTop ?? 0);
     });
   }, [editable]);
+
+  useEffect(() => {
+    if (!activeEditorMediaKey) return;
+    if (!editorDisplayModel.media.some((media) => media.key === activeEditorMediaKey)) {
+      setActiveEditorMediaKey(null);
+    }
+  }, [activeEditorMediaKey, editorDisplayModel.media]);
 
   useEffect(() => {
     clearViewerCopyTimer();
@@ -889,17 +1126,28 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     const textarea = target;
     if (!textarea) return;
     selectionRef.current = {
-      start: textarea.selectionStart ?? 0,
-      end: textarea.selectionEnd ?? 0,
+      start: displayOffsetToSourceOffset(editorDisplayModel, textarea.selectionStart ?? 0),
+      end: displayOffsetToSourceOffset(editorDisplayModel, textarea.selectionEnd ?? 0),
     };
-    const noteValue = ensureTrailingNewlines(textarea.value);
-    onSelectionChange?.(noteValue.slice(selectionRef.current.start, selectionRef.current.end).trim());
+    onSelectionChange?.(noteBodyMarkdown.slice(selectionRef.current.start, selectionRef.current.end).trim());
   };
 
-  const handleBodyTextareaChange = (value: string) => {
+  const handleBodyTextareaChange = (displayValue: string) => {
+    const value = restoreEditorDisplayValue(displayValue, editorDisplayModel.media);
     bodyDraftRef.current = value;
     setBodyDraft(value);
     scheduleBodyChange(value);
+  };
+
+  const handleBodyTextareaKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if ((event.metaKey || event.ctrlKey || event.altKey) && event.key !== "Backspace" && event.key !== "Delete") return;
+
+    const selectionStart = event.currentTarget.selectionStart ?? 0;
+    const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
+    if (!shouldProtectEditorMediaKey(editorDisplayModel, event.key, selectionStart, selectionEnd)) return;
+
+    event.preventDefault();
+    event.currentTarget.setSelectionRange(selectionStart, selectionEnd);
   };
 
   const applyTextareaMutation = (nextValue: string, nextSelection: TextSelection) => {
@@ -907,17 +1155,22 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     setBodyDraft(nextValue);
     publishBodyChange(nextValue);
     selectionRef.current = nextSelection;
+    const nextDisplayModel = buildEditorDisplayModel(ensureTrailingNewlines(nextValue));
+    const displaySelection = {
+      start: sourceOffsetToDisplayOffset(nextDisplayModel, nextSelection.start),
+      end: sourceOffsetToDisplayOffset(nextDisplayModel, nextSelection.end),
+    };
     window.requestAnimationFrame(() => {
       const textarea = textareaRef.current;
       if (!textarea) return;
       textarea.focus();
-      textarea.setSelectionRange(nextSelection.start, nextSelection.end);
+      textarea.setSelectionRange(displaySelection.start, displaySelection.end);
     });
   };
 
-  const getTextareaOffsetTop = (textarea: HTMLTextAreaElement, offset: number) => {
-    const clampedOffset = Math.max(0, Math.min(offset, textarea.value.length));
-    const lineNumber = textarea.value.slice(0, clampedOffset).split("\n").length;
+  const getTextareaSourceOffsetTop = (textarea: HTMLTextAreaElement, offset: number) => {
+    const clampedOffset = Math.max(0, Math.min(offset, noteBodyMarkdown.length));
+    const lineNumber = noteBodyMarkdown.slice(0, clampedOffset).split("\n").length;
     const measuredTop = editorLineLayout.tops[lineNumber];
     if (measuredTop !== undefined) return measuredTop;
 
@@ -930,8 +1183,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       window.requestAnimationFrame(() => {
         const textarea = textareaRef.current;
         if (!textarea) return;
-        const clampedOffset = Math.max(0, Math.min(offset, textarea.value.length));
-        const offsetTop = getTextareaOffsetTop(textarea, clampedOffset);
+        const clampedOffset = Math.max(0, Math.min(offset, noteBodyMarkdown.length));
+        const offsetTop = getTextareaSourceOffsetTop(textarea, clampedOffset);
         window.scrollTo({
           top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + offsetTop - 100, 0),
           behavior: "smooth",
@@ -945,8 +1198,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       window.requestAnimationFrame(() => {
         const textarea = textareaRef.current;
         if (!textarea) return;
-        const clampedOffset = Math.max(0, Math.min(offset, textarea.value.length));
-        const offsetTop = getTextareaOffsetTop(textarea, clampedOffset);
+        const clampedOffset = Math.max(0, Math.min(offset, noteBodyMarkdown.length));
+        const offsetTop = getTextareaSourceOffsetTop(textarea, clampedOffset);
         const viewportHeight = window.innerHeight;
         const positionOffset =
           position === "middle" ? viewportHeight / 2 : position === "bottom" ? viewportHeight - 140 : 96;
@@ -956,6 +1209,19 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         });
       });
     });
+  };
+
+  const removeEditorMedia = (media: EditorMediaPreview) => {
+    let removeStart = media.sourceStart;
+    let removeEnd = media.sourceEnd;
+    if (noteBodyMarkdown[removeEnd] === "\n") {
+      removeEnd += 1;
+    } else if (removeStart > 0 && noteBodyMarkdown[removeStart - 1] === "\n") {
+      removeStart -= 1;
+    }
+    const nextValue = `${noteBodyMarkdown.slice(0, removeStart)}${noteBodyMarkdown.slice(removeEnd)}`;
+    setActiveEditorMediaKey(null);
+    applyTextareaMutation(nextValue, { start: removeStart, end: removeStart });
   };
 
   const copyViewerImageUrl = async () => {
@@ -976,11 +1242,13 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const focusTextareaRange = (start: number, end: number) => {
     const textarea = textareaRef.current;
     if (!textarea) return;
-    const clampedStart = Math.max(0, Math.min(start, textarea.value.length));
-    const clampedEnd = Math.max(clampedStart, Math.min(end, textarea.value.length));
-    const offsetTop = getTextareaOffsetTop(textarea, clampedStart);
+    const clampedStart = Math.max(0, Math.min(start, noteBodyMarkdown.length));
+    const clampedEnd = Math.max(clampedStart, Math.min(end, noteBodyMarkdown.length));
+    const displayStart = sourceOffsetToDisplayOffset(editorDisplayModel, clampedStart);
+    const displayEnd = sourceOffsetToDisplayOffset(editorDisplayModel, clampedEnd);
+    const offsetTop = getTextareaSourceOffsetTop(textarea, clampedStart);
     textarea.focus();
-    textarea.setSelectionRange(clampedStart, clampedEnd);
+    textarea.setSelectionRange(displayStart, displayEnd);
     textarea.scrollTop = 0;
     setTextareaScrollTop(0);
     window.scrollTo({
@@ -1019,7 +1287,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       preview.scrollIntoView({ behavior: "smooth", block: "center" });
       return;
     }
-    const haystack = textarea.value.toLowerCase();
+    const haystack = noteBodyMarkdown.toLowerCase();
     const search = needle.toLowerCase();
     const matches: Array<{ start: number; end: number }> = [];
     let index = haystack.indexOf(search);
@@ -1028,8 +1296,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       index = haystack.indexOf(search, index + search.length);
     }
     if (matches.length === 0) return;
-    const currentStart = textarea.selectionStart ?? 0;
-    const currentEnd = textarea.selectionEnd ?? 0;
+    const currentStart = displayOffsetToSourceOffset(editorDisplayModel, textarea.selectionStart ?? 0);
+    const currentEnd = displayOffsetToSourceOffset(editorDisplayModel, textarea.selectionEnd ?? 0);
     const currentIndex = matches.findIndex((match) => match.start === currentStart && match.end === currentEnd);
     let targetIndex = 0;
     if (occurrence === "previous") {
@@ -1124,6 +1392,112 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     </div>
   );
 
+  const renderEditorMediaPreviewLayer = () => {
+    if (editorDisplayModel.media.length === 0) return null;
+
+    return (
+      <div aria-label="Media previews" className="pointer-events-none absolute inset-0 overflow-hidden">
+        {editorDisplayModel.media.map((media) => {
+          const rowHeight = Math.max(
+            editorLineLayout.heights[media.lineNumber - 1] ?? EDITOR_TEXT_LINE_HEIGHT_PX * EDITOR_MEDIA_RESERVED_LINE_COUNT,
+            EDITOR_TEXT_LINE_HEIGHT_PX * EDITOR_MEDIA_RESERVED_LINE_COUNT,
+          );
+          const previewHeight = Math.max(92, rowHeight - 10);
+          const top = (editorLineLayout.tops[media.lineNumber] ?? 0) - textareaScrollTop;
+          const active = activeEditorMediaKey === media.key;
+
+          return (
+            <div
+              className="pointer-events-auto absolute left-[10px] right-[10px] flex items-start gap-2 bg-[#fffbf4] py-[5px]"
+              data-editor-media-preview="true"
+              key={media.key}
+              onClick={() => setActiveEditorMediaKey(media.key)}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                onNoteInteract?.();
+              }}
+              style={{ height: `${rowHeight}px`, top: `${top}px` }}
+            >
+              <button
+                className="block h-full max-w-[240px] overflow-hidden rounded-[8px] border border-ink/10 bg-white text-left shadow-[0_8px_20px_rgba(15,23,42,0.08)]"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setActiveEditorMediaKey(media.key);
+                }}
+                title={media.fileName}
+                type="button"
+              >
+                {media.kind === "image" ? (
+                  <img
+                    alt={media.fileName}
+                    className="h-full w-auto max-w-[240px] object-contain"
+                    loading="lazy"
+                    src={media.previewUrl}
+                    style={{ height: `${previewHeight}px` }}
+                  />
+                ) : (
+                  <video
+                    className="h-full w-auto max-w-[240px] bg-black object-contain"
+                    muted
+                    playsInline
+                    preload="metadata"
+                    src={media.previewUrl}
+                    style={{ height: `${previewHeight}px` }}
+                  />
+                )}
+              </button>
+              {active ? (
+                <div className="flex shrink-0 flex-col gap-2 pt-1" data-note-media-actions="true">
+                  <button
+                    className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-[#bb3e2d] shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-[#bb3e2d]/30 hover:bg-[#fff0ed]"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      removeEditorMedia(media);
+                    }}
+                    title={`Delete ${media.kind}`}
+                    type="button"
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path d="M9 4h6M5 7h14M10 11v6M14 11v6M7 7l1 13h8l1-13" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+                    </svg>
+                  </button>
+                  <button
+                    className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-ink/20 hover:bg-mist"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      setViewerMedia(media);
+                    }}
+                    title="View large"
+                    type="button"
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path d="M14 4h6v6M10 20H4v-6M20 10V4h-6M4 14v6h6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+                    </svg>
+                  </button>
+                  {onAddMediaToAi ? (
+                    <button
+                      className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-ink/20 hover:bg-mist"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onAddMediaToAi(media);
+                      }}
+                      title="Add to AI"
+                      type="button"
+                    >
+                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                      </svg>
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   useImperativeHandle(
     ref,
     () => ({
@@ -1196,7 +1570,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         applyTextareaMutation(next.value, next.selection);
       },
     }),
-    [noteBodyMarkdown, editable, lineStartTops, editorLineLayout],
+    [noteBodyMarkdown, editable, lineStartTops, editorLineLayout, editorDisplayModel],
   );
 
   return (
@@ -1242,20 +1616,24 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
             <div className="grid gap-3">
               <div className="relative grid grid-cols-[20px_minmax(0,1fr)]">
                 {renderLineNumberGutter(textareaScrollTop, { lineHeights: editorLineLayout.heights })}
-                <textarea
-                  className="min-h-[34rem] w-full resize-none overflow-hidden whitespace-pre-wrap break-words bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
-                  onChange={(event) => handleBodyTextareaChange(event.target.value)}
-                  onFocus={onNoteInteract}
-                  onKeyUp={(event) => syncTextareaSelection(event.currentTarget)}
-                  onMouseUp={(event) => syncTextareaSelection(event.currentTarget)}
-                  onPointerDown={onNoteInteract}
-                  onScroll={(event) => setTextareaScrollTop(event.currentTarget.scrollTop)}
-                  onSelect={(event) => syncTextareaSelection(event.currentTarget)}
-                  placeholder="Write in markdown..."
-                  ref={textareaRef}
-                  value={noteBodyMarkdown}
-                  wrap="soft"
-                />
+                <div className="relative min-w-0">
+                  <textarea
+                    className="min-h-[34rem] w-full resize-none overflow-hidden whitespace-pre-wrap break-words bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                    onChange={(event) => handleBodyTextareaChange(event.target.value)}
+                    onFocus={onNoteInteract}
+                    onKeyDown={handleBodyTextareaKeyDown}
+                    onKeyUp={(event) => syncTextareaSelection(event.currentTarget)}
+                    onMouseUp={(event) => syncTextareaSelection(event.currentTarget)}
+                    onPointerDown={onNoteInteract}
+                    onScroll={(event) => setTextareaScrollTop(event.currentTarget.scrollTop)}
+                    onSelect={(event) => syncTextareaSelection(event.currentTarget)}
+                    placeholder="Write in markdown..."
+                    ref={textareaRef}
+                    value={editorDisplayModel.value}
+                    wrap="soft"
+                  />
+                  {renderEditorMediaPreviewLayer()}
+                </div>
               </div>
               <div aria-hidden="true" className="h-[90vh]" />
             </div>
