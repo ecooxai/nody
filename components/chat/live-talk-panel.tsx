@@ -71,10 +71,10 @@ type LiveSessionState = {
 };
 
 const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.45;
-const LIVE_RECORDING_SEND_GAIN = 5;
+const LIVE_RECORDING_SEND_GAIN = 3;
 const LIVE_RECORDING_BITS_PER_SECOND = 192_000;
 const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
-const LIVE_AUDIO_CAPTURE_SAMPLE_RATE = 48000;
+const LIVE_AUDIO_CAPTURE_SAMPLE_RATE = LIVE_AUDIO_STREAM_SAMPLE_RATE;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
 const LIVE_SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
 const LIVE_SPEECH_LOW_PASS_CUTOFF_HZ = 7000;
@@ -337,20 +337,10 @@ function getLiveRecordingCaptureGain(settings: LiveRecordingSettings) {
   return LIVE_RECORDING_SEND_GAIN;
 }
 
-function isAndroidChromeBrowser() {
-  if (typeof navigator === "undefined") return false;
-  const userAgent = navigator.userAgent.toLowerCase();
-  return userAgent.includes("android") && (userAgent.includes("chrome") || userAgent.includes("chromium"));
-}
-
-function shouldRequestNoiseSuppression(settings: LiveRecordingSettings) {
-  return settings.noiseSuppression || isAndroidChromeBrowser();
-}
-
 function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
   return {
     echoCancellation: settings.echoCancellation,
-    noiseSuppression: shouldRequestNoiseSuppression(settings),
+    noiseSuppression: settings.noiseSuppression,
     autoGainControl: false,
     channelCount: { ideal: 1 },
     sampleRate: { ideal: LIVE_AUDIO_CAPTURE_SAMPLE_RATE },
@@ -1294,6 +1284,22 @@ export function LiveTalkPanel({
     }
   }, []);
 
+  const sendUserAudioStreamEnd = useCallback(() => {
+    if (userAudioStreamEndedRef.current || !userAudioSentToModelRef.current) {
+      return false;
+    }
+
+    const socketConnection = socketRef.current;
+    if (!socketConnection || socketConnection.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    socketConnection.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    userAudioStreamEndedRef.current = true;
+    userAudioTrailingSilenceMsRef.current = 0;
+    return true;
+  }, []);
+
   const standbyStatusMessage = useCallback(() => {
     return liveRecordingSettingsRef.current.standbyEnabled
       ? "Standby listening. Speak a few words or send a message to reconnect."
@@ -1336,12 +1342,28 @@ export function LiveTalkPanel({
     if (!sessionRequestedRef.current || !liveRecordingSettingsRef.current.standbyEnabled) return;
     assistantReplyTimeoutRef.current = window.setTimeout(() => {
       assistantReplyTimeoutRef.current = null;
+      if (sendUserAudioStreamEnd()) {
+        setStatus("No AI reply yet. Ending the current audio stream...");
+        assistantReplyTimeoutRef.current = window.setTimeout(() => {
+          assistantReplyTimeoutRef.current = null;
+          enterStandby("No AI reply for 20 seconds. Back in standby listening.");
+        }, LIVE_STANDBY_REPLY_TIMEOUT_MS);
+        return;
+      }
       enterStandby("No AI reply for 20 seconds. Back in standby listening.");
     }, LIVE_STANDBY_REPLY_TIMEOUT_MS);
-  }, [clearAssistantReplyTimeout, enterStandby]);
+  }, [clearAssistantReplyTimeout, enterStandby, sendUserAudioStreamEnd]);
 
   const buildConnectionAudioNotice = useCallback(() => {
-    return liveRecordingSettingsRef.current.echoCancellation ? "" : "Echo cancellation is disabled for this live connection.";
+    const enabledProcessing = [
+      liveRecordingSettingsRef.current.echoCancellation ? "echo cancellation" : "",
+      liveRecordingSettingsRef.current.noiseSuppression ? "noise reduction" : "",
+    ].filter(Boolean);
+
+    if (enabledProcessing.length === 0) return "";
+
+    const verb = enabledProcessing.length === 1 ? "is" : "are";
+    return `Browser ${enabledProcessing.join(" and ")} ${verb} enabled for this live connection.`;
   }, []);
 
   const queueLiveAction = useCallback((action: PendingLiveAction) => {
@@ -2034,10 +2056,9 @@ export function LiveTalkPanel({
                     userAudioSpeechDurationMsRef.current >= LIVE_SPEECH_END_MIN_SPEECH_MS &&
                     userAudioTrailingSilenceMsRef.current >= LIVE_SPEECH_END_TRAILING_SILENCE_MS
                   ) {
-                    socketConnection.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-                    userAudioStreamEndedRef.current = true;
-                    userAudioTrailingSilenceMsRef.current = 0;
-                    armAssistantReplyTimeout();
+                    if (sendUserAudioStreamEnd()) {
+                      armAssistantReplyTimeout();
+                    }
                   }
                 }
                 return;
@@ -2154,7 +2175,7 @@ export function LiveTalkPanel({
       resetMicrophoneRef.current = () => {};
       resetMicrophone();
     };
-  }, [appendStandbyPreRoll, armAssistantReplyTimeout, requestSocketConnection, resetStandbyVoiceActivationState]);
+  }, [appendStandbyPreRoll, armAssistantReplyTimeout, requestSocketConnection, resetStandbyVoiceActivationState, sendUserAudioStreamEnd]);
 
   useEffect(
     () => () => {
@@ -3009,6 +3030,7 @@ export function LiveTalkPanel({
       userAudioSentToModelRef.current = true;
       userAudioStreamEndedRef.current = false;
       userAudioActiveRef.current = true;
+      armAssistantReplyTimeout();
       armVideoShareIdleTimer();
     };
 

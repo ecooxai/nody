@@ -84,7 +84,7 @@ type MicrophoneSource = {
 
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 const AUDIO_RECORDING_BITS_PER_SECOND = 192_000;
-const AUDIO_RECORDING_SEND_GAIN = 5;
+const AUDIO_RECORDING_SEND_GAIN = 3;
 const SPEECH_CAPTURE_SAMPLE_RATE = 48_000;
 const SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
 const SPEECH_LOW_PASS_CUTOFF_HZ = 7_000;
@@ -100,20 +100,10 @@ function normalizeLiveRecordingSettings(settings?: Partial<LiveRecordingSettings
   return { ...defaultLiveRecordingSettings, ...(settings ?? {}) };
 }
 
-function isAndroidChromeBrowser() {
-  if (typeof navigator === "undefined") return false;
-  const userAgent = navigator.userAgent.toLowerCase();
-  return userAgent.includes("android") && (userAgent.includes("chrome") || userAgent.includes("chromium"));
-}
-
-function shouldRequestNoiseSuppression(settings: LiveRecordingSettings) {
-  return settings.noiseSuppression || isAndroidChromeBrowser();
-}
-
 function buildSpeechMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
   return {
     echoCancellation: settings.echoCancellation,
-    noiseSuppression: shouldRequestNoiseSuppression(settings),
+    noiseSuppression: settings.noiseSuppression,
     autoGainControl: false,
     channelCount: { ideal: 1 },
     sampleRate: { ideal: SPEECH_CAPTURE_SAMPLE_RATE },

@@ -108,7 +108,9 @@ export function ProviderSettingsForm({
         <div className="mt-2 grid gap-3 border-t border-ink/10 pt-4">
           <div>
             <h3 className="text-sm font-semibold">Live recording</h3>
-            <p className="text-xs text-ink/55">Browser support varies by device. Unsupported audio constraints are ignored by the browser.</p>
+            <p className="text-xs text-ink/55">
+              Gemini Live receives mono PCM16 audio at 16 kHz. Echo cancellation and noise reduction are off by default for cleaner capture.
+            </p>
           </div>
           <label className="flex items-center justify-between gap-3 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
             <span>Echo cancellation</span>

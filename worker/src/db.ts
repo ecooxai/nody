@@ -274,7 +274,7 @@ export async function syncDocument(
 export async function getSettings(db: DB, userId: string): Promise<ProviderSettings | null> {
   const row = await db
     .prepare(
-      "SELECT provider, api_url, api_key, model, COALESCE(live_model, '') AS live_model, COALESCE(image_model, '') AS image_model, COALESCE(live_echo_cancellation, 1) AS live_echo_cancellation, COALESCE(live_noise_suppression, 0) AS live_noise_suppression, COALESCE(live_standby_enabled, 1) AS live_standby_enabled, COALESCE(live_auto_gain_control, 0) AS live_auto_gain_control, COALESCE(live_silence_trim, 1) AS live_silence_trim, COALESCE(live_speech_threshold, 0.007) AS live_speech_threshold, COALESCE(live_trim_sensitivity, 0.18) AS live_trim_sensitivity FROM provider_settings WHERE user_id = ?",
+      "SELECT provider, api_url, api_key, model, COALESCE(live_model, '') AS live_model, COALESCE(image_model, '') AS image_model, COALESCE(live_echo_cancellation, 0) AS live_echo_cancellation, COALESCE(live_noise_suppression, 0) AS live_noise_suppression, COALESCE(live_standby_enabled, 1) AS live_standby_enabled, COALESCE(live_auto_gain_control, 0) AS live_auto_gain_control, COALESCE(live_silence_trim, 1) AS live_silence_trim, COALESCE(live_speech_threshold, 0.007) AS live_speech_threshold, COALESCE(live_trim_sensitivity, 0.18) AS live_trim_sensitivity FROM provider_settings WHERE user_id = ?",
     )
     .bind(userId)
     .first<Record<string, unknown>>();

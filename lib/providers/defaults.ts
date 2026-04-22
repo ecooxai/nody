@@ -1,8 +1,8 @@
 import type { LiveRecordingSettings, ProviderName, ProviderSettings } from "@/shared/types";
 
 export const defaultLiveRecordingSettings: LiveRecordingSettings = {
-  echoCancellation: true,
-  noiseSuppression: true,
+  echoCancellation: false,
+  noiseSuppression: false,
   standbyEnabled: true,
 };
 
