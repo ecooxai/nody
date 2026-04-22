@@ -90,9 +90,12 @@ const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
 const LIVE_STANDBY_PREROLL_MS = 5_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
 const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
-const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
+const LIVE_STANDBY_VOICE_TRIGGER_DB = 6;
 const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
 const LIVE_STANDBY_VOICE_TRIGGER_MS = 2_000;
+const LIVE_STANDBY_VOICE_BURST_WINDOW_MS = 2_000;
+const LIVE_STANDBY_VOICE_BURST_TRIGGER_COUNT = 3;
+const LIVE_STANDBY_VOICE_BURST_RESET_DB = 3;
 const LIVE_STANDBY_NOISE_UPDATE_DB = 4;
 const LIVE_SPEECH_END_TRIGGER_DB = 6;
 const LIVE_SPEECH_END_MIN_SPEECH_MS = 350;
@@ -1234,6 +1237,8 @@ export function LiveTalkPanel({
   const standbyNoiseFloorDbRef = useRef<number | null>(null);
   const standbyNoiseCalibrationMsRef = useRef(0);
   const standbySpeechBoostMsRef = useRef(0);
+  const standbyVoiceBurstTimesRef = useRef<number[]>([]);
+  const standbyVoiceBurstActiveRef = useRef(false);
   const voiceActivationPendingRef = useRef(false);
   const queuedLiveActionsRef = useRef<PendingLiveAction[]>([]);
   const performLiveTextSendRef = useRef<(text: string, options?: { displayText?: string }) => boolean>(() => false);
@@ -1291,7 +1296,7 @@ export function LiveTalkPanel({
 
   const standbyStatusMessage = useCallback(() => {
     return liveRecordingSettingsRef.current.standbyEnabled
-      ? "Standby listening. Speak louder for about 2 seconds or send a message to reconnect."
+      ? "Standby listening. Speak a few words or send a message to reconnect."
       : "Live talk disconnected.";
   }, []);
 
@@ -1303,6 +1308,8 @@ export function LiveTalkPanel({
       standbyNoiseCalibrationMsRef.current = LIVE_STANDBY_NOISE_CALIBRATION_MS;
     }
     standbySpeechBoostMsRef.current = 0;
+    standbyVoiceBurstTimesRef.current = [];
+    standbyVoiceBurstActiveRef.current = false;
   }, []);
 
   const finalizeSpeechCaptureState = useCallback(() => {
@@ -2066,20 +2073,38 @@ export function LiveTalkPanel({
               }
 
               const volumeLiftDb = currentDb - currentNoiseFloorDb;
+              const now = performance.now();
+              const recentBurstTimes = standbyVoiceBurstTimesRef.current.filter(
+                (burstTime) => now - burstTime <= LIVE_STANDBY_VOICE_BURST_WINDOW_MS,
+              );
               if (volumeLiftDb >= LIVE_STANDBY_VOICE_TRIGGER_DB) {
+                if (!standbyVoiceBurstActiveRef.current) {
+                  recentBurstTimes.push(now);
+                }
+                standbyVoiceBurstActiveRef.current = true;
+                standbyVoiceBurstTimesRef.current = recentBurstTimes;
                 standbySpeechBoostMsRef.current += durationMs * (volumeLiftDb >= LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB ? 2 : 1);
               } else {
+                if (volumeLiftDb <= LIVE_STANDBY_VOICE_BURST_RESET_DB) {
+                  standbyVoiceBurstActiveRef.current = false;
+                }
+                standbyVoiceBurstTimesRef.current = recentBurstTimes;
                 standbySpeechBoostMsRef.current = Math.max(0, standbySpeechBoostMsRef.current - durationMs);
                 const smoothing = volumeLiftDb <= LIVE_STANDBY_NOISE_UPDATE_DB ? 0.08 : 0.005;
                 standbyNoiseFloorDbRef.current = currentNoiseFloorDb * (1 - smoothing) + currentDb * smoothing;
               }
 
-              if (standbySpeechBoostMsRef.current < LIVE_STANDBY_VOICE_TRIGGER_MS) {
+              if (
+                standbySpeechBoostMsRef.current < LIVE_STANDBY_VOICE_TRIGGER_MS &&
+                standbyVoiceBurstTimesRef.current.length < LIVE_STANDBY_VOICE_BURST_TRIGGER_COUNT
+              ) {
                 return;
               }
 
               voiceActivationPendingRef.current = true;
               standbySpeechBoostMsRef.current = 0;
+              standbyVoiceBurstTimesRef.current = [];
+              standbyVoiceBurstActiveRef.current = false;
               pendingUserAudioChunksRef.current = standbyPreRollRef.current.map((chunk) => chunk.bytes);
               pendingUserAudioBase64ChunksRef.current = standbyPreRollRef.current.map((chunk) => chunk.base64);
               pendingUserAudioChunkDurationsRef.current = standbyPreRollRef.current.map((chunk) => chunk.durationMs);

@@ -716,11 +716,11 @@ export function AIChatPanel({
   const [preparingRecording, setPreparingRecording] = useState(false);
   const [cameraPreparing, setCameraPreparing] = useState(false);
   const [cameraRecording, setCameraRecording] = useState(false);
-  const [activeTab, setActiveTab] = useState<"chat" | "live">(() => (supportsLive ? "live" : "chat"));
-  const [liveConnectionRequested, setLiveConnectionRequested] = useState(() => supportsLive);
+  const [activeTab, setActiveTab] = useState<"chat" | "live">("chat");
+  const [liveConnectionRequested, setLiveConnectionRequested] = useState(false);
   const [liveSessionState, setLiveSessionState] = useState<LiveSessionState>({
-    listening: supportsLive,
-    standby: supportsLive,
+    listening: false,
+    standby: false,
     connecting: false,
     ready: false,
     status: "Open the Live tab to start a session.",
@@ -857,6 +857,12 @@ export function AIChatPanel({
       setActiveTab("chat");
     }
   }, [activeTab, provider]);
+
+  useEffect(() => {
+    if (!supportsLive && liveConnectionRequested) {
+      setLiveConnectionRequested(false);
+    }
+  }, [liveConnectionRequested, supportsLive]);
 
   useEffect(() => {
     if (activeTab !== "live") {
@@ -1223,6 +1229,12 @@ export function AIChatPanel({
   const stopRecordingStream = () => {
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
+  };
+
+  const openLiveTab = () => {
+    if (!supportsLive) return;
+    setActiveTab("live");
+    setLiveConnectionRequested(true);
   };
 
   const clearMicrophoneLongPressTimer = () => {
@@ -2393,7 +2405,7 @@ export function AIChatPanel({
                     : "cursor-not-allowed text-ink/35"
               }`}
               disabled={!supportsLive}
-              onClick={() => setActiveTab("live")}
+              onClick={openLiveTab}
               title={supportsLive ? "Start live talk" : "Switch to Gemini and save a live model first"}
               type="button"
             >
