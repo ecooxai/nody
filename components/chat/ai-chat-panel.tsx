@@ -1792,8 +1792,21 @@ export function AIChatPanel({
     if (lastAutoReadSelectionKeyRef.current === readKey) return;
     if (provider !== "gemini" || !providerSettings.apiKey) return;
     if (readingSelection) return;
-    if (activeTab === "live" && !liveSendHandle) return;
-    if (activeTab !== "live" && busy) return;
+
+    if (activeTab === "live") {
+      if (!liveConnectionRequested) {
+        setLiveConnectionRequested(true);
+        return;
+      }
+      if (!liveSendHandle) return;
+      autoReadSelectionTimerRef.current = window.setTimeout(() => {
+        autoReadSelectionTimerRef.current = null;
+        void handleReadSelectedText();
+      }, 0);
+      return clearAutoReadSelectionTimer;
+    }
+
+    if (busy) return;
 
     autoReadSelectionTimerRef.current = window.setTimeout(() => {
       autoReadSelectionTimerRef.current = null;
@@ -1801,7 +1814,17 @@ export function AIChatPanel({
     }, 2000);
 
     return clearAutoReadSelectionTimer;
-  }, [activeTab, busy, handleReadSelectedText, liveSendHandle, provider, providerSettings.apiKey, readingSelection, selectedTextForReadAloud]);
+  }, [
+    activeTab,
+    busy,
+    handleReadSelectedText,
+    liveConnectionRequested,
+    liveSendHandle,
+    provider,
+    providerSettings.apiKey,
+    readingSelection,
+    selectedTextForReadAloud,
+  ]);
 
   const handleComposerSubmit = async () => {
     if (activeTab === "live") {
@@ -3574,7 +3597,6 @@ export function AIChatPanel({
             currentNoteBodyMarkdown={currentNoteBodyMarkdown}
             currentNoteId={currentNoteId}
             currentNoteTitle={currentNoteTitle}
-            currentSelectedText={selectedTextForReadAloud}
             microphoneDeviceId={selectedMicrophoneId}
             microphoneEnabled={liveMicrophoneEnabled}
             noteCatalog={noteCatalog}

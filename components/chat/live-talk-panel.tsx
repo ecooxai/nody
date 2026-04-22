@@ -200,10 +200,6 @@ type LiveTurnRecorderSession = {
   turnId: string;
 };
 
-function formatSelectedTextContext(selection: string) {
-  return `user selected:${selection.trim()}\nendselected\n\n`;
-}
-
 function estimateTokenCount(text: string) {
   const trimmed = text.trim();
   if (!trimmed) return 0;
@@ -1070,7 +1066,6 @@ export function LiveTalkPanel({
   currentNoteBodyMarkdown,
   currentNoteId,
   currentNoteTitle,
-  currentSelectedText,
   microphoneDeviceId,
   microphoneEnabled,
   noteCatalog,
@@ -1101,7 +1096,6 @@ export function LiveTalkPanel({
   currentNoteBodyMarkdown: string;
   currentNoteId: string;
   currentNoteTitle: string;
-  currentSelectedText?: string;
   microphoneDeviceId?: string | null;
   microphoneEnabled?: boolean;
   noteCatalog: AINoteReference[];
@@ -1240,8 +1234,6 @@ export function LiveTalkPanel({
   const cancelledToolCallIdsRef = useRef<Set<string>>(new Set());
   const finalizeUserAudioRef = useRef(() => {});
   const appliedNoteContextRef = useRef(noteContext);
-  const currentSelectedTextRef = useRef(currentSelectedText?.trim() ?? "");
-  const userAudioSelectionContextRef = useRef("");
   const userAudioPromptContextRef = useRef("");
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -1548,8 +1540,7 @@ export function LiveTalkPanel({
     noteCatalogRef.current = noteCatalog;
     noteTitleRef.current = currentNoteTitle;
     noteBodyMarkdownRef.current = currentNoteBodyMarkdown;
-    currentSelectedTextRef.current = currentSelectedText?.trim() ?? "";
-  }, [currentNoteId, currentNoteTitle, currentNoteBodyMarkdown, currentSelectedText, noteCatalog, noteContext]);
+  }, [currentNoteId, currentNoteTitle, currentNoteBodyMarkdown, noteCatalog, noteContext]);
 
   useEffect(() => {
     onOpenNoteRef.current = onOpenNote;
@@ -2464,20 +2455,6 @@ export function LiveTalkPanel({
       }
     };
 
-    const sendSelectedTextContext = (socketConnection: WebSocket) => {
-      const selection = currentSelectedTextRef.current.trim();
-      if (!selection) return "";
-      const context = formatSelectedTextContext(selection);
-      socketConnection.send(
-        JSON.stringify({
-          realtimeInput: {
-            text: context,
-          },
-        }),
-      );
-      return context;
-    };
-
     const sendSpeechPromptContext = (socketConnection: WebSocket) => {
       const prompt = speechPromptRef.current.trim();
       if (!prompt) return "";
@@ -2494,10 +2471,9 @@ export function LiveTalkPanel({
     };
 
     const withActiveSelectionContext = (content: string) => {
-      const selectionContext = userAudioSelectionContextRef.current.trim();
       const promptContext = userAudioPromptContextRef.current.trim();
       const trimmedContent = content.trim();
-      return [selectionContext, promptContext, trimmedContent].filter(Boolean).join("\n\n");
+      return [promptContext, trimmedContent].filter(Boolean).join("\n\n");
     };
 
     const updateUserTurn = (content: string) => {
@@ -2576,7 +2552,6 @@ export function LiveTalkPanel({
         discardLiveTurnRecorder();
       }
       userTurnIdRef.current = null;
-      userAudioSelectionContextRef.current = "";
       userAudioPromptContextRef.current = "";
       userAudioChunksRef.current = [];
       pendingUserAudioChunksRef.current = [];
@@ -3048,14 +3023,15 @@ export function LiveTalkPanel({
 
     prepareSpeechTurnRef.current = (socketConnection: WebSocket) => {
       if (userAudioSentToModelRef.current) return;
-      const selectionContext = sendSelectedTextContext(socketConnection);
       const promptContext = sendSpeechPromptContext(socketConnection);
-      userAudioSelectionContextRef.current = selectionContext;
       userAudioPromptContextRef.current = promptContext;
+      if (promptContext) {
+        onLiveSpeechSentRef.current?.();
+      }
       const screenImage = sendScreenSnapshotForTurn("speech");
       const turnImages = [screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
       const turnId = ensureUserTurn({
-        content: [selectionContext, promptContext].filter(Boolean).join("\n\n"),
+        content: promptContext,
         images: turnImages,
       });
       startLiveTurnRecorder(turnId);
@@ -3417,7 +3393,6 @@ export function LiveTalkPanel({
 
       const blob = await loadAttachmentBlob(attachment);
       if (attachment.kind === "audio") {
-        const selectionContext = sendSelectedTextContext(socketConnection);
         const promptContext = sendSpeechPromptContext(socketConnection);
         const screenImage = sendScreenSnapshotForTurn("audio");
         const turnImages = [screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
@@ -3428,7 +3403,7 @@ export function LiveTalkPanel({
           {
             id: crypto.randomUUID(),
             role: "user",
-            content: [selectionContext, promptContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
+            content: [promptContext, `Sent audio clip: ${attachment.fileName}`].filter(Boolean).join("\n\n"),
             audioUrl,
             images: turnImages.length > 0 ? turnImages : undefined,
           },
