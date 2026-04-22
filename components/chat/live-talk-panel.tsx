@@ -90,13 +90,14 @@ const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
 const LIVE_STANDBY_PREROLL_MS = 5_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
 const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
-const LIVE_STANDBY_VOICE_TRIGGER_DB = 6;
+const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
 const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
 const LIVE_STANDBY_VOICE_TRIGGER_MS = 2_000;
 const LIVE_STANDBY_VOICE_BURST_WINDOW_MS = 2_000;
 const LIVE_STANDBY_VOICE_BURST_TRIGGER_COUNT = 3;
 const LIVE_STANDBY_VOICE_BURST_RESET_DB = 3;
 const LIVE_STANDBY_NOISE_UPDATE_DB = 4;
+const LIVE_STANDBY_RECONNECT_GRACE_MS = 2_500;
 const LIVE_SPEECH_END_TRIGGER_DB = 6;
 const LIVE_SPEECH_END_MIN_SPEECH_MS = 350;
 const LIVE_SPEECH_END_TRAILING_SILENCE_MS = 900;
@@ -335,6 +336,12 @@ function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
 function getLiveRecordingCaptureGain(settings: LiveRecordingSettings) {
   void settings;
   return LIVE_RECORDING_SEND_GAIN;
+}
+
+function isAndroidChromeBrowser() {
+  if (typeof navigator === "undefined") return false;
+  const userAgent = navigator.userAgent.toLowerCase();
+  return userAgent.includes("android") && (userAgent.includes("chrome") || userAgent.includes("chromium"));
 }
 
 function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
@@ -697,7 +704,7 @@ function buildNoteContext(noteId: string, title: string, bodyMarkdown: string, n
     "When the user says modify, change, edit, restyle, remove something from, add something to, or make variations of the current image, treat that as an image edit request and call the tool.",
     "After the tool returns, briefly describe what was generated and mention any notable constraints or variations.",
     "If the user asks you to look through their camera, inspect a physical object, read a page in front of the device, or watch something in the room, call start_camera_share.",
-    "Camera sharing uses snapshot mode by default. It sends still images when the user starts speaking and when they send text or audio, but it can also stream live camera video if the user explicitly asks for continuous video.",
+    "Camera sharing uses snapshot mode by default. Snapshot mode does not send images automatically; call capture_camera_shot when the user's request needs a camera image.",
     "If the user explicitly asks for live or continuous camera video, call start_camera_share with mode set to video.",
     "If the user asks to switch, flip, or change cameras, call switch_camera_share. This is useful on phones with more than one camera.",
     "If the user asks you to take, shoot, snap, or capture a photo/image from the current camera feed, call capture_camera_shot.",
@@ -858,7 +865,7 @@ const listAvailableCamerasFunctionDeclaration = {
 const startCameraShareFunctionDeclaration = {
   name: "start_camera_share",
   description:
-    "Start camera sharing so Gemini can see the user's camera feed in the live session. Use snapshot mode by default for still-image sharing. Use video mode only when the user explicitly asks for live or continuous camera video.",
+    "Start camera sharing in the live session. Use snapshot mode by default; snapshot mode only opens the preview and does not send an image. After starting the camera, call capture_camera_shot when the user's request needs visual inspection. Use video mode only when the user explicitly asks for live or continuous camera video.",
   parameters: {
     type: "OBJECT",
     properties: {
@@ -1122,6 +1129,8 @@ export function LiveTalkPanel({
   const audioContextRef = useRef<AudioContext | null>(null);
   const microphoneStreamRef = useRef<MediaStream | null>(null);
   const microphoneStreamDeviceIdRef = useRef<string | null>(null);
+  const microphoneUsesVideoAudioTrackRef = useRef(false);
+  const microphoneRestoreTimerIdsRef = useRef<number[]>([]);
   const microphoneAudioContextRef = useRef<AudioContext | null>(null);
   const microphoneSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const microphoneGainRef = useRef<GainNode | null>(null);
@@ -1196,7 +1205,6 @@ export function LiveTalkPanel({
   const lastLiveImageInsertRef = useRef<{ key: string; insertedAt: number } | null>(null);
   const cameraShotInsertInFlightRef = useRef<Set<string>>(new Set());
   const lastCameraShotRequestRef = useRef<Map<string, number>>(new Map());
-  const pendingSpeechCameraImageRef = useRef<LiveGeneratedImage | null>(null);
   const videoShareStreamRef = useRef<MediaStream | null>(null);
   const videoShareElementRef = useRef<HTMLVideoElement | null>(null);
   const videoShareCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -1229,6 +1237,7 @@ export function LiveTalkPanel({
   const standbySpeechBoostMsRef = useRef(0);
   const standbyVoiceBurstTimesRef = useRef<number[]>([]);
   const standbyVoiceBurstActiveRef = useRef(false);
+  const standbyReconnectBlockedUntilRef = useRef(0);
   const voiceActivationPendingRef = useRef(false);
   const queuedLiveActionsRef = useRef<PendingLiveAction[]>([]);
   const performLiveTextSendRef = useRef<(text: string, options?: { displayText?: string }) => boolean>(() => false);
@@ -1334,8 +1343,12 @@ export function LiveTalkPanel({
     setReady(false);
     setSocketRequested(false);
     finalizeSpeechCaptureState();
+    standbyReconnectBlockedUntilRef.current = performance.now() + LIVE_STANDBY_RECONNECT_GRACE_MS;
+    standbyPreRollRef.current = [];
+    standbyPreRollDurationMsRef.current = 0;
+    resetStandbyVoiceActivationState({ resetNoiseFloor: true });
     setStatus(message ?? standbyStatusMessage());
-  }, [clearAssistantReplyTimeout, finalizeSpeechCaptureState, standbyStatusMessage]);
+  }, [clearAssistantReplyTimeout, finalizeSpeechCaptureState, resetStandbyVoiceActivationState, standbyStatusMessage]);
 
   const armAssistantReplyTimeout = useCallback(() => {
     clearAssistantReplyTimeout();
@@ -1543,6 +1556,8 @@ export function LiveTalkPanel({
         window.clearTimeout(assistantReplyTimeoutRef.current);
         assistantReplyTimeoutRef.current = null;
       }
+      microphoneRestoreTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      microphoneRestoreTimerIdsRef.current = [];
     },
     [],
   );
@@ -1892,9 +1907,12 @@ export function LiveTalkPanel({
       microphoneGainRef.current = null;
       microphoneSourceRef.current?.disconnect();
       microphoneSourceRef.current = null;
-      microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+      if (!microphoneUsesVideoAudioTrackRef.current) {
+        microphoneStreamRef.current?.getTracks().forEach((track) => track.stop());
+      }
       microphoneStreamRef.current = null;
       microphoneStreamDeviceIdRef.current = null;
+      microphoneUsesVideoAudioTrackRef.current = false;
       microphoneAudioContextRef.current?.close().catch(() => undefined);
       microphoneAudioContextRef.current = null;
       const recorderSession = liveTurnRecorderSessionRef.current;
@@ -1933,7 +1951,9 @@ export function LiveTalkPanel({
       const existingStream = microphoneStreamRef.current;
       const existingTracks = existingStream?.getAudioTracks() ?? [];
       const existingStreamLive = existingStream?.active && existingTracks.some((track) => track.readyState === "live");
-      if (existingStream && microphoneStreamDeviceIdRef.current === preferredDeviceId && existingStreamLive) {
+      const existingVideoAudio = microphoneUsesVideoAudioTrackRef.current && videoShareModeRef.current === "camera";
+      const existingPreferredDevice = preferredDeviceId ? microphoneStreamDeviceIdRef.current === preferredDeviceId : true;
+      if (existingStream && existingStreamLive && (existingVideoAudio || existingPreferredDevice)) {
         return existingStream;
       }
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
@@ -1943,14 +1963,21 @@ export function LiveTalkPanel({
       try {
         resetMicrophone();
         const audioConstraints = buildLiveMicAudioConstraints(liveRecordingSettingsRef.current);
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: preferredDeviceId
-            ? {
-                deviceId: { exact: preferredDeviceId },
-                ...audioConstraints,
-              }
-            : audioConstraints,
-        });
+        const cameraAudioTrack =
+          isAndroidChromeBrowser() && videoShareModeRef.current === "camera"
+            ? videoShareStreamRef.current?.getAudioTracks().find((track) => track.readyState === "live") ?? null
+            : null;
+        const usesVideoAudioTrack = Boolean(cameraAudioTrack);
+        const stream = cameraAudioTrack
+          ? new MediaStream([cameraAudioTrack])
+          : await navigator.mediaDevices.getUserMedia({
+              audio: preferredDeviceId
+                ? {
+                    deviceId: { exact: preferredDeviceId },
+                    ...audioConstraints,
+                  }
+                : audioConstraints,
+            });
         const audioTrack = stream.getAudioTracks()[0];
         if (isLocalSystemAudioInput(audioTrack?.label)) {
           stream.getTracks().forEach((track) => track.stop());
@@ -1959,6 +1986,7 @@ export function LiveTalkPanel({
         preferSpeechQualityAudio(stream);
         microphoneStreamRef.current = stream;
         microphoneStreamDeviceIdRef.current = audioTrack?.getSettings().deviceId ?? preferredDeviceId ?? null;
+        microphoneUsesVideoAudioTrackRef.current = usesVideoAudioTrack;
         const initialAudioContext = createSpeechAudioContext();
         if (initialAudioContext) {
           try {
@@ -2065,6 +2093,21 @@ export function LiveTalkPanel({
               }
 
               if (!liveRecordingSettingsRef.current.standbyEnabled) {
+                return;
+              }
+
+              if (performance.now() < standbyReconnectBlockedUntilRef.current) {
+                standbyPreRollRef.current = [];
+                standbyPreRollDurationMsRef.current = 0;
+                standbyNoiseFloorDbRef.current =
+                  standbyNoiseFloorDbRef.current === null ? currentDb : standbyNoiseFloorDbRef.current * 0.75 + currentDb * 0.25;
+                standbyNoiseCalibrationMsRef.current = Math.min(
+                  LIVE_STANDBY_NOISE_CALIBRATION_MS,
+                  standbyNoiseCalibrationMsRef.current + durationMs,
+                );
+                standbySpeechBoostMsRef.current = 0;
+                standbyVoiceBurstTimesRef.current = [];
+                standbyVoiceBurstActiveRef.current = false;
                 return;
               }
 
@@ -2520,7 +2563,6 @@ export function LiveTalkPanel({
       pendingUserAudioBase64ChunksRef.current = [];
       pendingUserAudioChunkDurationsRef.current = [];
       pendingUserAudioDurationMsRef.current = 0;
-      pendingSpeechCameraImageRef.current = null;
       userAudioSpeechStartMsRef.current = 0;
       userAudioActiveRef.current = false;
       userAudioSentToModelRef.current = false;
@@ -2803,8 +2845,28 @@ export function LiveTalkPanel({
       videoShareTurnIdRef.current = null;
     };
 
+    const restoreStandaloneMicrophoneAfterVideoShare = () => {
+      if (!microphoneCaptureEnabledRef.current) {
+        return;
+      }
+
+      microphoneRestoreTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      microphoneRestoreTimerIdsRef.current = [];
+      resetMicrophoneRef.current();
+      for (const delayMs of [350, 1_200, 2_500]) {
+        const timerId = window.setTimeout(async () => {
+          if (!microphoneCaptureEnabledRef.current || videoShareModeRef.current === "camera") {
+            return;
+          }
+          await requestMicrophoneRef.current();
+        }, delayMs);
+        microphoneRestoreTimerIdsRef.current.push(timerId);
+      }
+    };
+
     const stopVideoShare = (options?: { replacing?: boolean }) => {
       const previousMode = videoShareModeRef.current;
+      const shouldRestoreMicrophone = previousMode === "camera" && !options?.replacing && microphoneCaptureEnabledRef.current;
       clearVideoShareIdleTimer();
       if (videoShareIntervalRef.current) {
         window.clearInterval(videoShareIntervalRef.current);
@@ -2812,7 +2874,6 @@ export function LiveTalkPanel({
       }
       videoShareStreamRef.current?.getTracks().forEach((track) => track.stop());
       videoShareStreamRef.current = null;
-      pendingSpeechCameraImageRef.current = null;
       if (videoShareElementRef.current) {
         videoShareElementRef.current.pause();
         videoShareElementRef.current.srcObject = null;
@@ -2824,6 +2885,9 @@ export function LiveTalkPanel({
       updateVideoShareState(null);
       if (!options?.replacing && previousMode) {
         clearVideoShareTurn(previousMode === "camera" ? "Camera sharing stopped." : "Screen sharing stopped.");
+      }
+      if (shouldRestoreMicrophone) {
+        restoreStandaloneMicrophoneAfterVideoShare();
       }
     };
     stopVideoShareRef.current = stopVideoShare;
@@ -2852,21 +2916,6 @@ export function LiveTalkPanel({
       return dataBase64 || null;
     };
 
-    const createVideoShareImage = (fileNamePrefix: string, maxWidth = 1280, quality = 0.82) => {
-      const dataBase64 = captureVideoFrameBase64(maxWidth, quality);
-      if (!dataBase64) return null;
-      const image: LiveGeneratedImage = {
-        id: crypto.randomUUID(),
-        fileName: `${fileNamePrefix}-${Date.now()}.jpg`,
-        mimeType: "image/jpeg",
-        origin: "camera",
-        url: base64ToObjectUrl(dataBase64, "image/jpeg"),
-        dataBase64,
-      };
-      generatedImageUrlsRef.current.push(image.url);
-      return image;
-    };
-
     const markLatestImageContext = (image: LiveGeneratedImage) => {
       latestImageContextRef.current = {
         id: image.id,
@@ -2881,27 +2930,6 @@ export function LiveTalkPanel({
         mimeType: image.mimeType,
         previewUrl: image.url,
       };
-    };
-
-    const sendImageToLive = (socketConnection: WebSocket, image: LiveGeneratedImage, note: string) => {
-      socketConnection.send(
-        JSON.stringify({
-          realtimeInput: {
-            video: {
-              data: image.dataBase64,
-              mimeType: image.mimeType,
-            },
-          },
-        }),
-      );
-      socketConnection.send(
-        JSON.stringify({
-          realtimeInput: {
-            text: note,
-          },
-        }),
-      );
-      recordLiveContextUsage(note, 1);
     };
 
     const sendVideoFrame = () => {
@@ -2977,51 +3005,14 @@ export function LiveTalkPanel({
       return image;
     };
 
-    const captureCameraSnapshotForSpeechStart = () => {
-      if (videoShareModeRef.current !== "camera" || cameraShareSendModeRef.current !== "snapshot") return null;
-      const image = createVideoShareImage("camera-shot", 1280, 0.82);
-      if (image) {
-        markLatestImageContext(image);
-      }
-      return image;
-    };
-
-    const sendCameraSnapshotForTurn = (reason: "speech" | "text" | "audio") => {
-      const socketConnection = socketRef.current;
-      if (
-        videoShareModeRef.current !== "camera" ||
-        cameraShareSendModeRef.current !== "snapshot" ||
-        !socketConnection ||
-        socketConnection.readyState !== WebSocket.OPEN
-      ) {
-        return null;
-      }
-
-      const image = reason === "speech" ? pendingSpeechCameraImageRef.current ?? captureCameraSnapshotForSpeechStart() : createVideoShareImage("camera-shot", 1280, 0.82);
-      pendingSpeechCameraImageRef.current = null;
-      if (!image) return null;
-      markLatestImageContext(image);
-      sendImageToLive(
-        socketConnection,
-        image,
-        reason === "speech"
-          ? "Camera still image captured at the start of the user's spoken turn and sent with their audio."
-          : reason === "audio"
-            ? "Camera still image captured with the user's audio message."
-            : "Camera still image captured with the user's text message.",
-      );
-      return image;
-    };
-
     prepareSpeechTurnRef.current = (socketConnection: WebSocket) => {
       if (userAudioSentToModelRef.current) return;
       const selectionContext = sendSelectedTextContext(socketConnection);
       const promptContext = sendSpeechPromptContext(socketConnection);
       userAudioSelectionContextRef.current = selectionContext;
       userAudioPromptContextRef.current = promptContext;
-      const cameraImage = sendCameraSnapshotForTurn("speech");
       const screenImage = sendScreenSnapshotForTurn("speech");
-      const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+      const turnImages = [screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
       const turnId = ensureUserTurn({
         content: [selectionContext, promptContext].filter(Boolean).join("\n\n"),
         images: turnImages,
@@ -3086,7 +3077,7 @@ export function LiveTalkPanel({
         stopVideoShare();
         setStatus("Video share stopped.");
       };
-      stream.getTracks().forEach((track) => track.addEventListener("ended", handleTrackEnded, { once: true }));
+      stream.getVideoTracks().forEach((track) => track.addEventListener("ended", handleTrackEnded, { once: true }));
 
       await videoElement.play().catch(() => undefined);
       await waitForVideoFrame(videoElement);
@@ -3154,17 +3145,42 @@ export function LiveTalkPanel({
         throw new Error("Camera sharing is not supported in this browser.");
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: deviceId
-          ? {
-              deviceId: { exact: deviceId },
-            }
-          : {
-              facingMode: { ideal: "user" },
-            },
-        audio: false,
-      });
+      const videoConstraints = deviceId
+        ? {
+            deviceId: { exact: deviceId },
+          }
+        : {
+            facingMode: { ideal: "user" },
+          };
+      const includeCameraMicrophone = isAndroidChromeBrowser() && microphoneCaptureEnabledRef.current;
+      if (includeCameraMicrophone) {
+        resetMicrophoneRef.current();
+      }
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: videoConstraints,
+          audio: includeCameraMicrophone ? buildLiveMicAudioConstraints(liveRecordingSettingsRef.current) : false,
+        });
+      } catch (error) {
+        if (!includeCameraMicrophone) {
+          throw error;
+        }
+        await new Promise<void>((resolve) => window.setTimeout(resolve, 250));
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: videoConstraints,
+            audio: buildLiveMicAudioConstraints(liveRecordingSettingsRef.current),
+          });
+        } catch {
+          throw new Error("Android Chrome could not open camera and microphone together. Tap the camera button once so the browser can grant both streams.");
+        }
+      }
       await startVideoShare(stream, "camera", deviceId ?? null, { cameraMode: options?.video ? "video" : "snapshot" });
+      if (includeCameraMicrophone) {
+        await requestMicrophoneRef.current();
+        window.setTimeout(() => void requestMicrophoneRef.current(), 800);
+      }
       return true;
     };
 
@@ -3209,6 +3225,30 @@ export function LiveTalkPanel({
       });
       await startVideoShare(stream, "screen", null, { screenMode: options?.video ? "video" : "screenshot" });
       return true;
+    };
+
+    const refreshMicrophoneAfterCameraShot = async () => {
+      if (!microphoneCaptureEnabledRef.current || videoShareModeRef.current !== "camera") {
+        return;
+      }
+      if (!isAndroidChromeBrowser() && microphoneProcessorRef.current) {
+        return;
+      }
+
+      microphoneRestoreTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      microphoneRestoreTimerIdsRef.current = [];
+      resetMicrophoneRef.current();
+      await requestMicrophoneRef.current();
+
+      for (const delayMs of [500, 1_500]) {
+        const timerId = window.setTimeout(async () => {
+          if (!microphoneCaptureEnabledRef.current || videoShareModeRef.current !== "camera") {
+            return;
+          }
+          await requestMicrophoneRef.current();
+        }, delayMs);
+        microphoneRestoreTimerIdsRef.current.push(timerId);
+      }
     };
 
     const captureCurrentCameraShot = async () => {
@@ -3283,6 +3323,7 @@ export function LiveTalkPanel({
         ];
       });
       setStatus("Captured a camera shot.");
+      await refreshMicrophoneAfterCameraShot();
       return image;
     };
 
@@ -3301,9 +3342,8 @@ export function LiveTalkPanel({
         return false;
       }
 
-      const cameraImage = sendCameraSnapshotForTurn("text");
       const screenImage = sendScreenSnapshotForTurn("text");
-      const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+      const turnImages = [screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
       socketConnection.send(
         JSON.stringify({
           realtimeInput: {
@@ -3338,9 +3378,8 @@ export function LiveTalkPanel({
       if (attachment.kind === "audio") {
         const selectionContext = sendSelectedTextContext(socketConnection);
         const promptContext = sendSpeechPromptContext(socketConnection);
-        const cameraImage = sendCameraSnapshotForTurn("audio");
         const screenImage = sendScreenSnapshotForTurn("audio");
-        const turnImages = [cameraImage, screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
+        const turnImages = [screenImage].filter((image): image is LiveGeneratedImage => Boolean(image));
         const audioUrl = URL.createObjectURL(blob);
         audioUrlsRef.current.push(audioUrl);
         setTurns((current) => [
@@ -3843,7 +3882,7 @@ export function LiveTalkPanel({
           message: started
             ? cameraShareSendModeRef.current === "video"
               ? "Camera video sharing started."
-              : "Camera snapshot sharing started."
+              : "Camera snapshot sharing started. No camera image was sent; call capture_camera_shot when a visual answer needs one."
             : "Camera sharing was not started.",
         },
       };
@@ -4172,7 +4211,6 @@ export function LiveTalkPanel({
       stopVideoShare();
       nextAudioTimeRef.current = 0;
       assistantPlaybackMutedUntilRef.current = 0;
-      pendingSpeechCameraImageRef.current = null;
       assistantAudioChunksRef.current = [];
       cancelledToolCallIdsRef.current.clear();
       liveAssistantTurnIdRef.current = null;
