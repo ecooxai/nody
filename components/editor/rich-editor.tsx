@@ -64,6 +64,11 @@ type PreviewSelectionSnapshot = {
 
 type LineTopMap = Record<number, number>;
 
+type LineLayout = {
+  heights: number[];
+  tops: LineTopMap;
+};
+
 function wrapSelection(
   value: string,
   selection: TextSelection,
@@ -137,15 +142,13 @@ type EmbeddedMedia = {
 };
 
 type MediaTagPreview = {
-  endIndex: number;
   kind: "image" | "audio" | "video";
-  matchIndex: number;
-  tagText: string;
-  src: string;
 };
 
 const EDITOR_PREVIEW_VERTICAL_GAP_PX = 8;
 const EDITOR_PREVIEW_SIZE_PX = 200;
+const EDITOR_TEXT_LINE_HEIGHT_PX = 28;
+const EDITOR_AUDIO_PREVIEW_HEIGHT_PX = 48;
 
 function compactMediaTags(value: string) {
   return value.replace(/<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi, (match) =>
@@ -159,32 +162,50 @@ function extractMediaTagPreviews(value: string) {
 
   for (const match of value.matchAll(tagPattern)) {
     const rawTag = match[0] ?? "";
-    const tagText = compactMediaTags(rawTag);
-    const srcMatch = rawTag.match(/\ssrc=(?:"([^"]+)"|'([^']+)')/i);
-    const src = srcMatch?.[1] || srcMatch?.[2] || "";
     const kind = /^<video\b/i.test(rawTag) ? "video" : /^<audio\b/i.test(rawTag) ? "audio" : "image";
-    if (!src) continue;
-    const matchIndex = match.index ?? 0;
-    previews.push({
-      endIndex: matchIndex + rawTag.length,
-      kind,
-      matchIndex,
-      tagText,
-      src,
-    });
+    previews.push({ kind });
   }
 
   return previews;
 }
 
-function mediaTagPreviewKey(preview: MediaTagPreview) {
-  return `${preview.kind}:${preview.matchIndex}`;
+function mediaPreviewVisualHeight(kind: MediaTagPreview["kind"]) {
+  return kind === "audio" ? EDITOR_AUDIO_PREVIEW_HEIGHT_PX : EDITOR_PREVIEW_SIZE_PX;
 }
 
-function measureMediaPreviewTops(textarea: HTMLTextAreaElement, value: string, previews: MediaTagPreview[]) {
+function mediaLineExtraLineCount(line: string, lineHeight = EDITOR_TEXT_LINE_HEIGHT_PX) {
+  const media = extractMediaTagPreviews(line);
+  if (media.length === 0) return 0;
+
+  const mediaHeight = media.reduce(
+    (height, preview) => height + mediaPreviewVisualHeight(preview.kind) + EDITOR_PREVIEW_VERTICAL_GAP_PX,
+    0,
+  );
+  return Math.max(0, Math.ceil((mediaHeight - lineHeight) / lineHeight));
+}
+
+function cssPixelValue(value: string, fallback: number) {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function sameLineLayout(left: LineLayout, right: LineLayout) {
+  if (left.heights.length !== right.heights.length) return false;
+
+  for (let index = 0; index < left.heights.length; index += 1) {
+    if (left.heights[index] !== right.heights[index]) return false;
+    const lineNumber = index + 1;
+    if (left.tops[lineNumber] !== right.tops[lineNumber]) return false;
+  }
+
+  return true;
+}
+
+function measureTextareaLineLayout(textarea: HTMLTextAreaElement, value: string): LineLayout {
   const computed = window.getComputedStyle(textarea);
+  const lineHeight = cssPixelValue(computed.lineHeight, EDITOR_TEXT_LINE_HEIGHT_PX);
   const mirror = document.createElement("div");
-  const markers: Array<{ matchIndex: number; element: HTMLSpanElement }> = [];
+  const markers: Array<{ lineNumber: number; element: HTMLSpanElement }> = [];
 
   mirror.style.position = "absolute";
   mirror.style.visibility = "hidden";
@@ -212,36 +233,37 @@ function measureMediaPreviewTops(textarea: HTMLTextAreaElement, value: string, p
   mirror.style.textIndent = computed.textIndent;
   mirror.style.textTransform = computed.textTransform;
   mirror.style.whiteSpace = "pre-wrap";
-  mirror.style.overflowWrap = "break-word";
+  mirror.style.overflowWrap = computed.overflowWrap;
   mirror.style.wordBreak = computed.wordBreak;
   mirror.style.wordSpacing = computed.wordSpacing;
   mirror.style.tabSize = computed.tabSize;
 
-  let cursor = 0;
-  for (const preview of previews) {
-    mirror.appendChild(document.createTextNode(value.slice(cursor, preview.matchIndex)));
+  const lines = value.split("\n");
+  for (const [index, line] of lines.entries()) {
     const marker = document.createElement("span");
     marker.textContent = "\u200b";
     mirror.appendChild(marker);
-    markers.push({ matchIndex: preview.matchIndex, element: marker });
-    cursor = preview.matchIndex;
+    markers.push({ lineNumber: index + 1, element: marker });
+    mirror.appendChild(document.createTextNode(line));
+    if (index < lines.length - 1) {
+      mirror.appendChild(document.createTextNode("\n"));
+    }
   }
-  mirror.appendChild(document.createTextNode(value.slice(cursor)));
 
   document.body.appendChild(mirror);
-  const slotsByLine = new Map<number, number>();
-  const tops: Record<number, number> = {};
 
-  for (const marker of markers) {
-    const top = marker.element.offsetTop;
-    const lineKey = Math.round(top / (Number.parseFloat(computed.lineHeight || "28") || 28));
-    const slot = slotsByLine.get(lineKey) ?? 0;
-    slotsByLine.set(lineKey, slot + 1);
-    tops[marker.matchIndex] = top + slot * (EDITOR_PREVIEW_SIZE_PX + EDITOR_PREVIEW_VERTICAL_GAP_PX);
-  }
+  const markerTops = markers.map((marker) => marker.element.offsetTop);
+  const tops: LineTopMap = {};
+  const heights = markerTops.map((top, index) => {
+    const lineNumber = index + 1;
+    tops[lineNumber] = top;
+    const nextTop = markerTops[index + 1];
+    return Math.max(lineHeight, nextTop === undefined ? lineHeight : nextTop - top);
+  });
 
   mirror.remove();
-  return tops;
+
+  return { heights, tops };
 }
 
 function fileNameFromUrl(url: string) {
@@ -325,17 +347,6 @@ function insertBlockAtLine(value: string, block: string, lineNumber: number) {
   };
 }
 
-function embeddedMediaFromPreview(preview: MediaTagPreview): EmbeddedMedia {
-  return {
-    id: `${preview.kind}:${preview.src}`,
-    kind: preview.kind,
-    fileName: fileNameFromUrl(preview.src),
-    mimeType: inferMimeFromUrl(preview.src, preview.kind),
-    assetUrl: preview.src,
-    previewUrl: preview.src,
-  };
-}
-
 function extractEmbeddedMedia(target: EventTarget | null): EmbeddedMedia | null {
   const element = target instanceof HTMLElement ? target.closest("img,video,audio") : null;
   if (!(element instanceof HTMLElement)) return null;
@@ -389,6 +400,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const bodyChangeTimerRef = useRef<number | null>(null);
   const lastPublishedBodyRef = useRef(bodyMarkdown);
   const viewerCopyTimerRef = useRef<number | null>(null);
+  const editorMeasureWidthRef = useRef(0);
   const lineTapRef = useRef<{ key: string | null; count: number; startedAt: number }>({
     key: null,
     count: 0,
@@ -396,7 +408,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   });
   const [activeMedia, setActiveMedia] = useState<(EmbeddedMedia & { x: number; y: number }) | null>(null);
   const [textareaScrollTop, setTextareaScrollTop] = useState(0);
-  const [mediaPreviewTops, setMediaPreviewTops] = useState<Record<number, number>>({});
+  const [editorLineLayout, setEditorLineLayout] = useState<LineLayout>({ heights: [], tops: {} });
   const [lineStartTops, setLineStartTops] = useState<LineTopMap>({});
   const [viewerMedia, setViewerMedia] = useState<EmbeddedMedia | null>(null);
   const [viewerImageInfo, setViewerImageInfo] = useState<{
@@ -406,12 +418,14 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     loadingSize: boolean;
     width: number | null;
   }>({ copied: false, fileSize: null, height: null, loadingSize: false, width: null });
-  const [editingImageTagKey, setEditingImageTagKey] = useState<string | null>(null);
   const [bodyDraft, setBodyDraft] = useState(() => compactMediaTags(bodyMarkdown));
   const bodyDraftRef = useRef(compactMediaTags(bodyMarkdown));
   const noteBodyMarkdown = useMemo(() => ensureTrailingNewlines(bodyDraft), [bodyDraft]);
   const previewHtml = useMemo(() => (editable ? "" : markdownToHtml(noteBodyMarkdown)), [editable, noteBodyMarkdown]);
-  const mediaTagPreviews = useMemo(() => extractMediaTagPreviews(noteBodyMarkdown), [noteBodyMarkdown]);
+  const viewerLineHeights = useMemo(
+    () => noteBodyMarkdown.split("\n").map((line) => (mediaLineExtraLineCount(line) + 1) * EDITOR_TEXT_LINE_HEIGHT_PX),
+    [noteBodyMarkdown],
+  );
   const lineNumbers = useMemo(() => {
     const lineCount = Math.max(1, noteBodyMarkdown.split("\n").length);
     return Array.from({ length: lineCount }, (_, index) => index + 1);
@@ -583,7 +597,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       marker.textContent = "\u200b";
       mirror.appendChild(marker);
       markers.push({ lineNumber: index + 1, element: marker });
-      mirror.appendChild(document.createTextNode(`${line}\n`));
+      mirror.appendChild(document.createTextNode(`${line}${"\n".repeat(mediaLineExtraLineCount(line) + 1)}`));
     }
 
     document.body.appendChild(mirror);
@@ -658,6 +672,21 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     onRevealEditButton?.();
   };
 
+  const updateEditorLineLayout = () => {
+    const textarea = textareaRef.current;
+    if (!editable || !textarea) {
+      editorMeasureWidthRef.current = 0;
+      setEditorLineLayout((current) => (current.heights.length === 0 ? current : { heights: [], tops: {} }));
+      return;
+    }
+
+    resizeTextareaToContent();
+    editorMeasureWidthRef.current = textarea.clientWidth;
+    const nextLayout = measureTextareaLineLayout(textarea, noteBodyMarkdown);
+    setEditorLineLayout((current) => (sameLineLayout(current, nextLayout) ? current : nextLayout));
+    setTextareaScrollTop(textarea.scrollTop);
+  };
+
   useEffect(
     () => () => {
       clearActiveMediaHideTimer();
@@ -709,14 +738,6 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   }, [editable]);
 
   useEffect(() => {
-    if (!editingImageTagKey) return;
-    const stillEditingImage = mediaTagPreviews.some((preview) => preview.kind === "image" && mediaTagPreviewKey(preview) === editingImageTagKey);
-    if (!stillEditingImage) {
-      setEditingImageTagKey(null);
-    }
-  }, [editingImageTagKey, mediaTagPreviews]);
-
-  useEffect(() => {
     clearViewerCopyTimer();
     setViewerImageInfo({ copied: false, fileSize: null, height: null, loadingSize: viewerMedia?.kind === "image", width: null });
 
@@ -742,38 +763,30 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   }, [viewerMedia?.kind, viewerMedia?.previewUrl]);
 
   useLayoutEffect(() => {
-    if (!editable) return;
-    resizeTextareaToContent();
+    updateEditorLineLayout();
   }, [noteBodyMarkdown, editable]);
 
   useEffect(() => {
     if (!editable) return;
-    window.addEventListener("resize", resizeTextareaToContent);
-    return () => window.removeEventListener("resize", resizeTextareaToContent);
-  }, [editable]);
-
-  useLayoutEffect(() => {
     const textarea = textareaRef.current;
-    if (!editable || !textarea || mediaTagPreviews.length === 0) {
-      setMediaPreviewTops({});
-      return;
+    const updateAfterWidthChange = () => updateEditorLineLayout();
+    const resizeObserver = textarea
+      ? new ResizeObserver(() => {
+          if (textarea.clientWidth !== editorMeasureWidthRef.current) {
+            updateEditorLineLayout();
+          }
+        })
+      : null;
+
+    if (resizeObserver && textarea) {
+      resizeObserver.observe(textarea);
     }
-
-    const updatePreviewTops = () => {
-      setMediaPreviewTops(measureMediaPreviewTops(textarea, noteBodyMarkdown, mediaTagPreviews));
-      setTextareaScrollTop(textarea.scrollTop);
-    };
-
-    updatePreviewTops();
-    const resizeObserver = new ResizeObserver(updatePreviewTops);
-    resizeObserver.observe(textarea);
-    window.addEventListener("resize", updatePreviewTops);
-
+    window.addEventListener("resize", updateAfterWidthChange);
     return () => {
-      resizeObserver.disconnect();
-      window.removeEventListener("resize", updatePreviewTops);
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateAfterWidthChange);
     };
-  }, [noteBodyMarkdown, editable, mediaTagPreviews]);
+  }, [editable, noteBodyMarkdown]);
 
   useLayoutEffect(() => {
     if (editable) {
@@ -872,14 +885,15 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     previewPointerStartRef.current = { x: event.clientX, y: event.clientY };
   };
 
-  const syncTextareaSelection = () => {
-    const textarea = textareaRef.current;
+  const syncTextareaSelection = (target = textareaRef.current) => {
+    const textarea = target;
     if (!textarea) return;
     selectionRef.current = {
       start: textarea.selectionStart ?? 0,
       end: textarea.selectionEnd ?? 0,
     };
-    onSelectionChange?.(textarea.value.slice(selectionRef.current.start, selectionRef.current.end).trim());
+    const noteValue = ensureTrailingNewlines(textarea.value);
+    onSelectionChange?.(noteValue.slice(selectionRef.current.start, selectionRef.current.end).trim());
   };
 
   const handleBodyTextareaChange = (value: string) => {
@@ -901,16 +915,25 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     });
   };
 
+  const getTextareaOffsetTop = (textarea: HTMLTextAreaElement, offset: number) => {
+    const clampedOffset = Math.max(0, Math.min(offset, textarea.value.length));
+    const lineNumber = textarea.value.slice(0, clampedOffset).split("\n").length;
+    const measuredTop = editorLineLayout.tops[lineNumber];
+    if (measuredTop !== undefined) return measuredTop;
+
+    const lineHeight = cssPixelValue(window.getComputedStyle(textarea).lineHeight, EDITOR_TEXT_LINE_HEIGHT_PX);
+    return (lineNumber - 1) * lineHeight;
+  };
+
   const scrollTextareaOffsetNearTop = (offset: number) => {
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
         const textarea = textareaRef.current;
         if (!textarea) return;
         const clampedOffset = Math.max(0, Math.min(offset, textarea.value.length));
-        const lineHeight = Number.parseFloat(window.getComputedStyle(textarea).lineHeight || "28") || 28;
-        const linesBefore = textarea.value.slice(0, clampedOffset).split("\n").length - 1;
+        const offsetTop = getTextareaOffsetTop(textarea, clampedOffset);
         window.scrollTo({
-          top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + linesBefore * lineHeight - 100, 0),
+          top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + offsetTop - 100, 0),
           behavior: "smooth",
         });
       });
@@ -923,44 +946,16 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         const textarea = textareaRef.current;
         if (!textarea) return;
         const clampedOffset = Math.max(0, Math.min(offset, textarea.value.length));
-        const lineHeight = Number.parseFloat(window.getComputedStyle(textarea).lineHeight || "28") || 28;
-        const linesBefore = textarea.value.slice(0, clampedOffset).split("\n").length - 1;
+        const offsetTop = getTextareaOffsetTop(textarea, clampedOffset);
         const viewportHeight = window.innerHeight;
         const positionOffset =
           position === "middle" ? viewportHeight / 2 : position === "bottom" ? viewportHeight - 140 : 96;
         window.scrollTo({
-          top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + linesBefore * lineHeight - positionOffset, 0),
+          top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + offsetTop - positionOffset, 0),
           behavior: "smooth",
         });
       });
     });
-  };
-
-  const removeMediaTag = (preview: MediaTagPreview) => {
-    const before = noteBodyMarkdown.slice(0, preview.matchIndex);
-    const after = noteBodyMarkdown.slice(preview.endIndex);
-    const removeLeadingBlank = before.endsWith("\n\n") && after.startsWith("\n") ? 1 : 0;
-    const nextValue = `${before}${after.slice(removeLeadingBlank)}`;
-    applyTextareaMutation(nextValue, { start: preview.matchIndex, end: preview.matchIndex });
-  };
-
-  const updateMediaTagText = (preview: MediaTagPreview, nextTagText: string) => {
-    const compactedTag = compactMediaTags(nextTagText);
-    const sourceValue = bodyDraftRef.current;
-    const nextValue = `${sourceValue.slice(0, preview.matchIndex)}${compactedTag}${sourceValue.slice(preview.endIndex)}`;
-    const caret = preview.matchIndex + compactedTag.length;
-    bodyDraftRef.current = nextValue;
-    setBodyDraft(nextValue);
-    scheduleBodyChange(nextValue);
-    selectionRef.current = { start: caret, end: caret };
-  };
-
-  const syncMediaTagSelection = (preview: MediaTagPreview, target: HTMLTextAreaElement) => {
-    selectionRef.current = {
-      start: preview.matchIndex + (target.selectionStart ?? 0),
-      end: preview.matchIndex + (target.selectionEnd ?? 0),
-    };
-    onSelectionChange?.(target.value.slice(target.selectionStart ?? 0, target.selectionEnd ?? 0).trim());
   };
 
   const copyViewerImageUrl = async () => {
@@ -983,14 +978,13 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     if (!textarea) return;
     const clampedStart = Math.max(0, Math.min(start, textarea.value.length));
     const clampedEnd = Math.max(clampedStart, Math.min(end, textarea.value.length));
-    const lineHeight = Number.parseFloat(window.getComputedStyle(textarea).lineHeight || "28") || 28;
-    const linesBefore = textarea.value.slice(0, clampedStart).split("\n").length - 1;
+    const offsetTop = getTextareaOffsetTop(textarea, clampedStart);
     textarea.focus();
     textarea.setSelectionRange(clampedStart, clampedEnd);
     textarea.scrollTop = 0;
     setTextareaScrollTop(0);
     window.scrollTo({
-      top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + linesBefore * lineHeight - 96, 0),
+      top: Math.max(textarea.getBoundingClientRect().top + window.scrollY + offsetTop - 96, 0),
       behavior: "smooth",
     });
   };
@@ -1112,17 +1106,20 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     }
   };
 
-  const renderLineNumberGutter = (scrollTop = 0, options?: { everyTenOnly?: boolean }) => (
+  const renderLineNumberGutter = (scrollTop = 0, options?: { everyTenOnly?: boolean; lineHeights?: number[] }) => (
     <div
       aria-hidden="true"
       className={`hide-scrollbar overflow-hidden border-r border-ink/10 py-[5px] pr-1 text-right leading-7 text-ink/35 select-none ${lineNumberFontClass}`}
     >
       <div style={scrollTop ? { transform: `translateY(-${scrollTop}px)` } : undefined}>
-        {lineNumbers.map((lineNumber) => (
-          <div className="h-7 tabular-nums" key={lineNumber}>
-            {options?.everyTenOnly && lineNumber % 10 !== 0 ? "" : lineNumber}
-          </div>
-        ))}
+        {lineNumbers.map((lineNumber) => {
+          const rowHeight = options?.lineHeights?.[lineNumber - 1] ?? EDITOR_TEXT_LINE_HEIGHT_PX;
+          return (
+            <div className="tabular-nums" key={lineNumber} style={{ height: `${rowHeight}px`, lineHeight: `${EDITOR_TEXT_LINE_HEIGHT_PX}px` }}>
+              {options?.everyTenOnly && lineNumber % 10 !== 0 ? "" : lineNumber}
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -1199,7 +1196,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         applyTextareaMutation(next.value, next.selection);
       },
     }),
-    [noteBodyMarkdown, editable],
+    [noteBodyMarkdown, editable, lineStartTops, editorLineLayout],
   );
 
   return (
@@ -1244,110 +1241,28 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
           {editable ? (
             <div className="grid gap-3">
               <div className="relative grid grid-cols-[20px_minmax(0,1fr)]">
-                {renderLineNumberGutter(textareaScrollTop)}
+                {renderLineNumberGutter(textareaScrollTop, { lineHeights: editorLineLayout.heights })}
                 <textarea
-                  className="min-h-[34rem] w-full resize-none overflow-hidden bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                  className="min-h-[34rem] w-full resize-none overflow-hidden whitespace-pre-wrap break-words bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
                   onChange={(event) => handleBodyTextareaChange(event.target.value)}
                   onFocus={onNoteInteract}
-                  onKeyUp={syncTextareaSelection}
-                  onMouseUp={syncTextareaSelection}
+                  onKeyUp={(event) => syncTextareaSelection(event.currentTarget)}
+                  onMouseUp={(event) => syncTextareaSelection(event.currentTarget)}
                   onPointerDown={onNoteInteract}
                   onScroll={(event) => setTextareaScrollTop(event.currentTarget.scrollTop)}
-                  onSelect={syncTextareaSelection}
+                  onSelect={(event) => syncTextareaSelection(event.currentTarget)}
                   placeholder="Write in markdown..."
                   ref={textareaRef}
                   value={noteBodyMarkdown}
+                  wrap="soft"
                 />
-                {mediaTagPreviews.length > 0 ? (
-                  <div className="pointer-events-none absolute bottom-0 left-[20px] right-0 top-0 overflow-hidden" aria-label="Media tag previews">
-                    {mediaTagPreviews.map((preview) => {
-                      const previewKey = mediaTagPreviewKey(preview);
-                      const isEditingImageTag = preview.kind === "image" && editingImageTagKey === previewKey;
-                      return (
-                        <div
-                          className="pointer-events-auto absolute left-[10px] right-[10px] flex items-start gap-3 bg-[#fffbf4]"
-                          key={`${preview.kind}:${preview.src}:${preview.matchIndex}`}
-                          style={{
-                            top: (mediaPreviewTops[preview.matchIndex] ?? 0) - textareaScrollTop,
-                          }}
-                          title={preview.tagText}
-                        >
-                          <div className="flex shrink-0 items-start justify-start overflow-hidden">
-                            {preview.kind === "image" ? (
-                              <img alt="" className="h-[200px] w-auto rounded-xl object-contain" loading="lazy" src={preview.src} />
-                            ) : preview.kind === "audio" ? (
-                              <audio className="mt-2 h-10 w-[200px]" controls preload="metadata" src={preview.src} />
-                            ) : (
-                              <video className="max-h-[200px] max-w-[200px] rounded-xl bg-black" controls muted playsInline src={preview.src} />
-                            )}
-                          </div>
-                          <div className="mt-2 flex shrink-0 flex-col gap-2">
-                            <button
-                              className="flex h-9 w-9 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-[#bb3e2d]/30 hover:bg-[#fff0ed] hover:text-[#bb3e2d]"
-                              onClick={() => removeMediaTag(preview)}
-                              onPointerDown={onNoteInteract}
-                              title={`Remove ${preview.kind}`}
-                              type="button"
-                            >
-                              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                                <path d="M9 4h6M5 7h14M10 11v6M14 11v6M7 7l1 13h8l1-13" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
-                              </svg>
-                            </button>
-                            {preview.kind === "image" ? (
-                              <>
-                                <button
-                                  className="flex h-9 w-9 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-ink/20 hover:bg-mist"
-                                  onClick={() => setViewerMedia(embeddedMediaFromPreview(preview))}
-                                  onPointerDown={onNoteInteract}
-                                  title="View large"
-                                  type="button"
-                                >
-                                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                                    <path d="M14 4h6v6M10 20H4v-6M20 10V4h-6M4 14v6h6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
-                                  </svg>
-                                </button>
-                                <button
-                                  className={`flex h-9 w-9 items-center justify-center rounded-full border border-ink/10 bg-white text-ink shadow-[0_8px_20px_rgba(15,23,42,0.08)] transition hover:border-ink/20 hover:bg-mist ${isEditingImageTag ? "border-ink/25 bg-mist" : ""}`}
-                                  onClick={() => setEditingImageTagKey((current) => (current === previewKey ? null : previewKey))}
-                                  onPointerDown={onNoteInteract}
-                                  title="Edit image tag"
-                                  type="button"
-                                >
-                                  <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                                    <path d="M14.5 5.5l4 4M4 20l4.2-.8L19 8.4 15.6 5 4.8 15.8 4 20z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                                  </svg>
-                                </button>
-                              </>
-                            ) : null}
-                          </div>
-                          {isEditingImageTag ? (
-                            <textarea
-                              aria-label="Image tag source"
-                              className="mt-2 min-h-[96px] min-w-0 flex-1 resize-y overflow-x-auto rounded-lg border border-ink/10 bg-white px-3 py-2 font-mono text-xs leading-5 text-ink outline-none shadow-[0_8px_20px_rgba(15,23,42,0.06)] focus:border-ink/25"
-                              onChange={(event) => updateMediaTagText(preview, event.target.value)}
-                              onFocus={onNoteInteract}
-                              onKeyUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
-                              onMouseUp={(event) => syncMediaTagSelection(preview, event.currentTarget)}
-                              onPointerDown={onNoteInteract}
-                              onSelect={(event) => syncMediaTagSelection(preview, event.currentTarget)}
-                              rows={4}
-                              spellCheck={false}
-                              value={preview.tagText}
-                              wrap="off"
-                            />
-                          ) : null}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : null}
               </div>
               <div aria-hidden="true" className="h-[90vh]" />
             </div>
           ) : (
             <div className="relative">
               <div className="relative grid grid-cols-[20px_minmax(0,1fr)]">
-                {renderLineNumberGutter(0, { everyTenOnly: true })}
+                {renderLineNumberGutter(0, { everyTenOnly: true, lineHeights: viewerLineHeights })}
                 <div
                   className="markdown-preview min-h-[34rem] cursor-text px-[10px] py-[5px]"
                   dangerouslySetInnerHTML={{ __html: previewHtml }}

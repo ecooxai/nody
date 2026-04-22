@@ -85,7 +85,7 @@ body::-webkit-scrollbar {
 }
 
 .markdown-preview .note-embedded-video {
-  @apply max-h-[200px] max-w-[200px] rounded-xl bg-black;
+  @apply h-[200px] w-auto max-w-[200px] rounded-xl bg-black object-contain;
 }
 
 .markdown-preview .note-embedded-audio {
