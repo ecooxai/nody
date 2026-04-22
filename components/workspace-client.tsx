@@ -35,6 +35,7 @@ import type {
   AINoteReference,
   AIRequestAttachment,
   AIRequestMode,
+  AIResponseAttachment,
   AIResponseAction,
   DocumentRecord,
   FolderAsset,
@@ -160,6 +161,17 @@ function base64ToFile(base64: string, fileName: string, mimeType: string) {
     type: mimeType,
     lastModified: Date.now(),
   });
+}
+
+function imageGenerationMetadata(attachment: AIResponseAttachment) {
+  return {
+    ...(attachment.model ? { model: attachment.model } : {}),
+    ...(attachment.width ? { width: attachment.width } : {}),
+    ...(attachment.height ? { height: attachment.height } : {}),
+    ...(attachment.resolution ? { resolution: attachment.resolution } : {}),
+    ...(attachment.aspectRatio ? { aspectRatio: attachment.aspectRatio } : {}),
+    ...(attachment.imageSize ? { imageSize: attachment.imageSize } : {}),
+  };
 }
 
 function formatCommandIcon(command: EditorCommand) {
@@ -1389,6 +1401,7 @@ function WorkspaceClientContent() {
                   mimeType: savedAsset.mimeType,
                   origin: "generated",
                   url: savedAsset.url,
+                  ...imageGenerationMetadata(attachment),
                 });
                 continue;
               }
@@ -1401,6 +1414,7 @@ function WorkspaceClientContent() {
               mimeType: attachment.mimeType,
               origin: "generated",
               url: URL.createObjectURL(file),
+              ...imageGenerationMetadata(attachment),
             });
           }
 

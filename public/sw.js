@@ -1,4 +1,4 @@
-const CACHE_NAME = "nody-static-v2";
+const CACHE_NAME = "nody-static-v3";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -22,19 +22,21 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/_next/")) return;
 
+  if (event.request.mode === "navigate") {
+    event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+    return;
+  }
+
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const network = fetch(event.request)
-        .then((response) => {
-          const contentType = response.headers.get("content-type") ?? "";
-          if (contentType.includes("text/html") || contentType.includes("javascript") || contentType.includes("css")) {
-            const clone = response.clone();
-            void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return response;
-        })
-        .catch(() => cached);
-      return cached ?? network;
-    }),
+    fetch(event.request)
+      .then((response) => {
+        const contentType = response.headers.get("content-type") ?? "";
+        if (contentType.includes("javascript") || contentType.includes("css")) {
+          const clone = response.clone();
+          void caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        }
+        return response;
+      })
+      .catch(() => caches.match(event.request)),
   );
 });

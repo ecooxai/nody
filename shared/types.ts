@@ -96,6 +96,12 @@ export type AIRequestMode = "chat" | "image" | "tts";
 export type AIMessageAttachment = Pick<AIRequestAttachment, "id" | "kind" | "fileName" | "mimeType"> & {
   url?: string;
   origin?: "uploaded" | "generated";
+  model?: string;
+  width?: number;
+  height?: number;
+  resolution?: string;
+  aspectRatio?: string;
+  imageSize?: string;
 };
 
 export type AIMessagePrompt = Pick<PromptTemplate, "id" | "name" | "content">;
@@ -162,6 +168,12 @@ export type AIResponseAttachment = {
   fileName: string;
   mimeType: string;
   dataBase64: string;
+  model?: string;
+  width?: number;
+  height?: number;
+  resolution?: string;
+  aspectRatio?: string;
+  imageSize?: string;
 };
 
 export type AIResponse = {

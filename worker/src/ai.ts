@@ -32,6 +32,55 @@ const streamHeaders = {
 };
 
 const geminiTtsModel = "gemini-3.1-flash-tts-preview";
+const defaultGeminiImageModel = "gemini-3.1-flash-image-preview";
+const defaultGeminiImageAspectRatio = "1:1";
+const defaultGeminiImageSize = "1K";
+const supportedGeminiImageAspectRatios = [
+  "1:1",
+  "2:3",
+  "3:2",
+  "3:4",
+  "4:3",
+  "4:5",
+  "5:4",
+  "9:16",
+  "16:9",
+  "21:9",
+] as const;
+const supportedGeminiImageAspectRatioSet = new Set<string>(supportedGeminiImageAspectRatios);
+const geminiImageDimensions1k: Record<string, { width: number; height: number }> = {
+  "1:1": { width: 1024, height: 1024 },
+  "2:3": { width: 848, height: 1264 },
+  "3:2": { width: 1264, height: 848 },
+  "3:4": { width: 896, height: 1200 },
+  "4:3": { width: 1200, height: 896 },
+  "4:5": { width: 928, height: 1152 },
+  "5:4": { width: 1152, height: 928 },
+  "9:16": { width: 768, height: 1376 },
+  "16:9": { width: 1376, height: 768 },
+  "21:9": { width: 1584, height: 672 },
+};
+const gemini25ImageDimensions: Record<string, { width: number; height: number }> = {
+  "1:1": { width: 1024, height: 1024 },
+  "2:3": { width: 832, height: 1248 },
+  "3:2": { width: 1248, height: 832 },
+  "3:4": { width: 864, height: 1184 },
+  "4:3": { width: 1184, height: 864 },
+  "4:5": { width: 896, height: 1152 },
+  "5:4": { width: 1152, height: 896 },
+  "9:16": { width: 768, height: 1344 },
+  "16:9": { width: 1344, height: 768 },
+  "21:9": { width: 1536, height: 672 },
+};
+
+type GeminiImageRequestConfig = {
+  model: string;
+  aspectRatio: string;
+  imageSize?: string;
+  fallbackWidth: number;
+  fallbackHeight: number;
+  fallbackResolution: string;
+};
 
 export async function askProvider(env: Env, userId: string, settings: ProviderSettings, request: AIRequest): Promise<AIResponse> {
   if (!settings.apiKey) {
@@ -169,10 +218,11 @@ async function askGemini(env: Env, userId: string, settings: ProviderSettings, r
 }
 
 async function askGeminiImage(env: Env, userId: string, settings: ProviderSettings, request: AIRequest) {
-  const response = await fetch(buildGeminiImageUrl(settings), {
+  const imageRequest = buildGeminiImageRequestConfig(settings, request);
+  const response = await fetch(buildGeminiImageUrl(settings, imageRequest.model), {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(await buildGeminiImagePayload(env, userId, request)),
+    body: JSON.stringify(await buildGeminiImagePayload(env, userId, request, imageRequest)),
   });
   if (!response.ok) {
     throw new Error(await readProviderError(response, "Gemini image generation failed"));
@@ -195,12 +245,23 @@ async function askGeminiImage(env: Env, userId: string, settings: ProviderSettin
       const mimeType = inlineData.mimeType?.trim() || "image/png";
       if (!mimeType.startsWith("image/")) return [];
       const extension = imageExtensionForMimeType(mimeType);
+      const dimensions = readImageDimensionsFromBase64(inlineData.data, mimeType) ?? {
+        width: imageRequest.fallbackWidth,
+        height: imageRequest.fallbackHeight,
+      };
+      const resolution = `${dimensions.width}x${dimensions.height}`;
       return [
         {
           kind: "image",
           fileName: `generated-image-${index + 1}.${extension}`,
           mimeType,
           dataBase64: inlineData.data,
+          model: imageRequest.model,
+          width: dimensions.width,
+          height: dimensions.height,
+          resolution,
+          aspectRatio: imageRequest.aspectRatio,
+          imageSize: imageRequest.imageSize ?? defaultGeminiImageSize,
         },
       ];
     });
@@ -210,7 +271,7 @@ async function askGeminiImage(env: Env, userId: string, settings: ProviderSettin
     .join("\n\n");
 
   return normalizeAiResponse({
-    answer: answer || (attachments.length > 0 ? "Generated image." : "No answer"),
+    answer: withImageGenerationSummary(answer || (attachments.length > 0 ? "Generated image." : "No answer"), attachments, imageRequest),
     substitutions: [],
     attachments,
   });
@@ -312,7 +373,7 @@ async function buildGeminiPayload(env: Env, userId: string, request: AIRequest) 
   };
 }
 
-async function buildGeminiImagePayload(env: Env, userId: string, request: AIRequest) {
+async function buildGeminiImagePayload(env: Env, userId: string, request: AIRequest, imageRequest: GeminiImageRequestConfig) {
   return {
     contents: [
       {
@@ -325,6 +386,12 @@ async function buildGeminiImagePayload(env: Env, userId: string, request: AIRequ
         ],
       },
     ],
+    generationConfig: {
+      imageConfig: {
+        aspectRatio: imageRequest.aspectRatio,
+        ...(imageRequest.imageSize ? { imageSize: imageRequest.imageSize } : {}),
+      },
+    },
   };
 }
 
@@ -569,9 +636,32 @@ function normalizeAiResponse(response: AIResponse): AIResponse {
             fileName: attachment.fileName,
             mimeType: attachment.mimeType,
             dataBase64: attachment.dataBase64,
+            ...normalizeImageMetadata(attachment),
           }))
       : [],
   };
+}
+
+function normalizeImageMetadata(attachment: AIResponseAttachment) {
+  const width = normalizePositiveInteger(attachment.width);
+  const height = normalizePositiveInteger(attachment.height);
+  const resolution = typeof attachment.resolution === "string" && attachment.resolution.trim()
+    ? attachment.resolution.trim()
+    : width && height
+      ? `${width}x${height}`
+      : "";
+  return {
+    ...(typeof attachment.model === "string" && attachment.model.trim() ? { model: attachment.model.trim() } : {}),
+    ...(width ? { width } : {}),
+    ...(height ? { height } : {}),
+    ...(resolution ? { resolution } : {}),
+    ...(typeof attachment.aspectRatio === "string" && attachment.aspectRatio.trim() ? { aspectRatio: attachment.aspectRatio.trim() } : {}),
+    ...(typeof attachment.imageSize === "string" && attachment.imageSize.trim() ? { imageSize: attachment.imageSize.trim() } : {}),
+  };
+}
+
+function normalizePositiveInteger(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : null;
 }
 
 async function readProviderError(response: Response, fallback: string) {
@@ -609,6 +699,105 @@ function buildImagePromptText(request: AIRequest) {
     .join("\n\n");
 }
 
+function buildGeminiImageRequestConfig(settings: ProviderSettings, request: AIRequest): GeminiImageRequestConfig {
+  const model = effectiveGeminiImageModel(settings);
+  const promptText = buildImagePromptText(request);
+  const aspectRatio = parseRequestedImageAspectRatio(promptText) ?? defaultGeminiImageAspectRatio;
+  const imageSize = supportsGeminiImageSize(model) ? parseRequestedImageSize(promptText) ?? defaultGeminiImageSize : undefined;
+  const fallbackDimensions = estimateGeminiImageDimensions(model, aspectRatio, imageSize);
+  return {
+    model,
+    aspectRatio,
+    imageSize,
+    fallbackWidth: fallbackDimensions.width,
+    fallbackHeight: fallbackDimensions.height,
+    fallbackResolution: `${fallbackDimensions.width}x${fallbackDimensions.height}`,
+  };
+}
+
+function effectiveGeminiImageModel(settings: ProviderSettings) {
+  return settings.imageModel.trim() || defaultGeminiImageModel;
+}
+
+function supportsGeminiImageSize(model: string) {
+  return /\bgemini-3(?:[.-]|$)/i.test(model);
+}
+
+function parseRequestedImageAspectRatio(text: string) {
+  const dimensionMatch = text.match(/\b(\d{3,5})\s*[x×]\s*(\d{3,5})\b/i);
+  if (dimensionMatch) {
+    const width = Number.parseInt(dimensionMatch[1] ?? "", 10);
+    const height = Number.parseInt(dimensionMatch[2] ?? "", 10);
+    const aspectRatio = inferSupportedAspectRatio(width, height);
+    if (aspectRatio) return aspectRatio;
+  }
+
+  const ratioMatches = text.matchAll(/\b(\d{1,2})\s*[:/]\s*(\d{1,2})\b/g);
+  for (const match of ratioMatches) {
+    const aspectRatio = `${Number.parseInt(match[1] ?? "", 10)}:${Number.parseInt(match[2] ?? "", 10)}`;
+    if (supportedGeminiImageAspectRatioSet.has(aspectRatio)) return aspectRatio;
+  }
+
+  const normalized = text.toLowerCase();
+  if (/\b(square|square-format|square format)\b/.test(normalized)) return "1:1";
+  if (/\b(portrait aspect|vertical aspect|phone wallpaper|mobile wallpaper|story format)\b/.test(normalized)) return "9:16";
+  if (/\b(landscape aspect|horizontal aspect|widescreen|desktop wallpaper)\b/.test(normalized)) return "16:9";
+  return null;
+}
+
+function parseRequestedImageSize(text: string) {
+  const normalized = text.toLowerCase();
+  if (/\b4\s*k\b/.test(normalized)) return "4K";
+  if (/\b2\s*k\b/.test(normalized)) return "2K";
+
+  const dimensionMatch = normalized.match(/\b(\d{3,5})\s*[x×]\s*(\d{3,5})\b/);
+  if (!dimensionMatch) return null;
+  const width = Number.parseInt(dimensionMatch[1] ?? "", 10);
+  const height = Number.parseInt(dimensionMatch[2] ?? "", 10);
+  const largestSide = Math.max(width, height);
+  if (largestSide >= 3500) return "4K";
+  if (largestSide >= 1600) return "2K";
+  return "1K";
+}
+
+function inferSupportedAspectRatio(width: number, height: number) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  const requested = width / height;
+  const closest = supportedGeminiImageAspectRatios
+    .map((aspectRatio) => {
+      const [aspectWidth, aspectHeight] = aspectRatio.split(":").map((part) => Number.parseInt(part, 10));
+      return {
+        aspectRatio,
+        distance: Math.abs(Math.log(requested / ((aspectWidth ?? 1) / (aspectHeight ?? 1)))),
+      };
+    })
+    .sort((a, b) => a.distance - b.distance)[0];
+  return closest && closest.distance < 0.08 ? closest.aspectRatio : null;
+}
+
+function estimateGeminiImageDimensions(model: string, aspectRatio: string, imageSize?: string) {
+  const baseDimensions = model.toLowerCase().includes("gemini-2.5")
+    ? gemini25ImageDimensions[aspectRatio]
+    : geminiImageDimensions1k[aspectRatio];
+  const dimensions = baseDimensions ?? geminiImageDimensions1k[defaultGeminiImageAspectRatio];
+  const scale = imageSize === "4K" ? 4 : imageSize === "2K" ? 2 : 1;
+  return {
+    width: dimensions.width * scale,
+    height: dimensions.height * scale,
+  };
+}
+
+function withImageGenerationSummary(answer: string, attachments: AIResponseAttachment[], imageRequest: GeminiImageRequestConfig) {
+  if (attachments.length === 0) return answer;
+  const details = attachments.map((attachment, index) => {
+    const label = attachments.length > 1 ? `Image ${index + 1}: ` : "";
+    const resolution = attachment.resolution || imageRequest.fallbackResolution;
+    const model = attachment.model || imageRequest.model;
+    return `${label}Resolution: ${resolution}. Model: ${model}.`;
+  });
+  return `${answer.trim()}\n\n${details.join("\n")}`;
+}
+
 function buildTtsPromptText(text: string) {
   return [
     "Read the following selected note text aloud exactly as written.",
@@ -633,10 +822,10 @@ function buildGeminiTtsUrl(settings: ProviderSettings) {
   return `${base}/v1beta/models/${geminiTtsModel}:generateContent?key=${key}`;
 }
 
-function buildGeminiImageUrl(settings: ProviderSettings) {
+function buildGeminiImageUrl(settings: ProviderSettings, imageModel = effectiveGeminiImageModel(settings)) {
   const base = settings.apiUrl.replace(/\/$/, "");
   const key = encodeURIComponent(settings.apiKey);
-  const model = encodeURIComponent(settings.imageModel || "gemini-3.1-flash-image-preview");
+  const model = encodeURIComponent(imageModel);
   return `${base}/v1beta/models/${model}:generateContent?key=${key}`;
 }
 
@@ -645,6 +834,113 @@ function parsePcmSampleRate(mimeType?: string) {
   if (!match) return null;
   const rate = Number.parseInt(match[1], 10);
   return Number.isFinite(rate) && rate > 0 ? rate : null;
+}
+
+function readImageDimensionsFromBase64(base64: string, mimeType: string) {
+  try {
+    const bytes = base64ToUint8Array(base64);
+    if (mimeType.includes("png")) return readPngDimensions(bytes);
+    if (mimeType.includes("jpeg") || mimeType.includes("jpg")) return readJpegDimensions(bytes);
+    if (mimeType.includes("gif")) return readGifDimensions(bytes);
+    if (mimeType.includes("webp")) return readWebpDimensions(bytes);
+  } catch {}
+  return null;
+}
+
+function readPngDimensions(bytes: Uint8Array) {
+  if (
+    bytes.length < 24 ||
+    bytes[0] !== 0x89 ||
+    bytes[1] !== 0x50 ||
+    bytes[2] !== 0x4e ||
+    bytes[3] !== 0x47
+  ) {
+    return null;
+  }
+  return {
+    width: readUint32BE(bytes, 16),
+    height: readUint32BE(bytes, 20),
+  };
+}
+
+function readJpegDimensions(bytes: Uint8Array) {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return null;
+  let index = 2;
+  while (index + 9 < bytes.length) {
+    if (bytes[index] !== 0xff) {
+      index += 1;
+      continue;
+    }
+    const marker = bytes[index + 1];
+    if (marker === undefined || marker === 0xd9 || marker === 0xda) return null;
+    const segmentLength = readUint16BE(bytes, index + 2);
+    if (segmentLength < 2) return null;
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return {
+        height: readUint16BE(bytes, index + 5),
+        width: readUint16BE(bytes, index + 7),
+      };
+    }
+    index += 2 + segmentLength;
+  }
+  return null;
+}
+
+function readGifDimensions(bytes: Uint8Array) {
+  if (bytes.length < 10 || byteString(bytes, 0, 3) !== "GIF") return null;
+  return {
+    width: readUint16LE(bytes, 6),
+    height: readUint16LE(bytes, 8),
+  };
+}
+
+function readWebpDimensions(bytes: Uint8Array) {
+  if (bytes.length < 30 || byteString(bytes, 0, 4) !== "RIFF" || byteString(bytes, 8, 4) !== "WEBP") return null;
+  const chunk = byteString(bytes, 12, 4);
+  if (chunk === "VP8X") {
+    return {
+      width: readUint24LE(bytes, 24) + 1,
+      height: readUint24LE(bytes, 27) + 1,
+    };
+  }
+  if (chunk === "VP8 " && bytes.length >= 30) {
+    return {
+      width: readUint16LE(bytes, 26) & 0x3fff,
+      height: readUint16LE(bytes, 28) & 0x3fff,
+    };
+  }
+  if (chunk === "VP8L" && bytes.length >= 25) {
+    const bits = (bytes[21] ?? 0) | ((bytes[22] ?? 0) << 8) | ((bytes[23] ?? 0) << 16) | ((bytes[24] ?? 0) << 24);
+    return {
+      width: (bits & 0x3fff) + 1,
+      height: ((bits >> 14) & 0x3fff) + 1,
+    };
+  }
+  return null;
+}
+
+function readUint32BE(bytes: Uint8Array, offset: number) {
+  return ((bytes[offset] ?? 0) << 24) | ((bytes[offset + 1] ?? 0) << 16) | ((bytes[offset + 2] ?? 0) << 8) | (bytes[offset + 3] ?? 0);
+}
+
+function readUint16BE(bytes: Uint8Array, offset: number) {
+  return ((bytes[offset] ?? 0) << 8) | (bytes[offset + 1] ?? 0);
+}
+
+function readUint16LE(bytes: Uint8Array, offset: number) {
+  return (bytes[offset] ?? 0) | ((bytes[offset + 1] ?? 0) << 8);
+}
+
+function readUint24LE(bytes: Uint8Array, offset: number) {
+  return (bytes[offset] ?? 0) | ((bytes[offset + 1] ?? 0) << 8) | ((bytes[offset + 2] ?? 0) << 16);
+}
+
+function byteString(bytes: Uint8Array, offset: number, length: number) {
+  let value = "";
+  for (let index = 0; index < length; index += 1) {
+    value += String.fromCharCode(bytes[offset + index] ?? 0);
+  }
+  return value;
 }
 
 function pcm16Base64ToWavBase64(pcmBase64: string, sampleRate: number) {

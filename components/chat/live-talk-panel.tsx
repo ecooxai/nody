@@ -5,7 +5,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiClient } from "@/lib/api/client";
 import { stripMarkdown } from "@/lib/editor/markdown";
 import { defaultLiveRecordingSettings } from "@/lib/providers/defaults";
-import type { AIMediaKind, AINoteReference, LiveRecordingSettings, ProviderSettings, TextSubstitution } from "@/shared/types";
+import type { AIMediaKind, AINoteReference, AIResponseAttachment, LiveRecordingSettings, ProviderSettings, TextSubstitution } from "@/shared/types";
+
+type GeneratedImageMetadata = Pick<AIResponseAttachment, "model" | "width" | "height" | "resolution" | "aspectRatio" | "imageSize">;
 
 type LiveGeneratedImage = {
   id: string;
@@ -14,7 +16,7 @@ type LiveGeneratedImage = {
   origin: "camera" | "generated";
   url: string;
   dataBase64: string;
-};
+} & GeneratedImageMetadata;
 
 type LiveTurn = {
   id: string;
@@ -146,7 +148,7 @@ export type LiveHistoryImage = {
   id: string;
   fileName: string;
   url: string;
-};
+} & GeneratedImageMetadata;
 
 export type LiveHistoryTargets = {
   hasCamera: boolean;
@@ -663,6 +665,22 @@ function base64ToObjectUrl(base64: string, mimeType: string) {
   return URL.createObjectURL(new Blob([bytes], { type: mimeType }));
 }
 
+function generatedImageMetadata(attachment: GeneratedImageMetadata) {
+  return {
+    ...(attachment.model ? { model: attachment.model } : {}),
+    ...(attachment.width ? { width: attachment.width } : {}),
+    ...(attachment.height ? { height: attachment.height } : {}),
+    ...(attachment.resolution ? { resolution: attachment.resolution } : {}),
+    ...(attachment.aspectRatio ? { aspectRatio: attachment.aspectRatio } : {}),
+    ...(attachment.imageSize ? { imageSize: attachment.imageSize } : {}),
+  };
+}
+
+function formatGeneratedImageMetadata(image: GeneratedImageMetadata) {
+  const resolution = image.resolution || (image.width && image.height ? `${image.width}x${image.height}` : "");
+  return [resolution ? `Resolution ${resolution}` : "", image.model ? `Model ${image.model}` : ""].filter(Boolean).join(" | ");
+}
+
 function isLocalSystemAudioInput(label?: string | null) {
   return Boolean(label && LOCAL_AUDIO_INPUT_LABEL_PATTERN.test(label));
 }
@@ -701,8 +719,9 @@ function buildNoteContext(noteId: string, title: string, bodyMarkdown: string, n
     "If the user wants to change an uploaded image or a previously generated image, you must call generate_image with the edit request.",
     "Do not answer that you will only describe the current image or combine text instructions manually.",
     "The app keeps the most recent uploaded or generated image as the current source image and automatically uploads it to the image API when you call generate_image for an edit.",
+    "The image tool defaults to a 1024x1024 1:1 image unless the user requests another aspect ratio.",
     "When the user says modify, change, edit, restyle, remove something from, add something to, or make variations of the current image, treat that as an image edit request and call the tool.",
-    "After the tool returns, briefly describe what was generated and mention any notable constraints or variations.",
+    "After the tool returns, briefly describe what was generated and mention the image resolution and model returned by the tool.",
     "If the user asks you to look through their camera, inspect a physical object, read a page in front of the device, or watch something in the room, call start_camera_share.",
     "Camera sharing uses snapshot mode by default. Snapshot mode does not send images automatically; call capture_camera_shot when the user's request needs a camera image.",
     "If the user explicitly asks for live or continuous camera video, call start_camera_share with mode set to video.",
@@ -729,7 +748,7 @@ function buildNoteContext(noteId: string, title: string, bodyMarkdown: string, n
 const generateImageFunctionDeclaration = {
   name: "generate_image",
   description:
-    "Generate or edit an image with the configured Gemini image model. Use this whenever the user asks for an image, illustration, photo, icon, poster, wallpaper, or image edit. If the user refers to an uploaded image or the last generated image, treat the request as an image edit. For edits, the app automatically uploads the current source image to the image API when this tool is called.",
+    "Generate or edit an image with the configured Gemini image model. Use this whenever the user asks for an image, illustration, photo, icon, poster, wallpaper, or image edit. If the user refers to an uploaded image or the last generated image, treat the request as an image edit. For edits, the app automatically uploads the current source image to the image API when this tool is called. Defaults to a 1024x1024 1:1 image unless the user asks for another aspect ratio.",
   parameters: {
     type: "OBJECT",
     properties: {
@@ -740,7 +759,7 @@ const generateImageFunctionDeclaration = {
       },
       aspect_ratio: {
         type: "STRING",
-        description: "Optional aspect ratio like 1:1, 4:3, 3:4, 16:9, or 9:16.",
+        description: "Optional aspect ratio like 1:1, 4:3, 3:4, 16:9, or 9:16. Omit it when the user did not ask for another aspect ratio.",
       },
     },
     required: ["prompt"],
@@ -1200,7 +1219,7 @@ export function LiveTalkPanel({
   const audioUrlsRef = useRef<string[]>([]);
   const generatedImageUrlsRef = useRef<string[]>([]);
   const latestImageContextRef = useRef<LiveImageContext | null>(null);
-  const latestImagePreviewRef = useRef<{ fileName: string; mimeType: string; previewUrl: string } | null>(null);
+  const latestImagePreviewRef = useRef<({ fileName: string; mimeType: string; previewUrl: string } & GeneratedImageMetadata) | null>(null);
   const liveImageInsertInFlightRef = useRef<Set<string>>(new Set());
   const lastLiveImageInsertRef = useRef<{ key: string; insertedAt: number } | null>(null);
   const cameraShotInsertInFlightRef = useRef<Set<string>>(new Set());
@@ -1709,6 +1728,7 @@ export function LiveTalkPanel({
             id: image.id,
             fileName: image.fileName,
             url: image.url,
+            ...generatedImageMetadata(image),
           })),
       ),
     [orderedTurns],
@@ -2598,6 +2618,26 @@ export function LiveTalkPanel({
       moveVideoShareTurnToEnd();
     };
 
+    const appendAssistantToolMessage = (message: string) => {
+      const trimmedMessage = message.trim();
+      if (!trimmedMessage) return;
+      const existingId = liveAssistantTurnIdRef.current ?? createAssistantTurn();
+      setTurns((current) => {
+        let updated = false;
+        const next = current.map((turn) => {
+          if (turn.id !== existingId) return turn;
+          updated = true;
+          const existingContent = turn.content.trimEnd();
+          return {
+            ...turn,
+            content: existingContent ? `${existingContent}\n\n${trimmedMessage}` : trimmedMessage,
+          };
+        });
+        return updated ? next : [...current, { id: existingId, role: "assistant", content: trimmedMessage }];
+      });
+      moveVideoShareTurnToEnd();
+    };
+
     const announceImageGenerationStart = () => {
       const existingId = liveAssistantTurnIdRef.current ?? createAssistantTurn();
       liveAssistantTurnIdRef.current = existingId;
@@ -2929,6 +2969,7 @@ export function LiveTalkPanel({
         fileName: image.fileName,
         mimeType: image.mimeType,
         previewUrl: image.url,
+        ...generatedImageMetadata(image),
       };
     };
 
@@ -3599,6 +3640,7 @@ export function LiveTalkPanel({
               origin: "generated",
               url,
               dataBase64: attachment.dataBase64,
+              ...generatedImageMetadata(attachment),
             };
           });
 
@@ -3616,6 +3658,7 @@ export function LiveTalkPanel({
             fileName: latestGeneratedImage.fileName,
             mimeType: latestGeneratedImage.mimeType,
             previewUrl: latestGeneratedImage.url,
+            ...generatedImageMetadata(latestGeneratedImage),
           };
         }
 
@@ -3623,7 +3666,14 @@ export function LiveTalkPanel({
           pendingGeneratedImageScrollRef.current = true;
         }
         appendImagesToAssistantTurn(images, assistantTurnId);
-        setStatus(images.length > 0 ? "Generated image from live tool." : "Live tool returned no image.");
+        if (images.length > 0 && response.answer.trim()) {
+          appendAssistantToolMessage(response.answer);
+        }
+        setStatus(
+          images.length > 0
+            ? `Generated image from live tool.${latestGeneratedImage && formatGeneratedImageMetadata(latestGeneratedImage) ? ` ${formatGeneratedImageMetadata(latestGeneratedImage)}.` : ""}`
+            : "Live tool returned no image.",
+        );
 
         return {
           id: callId,
@@ -3636,6 +3686,8 @@ export function LiveTalkPanel({
             images: images.map((image) => ({
               file_name: image.fileName,
               mime_type: image.mimeType,
+              resolution: image.resolution || (image.width && image.height ? `${image.width}x${image.height}` : undefined),
+              model: image.model,
             })),
           },
         };
@@ -3818,6 +3870,7 @@ export function LiveTalkPanel({
       const rawLineNumber = call.args?.line_number;
       const lineNumber = typeof rawLineNumber === "number" && Number.isFinite(rawLineNumber) ? Math.max(1, Math.floor(rawLineNumber)) : undefined;
       if (!image) {
+        appendAssistantToolMessage("No current image is available to insert.");
         return {
           id: typeof call.id === "string" ? call.id : "",
           name: call.name ?? "insert_current_image",
@@ -3829,6 +3882,14 @@ export function LiveTalkPanel({
       }
 
       const { inserted, duplicate } = await insertLiveImageOnce(image, lineNumber);
+      const message = inserted
+        ? lineNumber
+          ? `Inserted ${image.fileName} before line ${lineNumber}.`
+          : `Inserted ${image.fileName} into the current note.`
+        : duplicate
+          ? `Skipped a duplicate insert for ${image.fileName}.`
+          : `${image.fileName} was not inserted into the current note.`;
+      appendAssistantToolMessage(message);
       setStatus(inserted ? "Inserted current image into the note." : duplicate ? "Skipped duplicate image insert." : "Current image was not inserted.");
       return {
         id: typeof call.id === "string" ? call.id : "",
@@ -4001,6 +4062,8 @@ export function LiveTalkPanel({
         return;
       }
 
+      clearAssistantReplyTimeout();
+      finalizeUserAudio();
       setStatus("Gemini requested a live tool.");
       const functionResponses = await Promise.all(
         functionCalls.map(async (call) => {
@@ -4067,6 +4130,7 @@ export function LiveTalkPanel({
           },
         }),
       );
+      resetAssistantTurn();
       setStatus("Live talk ready.");
       showHistoryNotice("Tool response sent to Gemini.");
     };
@@ -4304,7 +4368,7 @@ export function LiveTalkPanel({
                   <div className={`${turn.content || turn.videoStream ? "mb-2" : ""} grid gap-2`}>
                     {turn.images.map((image) => (
                       <button
-                        className="flex overflow-hidden rounded-[8px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
+                        className="flex flex-col overflow-hidden rounded-[8px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
                         data-live-generated-image={image.origin === "generated" ? "true" : undefined}
                         data-live-generated-image-id={image.origin === "generated" ? image.id : undefined}
                         key={image.id}
@@ -4316,6 +4380,9 @@ export function LiveTalkPanel({
                           className={`${turn.role === "user" ? "h-[150px]" : "max-h-[240px]"} w-auto max-w-full object-contain`}
                           src={image.url}
                         />
+                        {image.origin === "generated" && formatGeneratedImageMetadata(image) ? (
+                          <span className="mt-2 truncate text-[10px] text-ink/55">{formatGeneratedImageMetadata(image)}</span>
+                        ) : null}
                       </button>
                     ))}
                   </div>
@@ -4458,6 +4525,9 @@ export function LiveTalkPanel({
               <div className="min-w-0">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Image</div>
                 <div className="truncate text-sm font-medium text-ink">{previewImage.fileName}</div>
+                {previewImage.origin === "generated" && formatGeneratedImageMetadata(previewImage) ? (
+                  <div className="mt-0.5 truncate text-xs text-ink/55">{formatGeneratedImageMetadata(previewImage)}</div>
+                ) : null}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {onUploadImageToCurrentFolder ? (

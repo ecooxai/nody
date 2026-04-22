@@ -47,12 +47,14 @@ type LocalAttachment = {
   assetUrl?: string;
 };
 
+type GeneratedImageMetadata = Pick<AIMessageAttachment, "model" | "width" | "height" | "resolution" | "aspectRatio" | "imageSize">;
+
 type PreviewAttachment = {
   fileName: string;
   kind: AIMediaKind;
   mimeType: string;
   previewUrl: string;
-};
+} & GeneratedImageMetadata;
 
 type ExternalAttachmentSeed = {
   id: string;
@@ -67,7 +69,7 @@ type TopbarGeneratedImage = {
   id: string;
   fileName: string;
   url: string;
-};
+} & GeneratedImageMetadata;
 
 type LiveSessionState = {
   listening: boolean;
@@ -255,6 +257,63 @@ function revokeAttachmentPreview(attachment: LocalAttachment) {
 
 function attachmentBadge(kind: AIMediaKind) {
   return kind.charAt(0).toUpperCase() + kind.slice(1);
+}
+
+function generatedImageMetadata(attachment: GeneratedImageMetadata) {
+  return {
+    ...(attachment.model ? { model: attachment.model } : {}),
+    ...(attachment.width ? { width: attachment.width } : {}),
+    ...(attachment.height ? { height: attachment.height } : {}),
+    ...(attachment.resolution ? { resolution: attachment.resolution } : {}),
+    ...(attachment.aspectRatio ? { aspectRatio: attachment.aspectRatio } : {}),
+    ...(attachment.imageSize ? { imageSize: attachment.imageSize } : {}),
+  };
+}
+
+function formatGeneratedImageMetadata(attachment: GeneratedImageMetadata) {
+  const resolution = attachment.resolution || (attachment.width && attachment.height ? `${attachment.width}x${attachment.height}` : "");
+  return [resolution ? `Resolution ${resolution}` : "", attachment.model ? `Model ${attachment.model}` : ""].filter(Boolean).join(" | ");
+}
+
+function playImageGenerationCue() {
+  if (typeof window === "undefined") return;
+  const AudioContextConstructor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioContextConstructor) return;
+
+  let audioContext: AudioContext | null = null;
+  try {
+    audioContext = new AudioContextConstructor();
+    const play = () => {
+      if (!audioContext) return;
+      const now = audioContext.currentTime;
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.setValueAtTime(180, now);
+      oscillator.frequency.exponentialRampToValueAtTime(120, now + 0.11);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.2, now + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.18);
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.onended = () => {
+        oscillator.disconnect();
+        gain.disconnect();
+        void audioContext?.close().catch(() => undefined);
+        audioContext = null;
+      };
+      oscillator.start(now);
+      oscillator.stop(now + 0.2);
+    };
+
+    if (audioContext.state === "suspended") {
+      void audioContext.resume().then(play).catch(() => audioContext?.close().catch(() => undefined));
+      return;
+    }
+    play();
+  } catch {
+    void audioContext?.close().catch(() => undefined);
+  }
 }
 
 function dragEventHasFiles(event: DragEvent<HTMLElement>) {
@@ -779,6 +838,7 @@ export function AIChatPanel({
   const resizeStartHeightRef = useRef(460);
   const latestAssistantMessageId = [...messages].reverse().find((message) => message.role === "assistant")?.id ?? null;
   const previousLatestAssistantMessageIdRef = useRef<string | null>(null);
+  const imageGenerationCueActiveRef = useRef(false);
   const latestChatMessageRole = messages[messages.length - 1]?.role ?? null;
   let latestChatGeneratedImageId: string | null = null;
   let latestChatCameraAttachmentId: string | null = null;
@@ -806,11 +866,19 @@ export function AIChatPanel({
             id: attachment.id,
             fileName: attachment.fileName,
             url: attachment.url ?? "",
+            ...generatedImageMetadata(attachment),
           }))
       : [],
   );
   const activeGeneratedImages: TopbarGeneratedImage[] =
-    activeTab === "live" ? liveHistoryTargets.generatedImages.map(({ id, fileName, url }: LiveHistoryImage) => ({ id, fileName, url })) : chatGeneratedImages;
+    activeTab === "live"
+      ? liveHistoryTargets.generatedImages.map((image: LiveHistoryImage) => ({
+          id: image.id,
+          fileName: image.fileName,
+          url: image.url,
+          ...generatedImageMetadata(image),
+        }))
+      : chatGeneratedImages;
   const latestGeneratedImage = activeGeneratedImages[activeGeneratedImages.length - 1] ?? null;
   const displayedPanelHeight = compact ? COMPACT_PANEL_HEIGHT : panelHeight;
   const compactComposerChrome = historyExpanded;
@@ -853,6 +921,13 @@ export function AIChatPanel({
       setLiveConnectionRequested(false);
     }
   }, [liveConnectionRequested, supportsLive]);
+
+  useEffect(() => {
+    if (imageGenerationActive && !imageGenerationCueActiveRef.current) {
+      playImageGenerationCue();
+    }
+    imageGenerationCueActiveRef.current = imageGenerationActive;
+  }, [imageGenerationActive]);
 
   useEffect(() => {
     if (activeTab !== "live") {
@@ -1313,13 +1388,14 @@ export function AIChatPanel({
     file,
   });
 
-  const toPreviewAttachment = (attachment: Pick<PreviewAttachment, "fileName" | "kind" | "mimeType"> & { url?: string }) =>
+  const toPreviewAttachment = (attachment: Pick<PreviewAttachment, "fileName" | "kind" | "mimeType"> & GeneratedImageMetadata & { url?: string }) =>
     attachment.url
       ? {
           fileName: attachment.fileName,
           kind: attachment.kind,
           mimeType: attachment.mimeType,
           previewUrl: attachment.url,
+          ...generatedImageMetadata(attachment),
         }
       : null;
 
@@ -1947,6 +2023,9 @@ export function AIChatPanel({
         <div className="min-w-0">
           <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Generated image</div>
           <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
+          {formatGeneratedImageMetadata(attachment) ? (
+            <div className="mt-0.5 truncate text-[10px] text-ink/55">{formatGeneratedImageMetadata(attachment)}</div>
+          ) : null}
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -2479,7 +2558,7 @@ export function AIChatPanel({
                             scrollToGeneratedImage(image.id);
                             setGeneratedImageTrayOpen(false);
                           }}
-                          title={image.fileName}
+                          title={[image.fileName, formatGeneratedImageMetadata(image)].filter(Boolean).join(" - ")}
                           type="button"
                         >
                           <img alt={image.fileName} className="h-full w-full object-cover" src={image.url} />
@@ -3532,6 +3611,9 @@ export function AIChatPanel({
               <div className="min-w-0">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">{attachmentBadge(previewAttachment.kind)}</div>
                 <div className="truncate text-sm font-medium text-ink">{previewAttachment.fileName}</div>
+                {previewAttachment.kind === "image" && formatGeneratedImageMetadata(previewAttachment) ? (
+                  <div className="mt-0.5 truncate text-xs text-ink/55">{formatGeneratedImageMetadata(previewAttachment)}</div>
+                ) : null}
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 {previewAttachment.kind === "image" ? (
