@@ -13,6 +13,7 @@ Current feature set:
 - Service worker registration for offline-first HTML/CSS/JS caching plus delayed update refresh.
 - Bottom error notifications with copyable error codes.
 - Typecheck, test, production build, and Worker config validation scripts.
+- Separate local dev modes for local D1/R2 state and Cloudflare-hosted D1/R2 bindings.
 - Cloudflare frontend deployment through OpenNext plus a separate Worker API deployment.
 
 Runtime note:
@@ -55,7 +56,7 @@ Runtime note:
 │   ├── ui/button.tsx                               # Shared button component
 │   ├── ui/panel.tsx                                # Shared panel container
 │   └── workspace-client.tsx                        # Workspace orchestration and sync loop
-├── dev.sh                                          # Low-RAM dev launcher; add --worker/--check for heavier flows
+├── dev.sh                                          # Dev launcher; supports local or remote Cloudflare Worker bindings
 ├── run.sh                                          # Production-mode runner with file watching and automatic restart
 ├── doc
 │   ├── common_mistakes.md                          # Guardrails for future edits

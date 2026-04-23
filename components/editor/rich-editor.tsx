@@ -38,7 +38,6 @@ type RichEditorProps = {
   onBodyChange: (value: string) => void;
   onSelectionChange?: (selectedText: string) => void;
   onRequestEdit?: () => void;
-  onRevealEditButton?: () => void;
   onNoteInteract?: () => void;
   onAddMediaToAi?: (media: {
     id: string;
@@ -182,6 +181,10 @@ const EDITOR_TEXT_LINE_HEIGHT_PX = 28;
 const EDITOR_AUDIO_PREVIEW_HEIGHT_PX = 48;
 const EDITOR_MEDIA_RESERVED_LINE_COUNT = 5;
 const EDITOR_MEDIA_PLACEHOLDER = "\u001f";
+const FLOATING_EDIT_BUTTON_HIDE_MS = 3000;
+const FLOATING_EDIT_BUTTON_OFFSET_X_PX = 20;
+const FLOATING_EDIT_BUTTON_OFFSET_Y_PX = 20;
+const FLOATING_EDIT_BUTTON_SIZE_PX = 40;
 const MEDIA_TAG_PATTERN = /<img\b[\s\S]*?>|<(audio|video)\b[\s\S]*?(?:\/>|>[\s\S]*?<\/\1>)/gi;
 const EDITOR_MEDIA_LINE_PATTERN = /^\s*(<img\b[\s\S]*?>|<video\b[\s\S]*?(?:\/>|>[\s\S]*?<\/video>))\s*$/i;
 
@@ -607,18 +610,19 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   onBodyChange,
   onSelectionChange,
   onRequestEdit,
-  onRevealEditButton,
   onNoteInteract,
   onAddMediaToAi,
   inlineNotice,
   overlay,
   topRight,
 }, ref) {
+  const rootRef = useRef<HTMLDivElement>(null);
   const titleInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const previewRef = useRef<HTMLDivElement>(null);
   const selectionRef = useRef<TextSelection>({ start: 0, end: 0 });
   const activeMediaHideTimerRef = useRef<number | null>(null);
+  const floatingEditButtonTimerRef = useRef<number | null>(null);
   const previewSelectionTimerRef = useRef<number | null>(null);
   const previewPointerSelectingRef = useRef(false);
   const previewSelectionJustFinishedRef = useRef(false);
@@ -639,6 +643,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const [editorLineLayout, setEditorLineLayout] = useState<LineLayout>({ heights: [], tops: {} });
   const [lineStartTops, setLineStartTops] = useState<LineTopMap>({});
   const [viewerMedia, setViewerMedia] = useState<EmbeddedMedia | null>(null);
+  const [floatingEditButton, setFloatingEditButton] = useState<{ x: number; y: number } | null>(null);
   const [viewerImageInfo, setViewerImageInfo] = useState<{
     copied: boolean;
     fileSize: number | null;
@@ -681,6 +686,18 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       setActiveMedia(null);
       activeMediaHideTimerRef.current = null;
     }, 2000);
+  };
+
+  const clearFloatingEditButtonTimer = () => {
+    if (floatingEditButtonTimerRef.current) {
+      window.clearTimeout(floatingEditButtonTimerRef.current);
+      floatingEditButtonTimerRef.current = null;
+    }
+  };
+
+  const hideFloatingEditButton = () => {
+    clearFloatingEditButtonTimer();
+    setFloatingEditButton(null);
   };
 
   const clearPreviewSelectionTimer = () => {
@@ -896,9 +913,31 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     restorePreviewSelectionSnapshot(selectedSnapshot);
   };
 
-  const revealEditButton = () => {
-    if (editable || typeof window === "undefined") return;
-    onRevealEditButton?.();
+  const revealEditButton = (event: ReactMouseEvent<HTMLElement>) => {
+    if (editable || typeof window === "undefined" || !onRequestEdit) return;
+
+    const root = rootRef.current;
+    if (!root) return;
+
+    const rootRect = root.getBoundingClientRect();
+    const fallbackRect = event.currentTarget.getBoundingClientRect();
+    const pointerX = event.clientX || fallbackRect.left + Math.min(fallbackRect.width, FLOATING_EDIT_BUTTON_SIZE_PX) / 2;
+    const pointerY = event.clientY || fallbackRect.top + fallbackRect.height / 2;
+    const x = Math.max(
+      0,
+      Math.min(pointerX - rootRect.left + FLOATING_EDIT_BUTTON_OFFSET_X_PX, root.clientWidth - FLOATING_EDIT_BUTTON_SIZE_PX),
+    );
+    const y = Math.max(
+      0,
+      Math.min(pointerY - rootRect.top + FLOATING_EDIT_BUTTON_OFFSET_Y_PX, root.clientHeight - FLOATING_EDIT_BUTTON_SIZE_PX),
+    );
+
+    setFloatingEditButton({ x, y });
+    clearFloatingEditButtonTimer();
+    floatingEditButtonTimerRef.current = window.setTimeout(() => {
+      setFloatingEditButton(null);
+      floatingEditButtonTimerRef.current = null;
+    }, FLOATING_EDIT_BUTTON_HIDE_MS);
   };
 
   const updateEditorLineLayout = () => {
@@ -919,6 +958,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   useEffect(
     () => () => {
       clearActiveMediaHideTimer();
+      clearFloatingEditButtonTimer();
       clearPreviewSelectionTimer();
       clearBodyChangeTimer();
       clearViewerCopyTimer();
@@ -949,6 +989,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   useEffect(() => {
     lastPreviewSelectionRef.current = "";
     previewPointerSelectingRef.current = false;
+    hideFloatingEditButton();
     clearPreviewSelectionTimer();
 
     if (!editable) {
@@ -1315,7 +1356,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       return;
     }
     onNoteInteract?.();
-    revealEditButton();
+    revealEditButton(event);
 
     const media = extractEmbeddedMedia(event.target);
     if (media) {
@@ -1574,13 +1615,16 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   );
 
   return (
-    <div className="relative min-h-[calc(100vh-4rem)] bg-[linear-gradient(180deg,rgba(255,251,244,0.9),rgba(255,255,255,0.96))] pr-[5px] pb-10 pt-[5px]">
+    <div
+      className="relative min-h-[calc(100vh-4rem)] bg-[linear-gradient(180deg,rgba(255,251,244,0.9),rgba(255,255,255,0.96))] pr-[5px] pb-10 pt-[5px]"
+      ref={rootRef}
+    >
       <section className="overflow-visible bg-transparent">
         <div className="flex items-start justify-between gap-3 px-[5px] py-[5px]">
           <div className="min-w-0 flex-1">
             {editable ? (
               <input
-                className="w-full bg-transparent font-display text-3xl text-ink outline-none sm:text-4xl"
+                className="w-full bg-transparent pl-[25px] font-display text-[18px] leading-8 text-ink outline-none sm:text-[19px]"
                 onChange={(event) => onTitleChange(event.target.value)}
                 onFocus={onNoteInteract}
                 onPointerDown={onNoteInteract}
@@ -1590,7 +1634,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               />
             ) : (
               <button
-                className="block w-full truncate bg-transparent text-left font-display text-3xl text-ink outline-none sm:text-4xl"
+                className="block w-full truncate bg-transparent pl-[25px] text-left font-display text-[18px] leading-8 text-ink outline-none sm:text-[19px]"
                 onClick={handlePreviewClick}
                 onFocus={onNoteInteract}
                 type="button"
@@ -1692,6 +1736,30 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
             </div>
           )}
         </div>
+        {!editable && floatingEditButton ? (
+          <button
+            aria-label="Edit note"
+            className="absolute z-30 flex h-10 w-10 items-center justify-center rounded-full bg-ink text-white shadow-[0_12px_28px_rgba(15,23,42,0.18)] transition hover:bg-ink/90"
+            onClick={() => {
+              hideFloatingEditButton();
+              onRequestEdit?.();
+            }}
+            style={{ left: floatingEditButton.x, top: floatingEditButton.y }}
+            title="Edit note"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path
+                d="M4 20h4l10-10-4-4L4 16v4Z"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.7"
+              />
+              <path d="m12.5 7.5 4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+            </svg>
+          </button>
+        ) : null}
       </section>
       {viewerMedia ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">

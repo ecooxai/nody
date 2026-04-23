@@ -359,6 +359,34 @@ function buildReadAloudPrompt(text: string) {
   ].join("\n");
 }
 
+function clampUnitInterval(value: number) {
+  return Math.max(0, Math.min(1, value));
+}
+
+function microphoneButtonStyle(level: number, options: { recording?: boolean; liveEnabled?: boolean }) {
+  const intensity = clampUnitInterval(level);
+
+  if (options.recording) {
+    return {
+      backgroundColor: `hsl(7deg 61% ${46 - intensity * 10}%)`,
+      borderColor: `hsl(7deg 61% ${46 - intensity * 10}%)`,
+      color: "#ffffff",
+      boxShadow: intensity > 0.04 ? `0 0 0 ${2 + intensity * 5}px rgba(187,62,45,${0.12 + intensity * 0.18})` : undefined,
+    };
+  }
+
+  if (!options.liveEnabled) {
+    return undefined;
+  }
+
+  return {
+    backgroundColor: `hsl(188deg 47% ${93 - intensity * 46}%)`,
+    borderColor: `hsl(188deg 58% ${36 - intensity * 10}%)`,
+    color: intensity > 0.42 ? "#ffffff" : "#1f6f78",
+    boxShadow: intensity > 0.04 ? `0 0 0 ${2 + intensity * 5}px rgba(31,111,120,${0.10 + intensity * 0.18})` : undefined,
+  };
+}
+
 function getPreferredRecordingMimeType() {
   if (typeof MediaRecorder === "undefined") return null;
   const candidates = [
@@ -796,6 +824,7 @@ export function AIChatPanel({
   const [historyExpanded, setHistoryExpanded] = useState(false);
   const [composerChromeHeight, setComposerChromeHeight] = useState(0);
   const [liveMicrophoneEnabled, setLiveMicrophoneEnabled] = useState(true);
+  const [liveMicrophoneLevel, setLiveMicrophoneLevel] = useState(0);
   const [microphoneSources, setMicrophoneSources] = useState<MicrophoneSource[]>([]);
   const [microphoneMenuOpen, setMicrophoneMenuOpen] = useState(false);
   const [microphoneMenuLoading, setMicrophoneMenuLoading] = useState(false);
@@ -897,6 +926,7 @@ export function AIChatPanel({
   const selectedTextForReadAloud = selectedText?.trim() ?? "";
   const liveDisconnected = activeTab === "live" && !liveSessionState.listening;
   const composerMenuOpen = microphoneMenuOpen || liveVideoMenuOpen;
+  const activeLiveMicrophoneLevel = activeTab === "live" && liveMicrophoneEnabled ? liveMicrophoneLevel : 0;
 
   const triggerLatestMessageShortcutFlash = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -2935,7 +2965,7 @@ export function AIChatPanel({
             <button
               aria-expanded={microphoneMenuOpen}
               aria-label={recording ? "Release to stop recording" : "Quick tap for microphones, hold 2 seconds to record audio"}
-              className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
+              className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition-[background-color,border-color,color,box-shadow] duration-150 disabled:cursor-not-allowed disabled:opacity-50 ${
                 recording
                   ? "border-[#bb3e2d] bg-[#bb3e2d] text-white"
                   : activeTab === "live" && liveMicrophoneEnabled
@@ -2964,9 +2994,15 @@ export function AIChatPanel({
                 supportsMedia
                   ? recording
                     ? "Release to stop and send audio"
-                    : "Tap for microphone choices, hold 2 seconds to record"
+                    : activeTab === "live" && liveMicrophoneEnabled
+                      ? "Live microphone is listening. Tap for microphone choices, hold 2 seconds to record."
+                      : "Tap for microphone choices, hold 2 seconds to record"
                   : "Switch to Gemini to use microphones"
               }
+              style={microphoneButtonStyle(activeLiveMicrophoneLevel, {
+                recording,
+                liveEnabled: activeTab === "live" && liveMicrophoneEnabled,
+              })}
               type="button"
             >
               {preparingRecording ? (
@@ -3610,6 +3646,7 @@ export function AIChatPanel({
             onFindInNote={onFindInNote}
             onLatestMessageStateChange={handleLiveLatestMessageStateChange}
             onLiveSpeechSent={clearPromptTextDraft}
+            onMicrophoneLevelChange={setLiveMicrophoneLevel}
             onOpenNote={onOpenNote}
             onScrollNote={onScrollNote}
             onRegisterHistoryControls={setLiveHistoryControls}

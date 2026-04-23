@@ -72,12 +72,15 @@ type LiveSessionState = {
   status: string;
 };
 
-const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.45;
+const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.9;
 const LIVE_RECORDING_SEND_GAIN = 3;
 const LIVE_RECORDING_BITS_PER_SECOND = 192_000;
 const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
 const LIVE_AUDIO_CAPTURE_SAMPLE_RATE = LIVE_AUDIO_STREAM_SAMPLE_RATE;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
+const LIVE_MICROPHONE_LEVEL_REFERENCE_RMS = 0.12;
+const LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS = 1200;
+const LIVE_MICROPHONE_STALE_TIMEOUT_MS = 3200;
 const LIVE_SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
 const LIVE_SPEECH_LOW_PASS_CUTOFF_HZ = 7000;
 const LIVE_SPEECH_NOISE_GATE_FLOOR_RMS = 0.004;
@@ -511,6 +514,11 @@ function amplifySpeechSamples(samples: Float32Array, gain: number) {
     amplified[index] = Math.tanh(lifted);
   }
   return amplified;
+}
+
+function normalizeMicrophoneUiLevel(rms: number) {
+  if (!Number.isFinite(rms) || rms <= 0) return 0;
+  return Math.max(0, Math.min(1, Math.sqrt(Math.min(1, rms / LIVE_MICROPHONE_LEVEL_REFERENCE_RMS))));
 }
 
 function normalizeUserPlaybackSamples(samples: Float32Array, minimumGain = LIVE_RECORDING_SEND_GAIN) {
@@ -1082,6 +1090,7 @@ export function LiveTalkPanel({
   onInsertGeneratedImageInNote,
   onLatestMessageStateChange,
   onLiveSpeechSent,
+  onMicrophoneLevelChange,
   onOpenNote,
   onFindInNote,
   onScrollNote,
@@ -1112,6 +1121,7 @@ export function LiveTalkPanel({
   onInsertGeneratedImageInNote: (attachment: { fileName: string; mimeType: string; previewUrl: string }, lineNumber?: number) => Promise<boolean>;
   onLatestMessageStateChange?: ((available: boolean) => void) | undefined;
   onLiveSpeechSent?: (() => void) | undefined;
+  onMicrophoneLevelChange?: ((level: number) => void) | undefined;
   onOpenNote: (target: { noteId?: string; title?: string }) => boolean;
   onFindInNote: (target: { query: string; occurrence?: "first" | "next" | "previous" }) => boolean;
   onScrollNote: (target: { target: "top" | "middle" | "bottom" | "line" | "up" | "down"; lineNumber?: number; pixels?: number }) => boolean;
@@ -1149,6 +1159,8 @@ export function LiveTalkPanel({
   const microphoneGainRef = useRef<GainNode | null>(null);
   const microphoneProcessorRef = useRef<ScriptProcessorNode | null>(null);
   const microphoneSinkGainRef = useRef<GainNode | null>(null);
+  const microphoneLastFrameAtRef = useRef(0);
+  const microphoneRefreshInFlightRef = useRef(false);
   const microphoneHighPassStateRef = useRef<SpeechHighPassState>(createSpeechHighPassState());
   const microphoneLowPassStateRef = useRef<SpeechLowPassState>(createSpeechLowPassState());
   const microphoneNoiseGateStateRef = useRef<SpeechNoiseGateState>(createSpeechNoiseGateState());
@@ -1160,6 +1172,7 @@ export function LiveTalkPanel({
   const resumeLiveSpeechRecordingRef = useRef(() => {});
   const assistantPlaybackGainRef = useRef<GainNode | null>(null);
   const onFindInNoteRef = useRef(onFindInNote);
+  const onMicrophoneLevelChangeRef = useRef(onMicrophoneLevelChange);
   const onScrollNoteRef = useRef(onScrollNote);
   const nextAudioTimeRef = useRef(0);
   const assistantPlaybackMutedUntilRef = useRef(0);
@@ -1173,7 +1186,8 @@ export function LiveTalkPanel({
   const microphoneEnabledRef = useRef(microphoneEnabled ?? true);
   const preferredMicrophoneDeviceIdRef = useRef<string | null>(microphoneDeviceId ?? null);
   const liveRecordingSettingsRef = useRef<LiveRecordingSettings>(initialLiveRecordingSettings);
-  const requestMicrophoneRef = useRef<() => Promise<MediaStream | null>>(async () => null);
+  const requestMicrophoneRef = useRef<(options?: { force?: boolean }) => Promise<MediaStream | null>>(async () => null);
+  const refreshMicrophoneRef = useRef<() => Promise<void>>(async () => {});
   const resetMicrophoneRef = useRef(() => {});
   const noteContext = useMemo(
     () => buildNoteContext(currentNoteId, currentNoteTitle, currentNoteBodyMarkdown, noteCatalog),
@@ -1449,6 +1463,10 @@ export function LiveTalkPanel({
   }, [turns]);
 
   useEffect(() => {
+    onMicrophoneLevelChangeRef.current = onMicrophoneLevelChange;
+  }, [onMicrophoneLevelChange]);
+
+  useEffect(() => {
     const isAudibleMediaElement = (target: EventTarget | null): target is HTMLMediaElement =>
       target instanceof HTMLMediaElement && !target.muted && target.volume > 0;
 
@@ -1568,6 +1586,7 @@ export function LiveTalkPanel({
       }
       microphoneRestoreTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
       microphoneRestoreTimerIdsRef.current = [];
+      onMicrophoneLevelChangeRef.current?.(0);
     },
     [],
   );
@@ -1639,6 +1658,45 @@ export function LiveTalkPanel({
     providerSettings.liveRecording?.noiseSuppression,
     sessionRequested,
   ]);
+
+  useEffect(() => {
+    if (!sessionRequested) {
+      onMicrophoneLevelChangeRef.current?.(0);
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      if (!microphoneCaptureEnabledRef.current) {
+        onMicrophoneLevelChangeRef.current?.(0);
+        return;
+      }
+
+      const stream = microphoneStreamRef.current;
+      const processor = microphoneProcessorRef.current;
+      const track = stream?.getAudioTracks()[0] ?? null;
+      const now = performance.now();
+      const mutedByPlayback =
+        microphoneStreamingPausedRef.current || webappPlaybackCountRef.current > 0 || now < assistantPlaybackMutedUntilRef.current;
+
+      if (mutedByPlayback) {
+        onMicrophoneLevelChangeRef.current?.(0);
+        return;
+      }
+
+      if (!stream || !stream.active || !processor || !track || track.readyState !== "live") {
+        if (microphoneLastFrameAtRef.current > 0 || stream) {
+          void refreshMicrophoneRef.current();
+        }
+        return;
+      }
+
+      if (microphoneLastFrameAtRef.current > 0 && now - microphoneLastFrameAtRef.current > LIVE_MICROPHONE_STALE_TIMEOUT_MS) {
+        void refreshMicrophoneRef.current();
+      }
+    }, LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [sessionRequested]);
 
   useEffect(() => {
     onVideoShareStateChangeRef.current = onVideoShareStateChange;
@@ -1910,6 +1968,7 @@ export function LiveTalkPanel({
       pauseLiveSpeechRecordingRef.current = () => {};
       resumeLiveSpeechRecordingRef.current = () => {};
       microphoneStreamingPausedRef.current = false;
+      microphoneLastFrameAtRef.current = 0;
       microphoneProcessorRef.current?.disconnect();
       microphoneProcessorRef.current = null;
       microphoneSinkGainRef.current?.disconnect();
@@ -1946,6 +2005,7 @@ export function LiveTalkPanel({
       standbyPreRollRef.current = [];
       standbyPreRollDurationMsRef.current = 0;
       resetStandbyVoiceActivationState({ resetNoiseFloor: true });
+      onMicrophoneLevelChangeRef.current?.(0);
     };
 
     const trimPendingUserAudio = () => {
@@ -1957,14 +2017,15 @@ export function LiveTalkPanel({
       pendingUserAudioDurationMsRef.current = Math.max(0, pendingUserAudioDurationMsRef.current);
     };
 
-    const requestMicrophone = async () => {
+    const requestMicrophone = async (options?: { force?: boolean }) => {
+      const forceRefresh = Boolean(options?.force);
       const preferredDeviceId = preferredMicrophoneDeviceIdRef.current;
       const existingStream = microphoneStreamRef.current;
       const existingTracks = existingStream?.getAudioTracks() ?? [];
       const existingStreamLive = existingStream?.active && existingTracks.some((track) => track.readyState === "live");
       const existingVideoAudio = microphoneUsesVideoAudioTrackRef.current && videoShareModeRef.current === "camera";
       const existingPreferredDevice = preferredDeviceId ? microphoneStreamDeviceIdRef.current === preferredDeviceId : true;
-      if (existingStream && existingStreamLive && (existingVideoAudio || existingPreferredDevice)) {
+      if (!forceRefresh && existingStream && existingStreamLive && (existingVideoAudio || existingPreferredDevice)) {
         return existingStream;
       }
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
@@ -1974,21 +2035,45 @@ export function LiveTalkPanel({
       try {
         resetMicrophone();
         const audioConstraints = buildLiveMicAudioConstraints(liveRecordingSettingsRef.current);
-        const cameraAudioTrack =
+        const fallbackCameraAudioTrack =
           isAndroidChromeBrowser() && videoShareModeRef.current === "camera"
             ? videoShareStreamRef.current?.getAudioTracks().find((track) => track.readyState === "live") ?? null
             : null;
-        const usesVideoAudioTrack = Boolean(cameraAudioTrack);
-        const stream = cameraAudioTrack
-          ? new MediaStream([cameraAudioTrack])
-          : await navigator.mediaDevices.getUserMedia({
-              audio: preferredDeviceId
-                ? {
-                    deviceId: { exact: preferredDeviceId },
-                    ...audioConstraints,
-                  }
-                : audioConstraints,
-            });
+        let usesVideoAudioTrack = false;
+        let stream: MediaStream | null = null;
+
+        const openStandaloneMicrophone = async () => {
+          if (preferredDeviceId) {
+            try {
+              return await navigator.mediaDevices.getUserMedia({
+                audio: {
+                  deviceId: { exact: preferredDeviceId },
+                  ...audioConstraints,
+                },
+              });
+            } catch {
+              // Fall back to the browser default microphone when the saved device is unavailable.
+            }
+          }
+
+          return await navigator.mediaDevices.getUserMedia({
+            audio: audioConstraints,
+          });
+        };
+
+        try {
+          stream = await openStandaloneMicrophone();
+        } catch (error) {
+          if (!fallbackCameraAudioTrack) {
+            throw error;
+          }
+          stream = new MediaStream([fallbackCameraAudioTrack]);
+          usesVideoAudioTrack = true;
+        }
+
+        if (!stream) {
+          return null;
+        }
         const audioTrack = stream.getAudioTracks()[0];
         if (isLocalSystemAudioInput(audioTrack?.label)) {
           stream.getTracks().forEach((track) => track.stop());
@@ -2023,6 +2108,7 @@ export function LiveTalkPanel({
 
             pauseLiveSpeechRecordingRef.current = () => {
               microphoneStreamingPausedRef.current = true;
+              onMicrophoneLevelChangeRef.current?.(0);
             };
 
             resumeLiveSpeechRecordingRef.current = () => {
@@ -2054,6 +2140,8 @@ export function LiveTalkPanel({
                 sumSquares += sample * sample;
               }
               const rms = Math.sqrt(sumSquares / processed.length);
+              microphoneLastFrameAtRef.current = performance.now();
+              onMicrophoneLevelChangeRef.current?.(normalizeMicrophoneUiLevel(rms));
               const currentDb = 20 * Math.log10(Math.max(rms, 1e-6));
 
               const socketConnection = socketRef.current;
@@ -2210,12 +2298,24 @@ export function LiveTalkPanel({
         setStatus("Live microphone streaming is not supported in this browser. Text live chat still works.");
         return stream;
       } catch (error) {
+        onMicrophoneLevelChangeRef.current?.(0);
         setStatus(error instanceof Error ? `${error.message} Text live chat still works.` : "Microphone access was not granted. Text live chat still works.");
         return null;
       }
     };
 
+    const refreshMicrophone = async () => {
+      if (!microphoneCaptureEnabledRef.current || microphoneRefreshInFlightRef.current) return;
+      microphoneRefreshInFlightRef.current = true;
+      try {
+        await requestMicrophone({ force: true });
+      } finally {
+        microphoneRefreshInFlightRef.current = false;
+      }
+    };
+
     requestMicrophoneRef.current = requestMicrophone;
+    refreshMicrophoneRef.current = refreshMicrophone;
     resetMicrophoneRef.current = resetMicrophone;
     if (
       microphoneCaptureEnabledRef.current &&
@@ -2226,6 +2326,7 @@ export function LiveTalkPanel({
 
     return () => {
       requestMicrophoneRef.current = async () => null;
+      refreshMicrophoneRef.current = async () => {};
       resetMicrophoneRef.current = () => {};
       resetMicrophone();
     };
@@ -3195,8 +3296,8 @@ export function LiveTalkPanel({
       }
       await startVideoShare(stream, "camera", deviceId ?? null, { cameraMode: options?.video ? "video" : "snapshot" });
       if (includeCameraMicrophone) {
-        await requestMicrophoneRef.current();
-        window.setTimeout(() => void requestMicrophoneRef.current(), 800);
+        await requestMicrophoneRef.current({ force: true });
+        window.setTimeout(() => void requestMicrophoneRef.current({ force: true }), 800);
       }
       return true;
     };
@@ -3255,14 +3356,14 @@ export function LiveTalkPanel({
       microphoneRestoreTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
       microphoneRestoreTimerIdsRef.current = [];
       resetMicrophoneRef.current();
-      await requestMicrophoneRef.current();
+      await requestMicrophoneRef.current({ force: true });
 
       for (const delayMs of [500, 1_500]) {
         const timerId = window.setTimeout(async () => {
           if (!microphoneCaptureEnabledRef.current || videoShareModeRef.current !== "camera") {
             return;
           }
-          await requestMicrophoneRef.current();
+          await requestMicrophoneRef.current({ force: true });
         }, delayMs);
         microphoneRestoreTimerIdsRef.current.push(timerId);
       }

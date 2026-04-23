@@ -5,6 +5,7 @@ RUN_CHECKS=0
 RUN_WORKER=1
 WORKER_MODE="auto"
 WORKER_URL="http://[::1]:8787/v1/health"
+WORKER_BINDINGS_MODE="${NODY_DEV_WORKER_BINDINGS_MODE:-local}"
 ENV_FILE="${NODY_DEV_ENV_FILE:-.env.dev}"
 PROJECT_LOCK_ID="$(pwd | sha256sum | awk '{print $1}')"
 LOCK_DIR="${TMPDIR:-/tmp}/nody-dev-${PROJECT_LOCK_ID}.lock"
@@ -22,9 +23,18 @@ if [[ -z "${WORKER_API_BASE_URL:-}" || "${WORKER_API_BASE_URL}" == "http://127.0
   export WORKER_API_BASE_URL="http://[::1]:8787/v1"
 fi
 
+if [[ "${WORKER_BINDINGS_MODE}" == "remote" ]]; then
+  export WORKER_API_BASE_URL="http://[::1]:8787/v1"
+fi
+
+if [[ "${WORKER_BINDINGS_MODE}" != "local" && "${WORKER_BINDINGS_MODE}" != "remote" ]]; then
+  echo "Invalid NODY_DEV_WORKER_BINDINGS_MODE=${WORKER_BINDINGS_MODE}; expected local or remote." >&2
+  exit 1
+fi
+
 usage() {
   cat <<'EOF'
-Usage: ./dev.sh [--check] [--worker] [--no-worker] [--full] [--help]
+Usage: ./dev.sh [--check] [--worker] [--remote-bindings] [--no-worker] [--full] [--help]
 
 Defaults to local dev mode:
   - loads .env.dev when present
@@ -35,6 +45,8 @@ Defaults to local dev mode:
 Options:
   --check   Run ./test.sh before starting the dev server
   --worker  Start the Cloudflare worker alongside Next.js
+  --remote-bindings
+            Run the dev Worker on Cloudflare with remote D1/R2 bindings
   --no-worker  Skip starting the local worker
   --full    Equivalent to --check --worker
   --help    Show this help
@@ -48,6 +60,12 @@ while (($#)); do
       ;;
     --worker)
       RUN_WORKER=1
+      ;;
+    --remote-bindings)
+      RUN_WORKER=1
+      WORKER_MODE="force-on"
+      WORKER_BINDINGS_MODE="remote"
+      export WORKER_API_BASE_URL="http://[::1]:8787/v1"
       ;;
     --no-worker)
       RUN_WORKER=0
@@ -154,8 +172,15 @@ wait_for_worker() {
 }
 
 if (( RUN_WORKER )); then
-  ./node_modules/.bin/wrangler d1 migrations apply nody-db --local --config worker/wrangler.jsonc
-  ./node_modules/.bin/wrangler dev --config worker/wrangler.jsonc --port 8787 --ip :: &
+  if [[ "${WORKER_BINDINGS_MODE}" == "remote" ]]; then
+    echo "Applying remote D1 migrations for cloud-backed dev mode." >&2
+    CI=1 ./node_modules/.bin/wrangler d1 migrations apply nody-db --remote --config worker/wrangler.jsonc
+    echo "Starting Worker with remote Cloudflare D1/R2 bindings." >&2
+    ./node_modules/.bin/wrangler dev --remote --config worker/wrangler.jsonc --port 8787 --ip :: &
+  else
+    ./node_modules/.bin/wrangler d1 migrations apply nody-db --local --config worker/wrangler.jsonc
+    ./node_modules/.bin/wrangler dev --config worker/wrangler.jsonc --port 8787 --ip :: &
+  fi
   WORKER_PID=$!
   wait_for_worker
 fi

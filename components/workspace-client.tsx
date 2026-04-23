@@ -400,12 +400,10 @@ function WorkspaceClientContent() {
   const [selectedText, setSelectedText] = useState("");
   const [recentOpen, setRecentOpen] = useState(true);
   const [showAllRecent, setShowAllRecent] = useState(false);
-  const [editButtonVisible, setEditButtonVisible] = useState(false);
   const previewFrameRef = useRef<HTMLDivElement>(null);
   const editorShellRef = useRef<HTMLDivElement>(null);
   const folderCreateInputRef = useRef<HTMLInputElement>(null);
   const copyResetTimerRef = useRef<number | null>(null);
-  const editButtonTimerRef = useRef<number | null>(null);
   const messagesRef = useRef<AIMessage[]>([]);
   const idleTimerRef = useRef<number | null>(null);
   const wasIdleRef = useRef(false);
@@ -641,7 +639,6 @@ function WorkspaceClientContent() {
     documentStateRef.current = next;
     setDocument(next);
     setIsEditing(false);
-    setEditButtonVisible(false);
     setPendingAiEditPreview(null);
     setSelectedFolderId(next.folderId);
     setSelectedFolderAsset(null);
@@ -669,16 +666,11 @@ function WorkspaceClientContent() {
   }, [activeWindow]);
 
   const enterEditMode = () => {
-    if (editButtonTimerRef.current) {
-      window.clearTimeout(editButtonTimerRef.current);
-      editButtonTimerRef.current = null;
-    }
     const currentDocument = documentStateRef.current;
     const paddedBodyMarkdown = ensureTrailingNewlines(currentDocument.bodyMarkdown);
     if (paddedBodyMarkdown !== currentDocument.bodyMarkdown) {
       updateDocument({ bodyMarkdown: paddedBodyMarkdown });
     }
-    setEditButtonVisible(false);
     setIsEditing(true);
   };
 
@@ -709,28 +701,6 @@ function WorkspaceClientContent() {
     }
     editorRef.current?.runCommand(command);
   };
-
-  const revealEditButton = () => {
-    if (isEditing) return;
-    setEditButtonVisible(true);
-    if (editButtonTimerRef.current) {
-      window.clearTimeout(editButtonTimerRef.current);
-    }
-    editButtonTimerRef.current = window.setTimeout(() => {
-      setEditButtonVisible(false);
-      editButtonTimerRef.current = null;
-    }, 3000);
-  };
-
-  useEffect(
-    () => () => {
-      if (editButtonTimerRef.current) {
-        window.clearTimeout(editButtonTimerRef.current);
-        editButtonTimerRef.current = null;
-      }
-    },
-    [],
-  );
 
   refreshDocumentsFromServerRef.current = async (statusWhenFresh = "Live") => {
     if (syncInFlightRef.current) return;
@@ -1231,7 +1201,6 @@ function WorkspaceClientContent() {
       const restoreView = !isEditing;
       setPendingAiScroll({ lineNumber, position, restoreView });
       if (restoreView) {
-        setEditButtonVisible(false);
         setIsEditing(true);
         return;
       }
@@ -1826,7 +1795,7 @@ function WorkspaceClientContent() {
   const workspaceContent = (
     <div className="min-h-screen bg-white/80 pb-8">
           <div className="sticky top-0 z-50">
-            <div className="relative overflow-visible bg-[rgba(255,251,244,0.94)] px-3 py-2 backdrop-blur">
+            <div className="relative overflow-visible bg-[rgba(255,251,244,0.94)] p-0 backdrop-blur">
               <div className="flex flex-wrap items-center gap-2">
                 <MenuTriggerButton active={activeWindow === "ai"} label="AI" onClick={() => toggleWindow("ai")}>
                   <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -1889,26 +1858,6 @@ function WorkspaceClientContent() {
                   )}
                 </MenuTriggerButton>
                 <div className="ml-auto flex items-center gap-2">
-                  {!isEditing && editButtonVisible ? (
-                    <button
-                      aria-label="Edit note"
-                      className="flex h-10 w-10 items-center justify-center rounded-full bg-ink text-white transition hover:bg-ink/90"
-                      onClick={enterEditMode}
-                      title="Edit note"
-                      type="button"
-                    >
-                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                        <path
-                          d="M4 20h4l10-10-4-4L4 16v4Z"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="1.7"
-                        />
-                        <path d="m12.5 7.5 4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
-                      </svg>
-                    </button>
-                  ) : null}
                   <div className="hidden rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60 sm:block">{selectedFolderName}</div>
                   {clerkClientConfigured ? (
                     <ClerkAccessControls />
@@ -2417,138 +2366,137 @@ function WorkspaceClientContent() {
                   </div>
                 ) : null
               }
-            onAddMediaToAi={addNoteMediaToAi}
-            onNoteInteract={compactAiPanelForNote}
-            onSelectionChange={setSelectedText}
-            onRequestEdit={enterEditMode}
-            onRevealEditButton={revealEditButton}
-            overlay={
-              aiPanelMounted ? (
-                <div
-                  aria-hidden={activeWindow !== "ai"}
-                  className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4"
-                  hidden={activeWindow !== "ai"}
-                  style={activeWindow !== "ai" ? { display: "none" } : undefined}
-                >
+              onAddMediaToAi={addNoteMediaToAi}
+              onNoteInteract={compactAiPanelForNote}
+              onSelectionChange={setSelectedText}
+              onRequestEdit={enterEditMode}
+              overlay={
+                aiPanelMounted ? (
                   <div
-                    className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[600px] sm:rounded-[4px]"
-                    data-ai-panel="true"
-                    onFocusCapture={expandAiPanelToUserHeight}
-                    onPointerDownCapture={expandAiPanelToUserHeight}
+                    aria-hidden={activeWindow !== "ai"}
+                    className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4"
+                    hidden={activeWindow !== "ai"}
+                    style={activeWindow !== "ai" ? { display: "none" } : undefined}
                   >
-                    <AIChatPanel
-                      busy={thinking}
-                      compact={activeWindow === "ai" && aiPanelCompact}
-                      currentFolderFiles={aiCurrentFolderFiles}
-                      currentFolderName={selectedFolderName}
-                      currentNoteBodyMarkdown={document.bodyMarkdown}
-                      currentNoteId={document.id}
-                      currentNoteTitle={document.title}
-                      messages={messages}
-                      noteCatalog={aiAvailableNotes}
-                      onAddAttachmentToNote={addAiAttachmentToNote}
-                      onAppendToCurrentNote={appendAiSummaryToCurrentNote}
-                      onApply={applyAiEdits}
-                      onAsk={askAi}
-                      onCreatePrompt={async (value) => {
-                        const created = await apiClient.createPrompt(value);
-                        setPromptTemplates((current) => [created, ...current.filter((item) => item.id !== created.id)]);
-                        return created;
-                      }}
-                      onUpdatePrompt={async (id, value) => {
-                        const updated = await apiClient.updatePrompt(id, value);
-                        setPromptTemplates((current) =>
-                          current.map((item) => (item.id === updated.id ? updated : item)).sort((left, right) =>
-                            new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
-                          ),
-                        );
-                        return updated;
-                      }}
-                      onError={pushError}
-                      onPendingExternalAttachmentHandled={() => setPendingAiAttachment(null)}
-                      pendingExternalAttachment={pendingAiAttachment}
-                      prompts={promptTemplates}
-                      provider={settings.provider}
-                      providerSettings={settings}
-                      selectedText={selectedText}
-                      storedPanelHeight={loadAiPanelHeight()}
-                      onInsertGeneratedImageInNote={insertAiImageFileIntoNote}
-                      onFindInNote={findNoteByAiAction}
-                      onOpenNote={openNoteByAiAction}
-                      onScrollNote={scrollNoteByAiAction}
-                      onPanelHeightChange={saveAiPanelHeight}
-                      onUploadImageToCurrentFolder={uploadAiImageToCurrentFolder}
-                    />
+                    <div
+                      className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[600px] sm:rounded-[4px]"
+                      data-ai-panel="true"
+                      onFocusCapture={expandAiPanelToUserHeight}
+                      onPointerDownCapture={expandAiPanelToUserHeight}
+                    >
+                      <AIChatPanel
+                        busy={thinking}
+                        compact={activeWindow === "ai" && aiPanelCompact}
+                        currentFolderFiles={aiCurrentFolderFiles}
+                        currentFolderName={selectedFolderName}
+                        currentNoteBodyMarkdown={document.bodyMarkdown}
+                        currentNoteId={document.id}
+                        currentNoteTitle={document.title}
+                        messages={messages}
+                        noteCatalog={aiAvailableNotes}
+                        onAddAttachmentToNote={addAiAttachmentToNote}
+                        onAppendToCurrentNote={appendAiSummaryToCurrentNote}
+                        onApply={applyAiEdits}
+                        onAsk={askAi}
+                        onCreatePrompt={async (value) => {
+                          const created = await apiClient.createPrompt(value);
+                          setPromptTemplates((current) => [created, ...current.filter((item) => item.id !== created.id)]);
+                          return created;
+                        }}
+                        onUpdatePrompt={async (id, value) => {
+                          const updated = await apiClient.updatePrompt(id, value);
+                          setPromptTemplates((current) =>
+                            current.map((item) => (item.id === updated.id ? updated : item)).sort((left, right) =>
+                              new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+                            ),
+                          );
+                          return updated;
+                        }}
+                        onError={pushError}
+                        onPendingExternalAttachmentHandled={() => setPendingAiAttachment(null)}
+                        pendingExternalAttachment={pendingAiAttachment}
+                        prompts={promptTemplates}
+                        provider={settings.provider}
+                        providerSettings={settings}
+                        selectedText={selectedText}
+                        storedPanelHeight={loadAiPanelHeight()}
+                        onInsertGeneratedImageInNote={insertAiImageFileIntoNote}
+                        onFindInNote={findNoteByAiAction}
+                        onOpenNote={openNoteByAiAction}
+                        onScrollNote={scrollNoteByAiAction}
+                        onPanelHeightChange={saveAiPanelHeight}
+                        onUploadImageToCurrentFolder={uploadAiImageToCurrentFolder}
+                      />
+                    </div>
                   </div>
-                </div>
-              ) : null
-            }
-            onBodyChange={(bodyMarkdown) => updateDocument({ bodyMarkdown })}
-            onTitleChange={(title) => updateDocument({ title })}
-            title={document.title}
-            topRight={
-              isEditing ? (
-                <>
-                  <IconActionButton
-                    disabled={uploading}
-                    label="Upload and insert image"
-                    onClick={() => uploadAndInsertEditorAsset("image")}
-                  >
-                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                      <path
-                        d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5v-11Z"
-                        stroke="currentColor"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth="1.5"
-                      />
-                      <path
-                        d="M8 11.5a1.25 1.25 0 1 0 0-2.5a1.25 1.25 0 0 0 0 2.5Zm-3.5 5L9 11l3.5 4 2-2 4 3.5"
-                        stroke="currentColor"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth="1.5"
-                      />
-                    </svg>
-                  </IconActionButton>
-                  <IconActionButton
-                    disabled={uploading}
-                    label="Upload and insert audio"
-                    onClick={() => uploadAndInsertEditorAsset("audio")}
-                  >
-                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                      <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                      <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                      <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                    </svg>
-                  </IconActionButton>
-                  <IconActionButton
-                    disabled={uploading}
-                    label="Upload and insert video"
-                    onClick={() => uploadAndInsertEditorAsset("video")}
-                  >
-                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                      <path
-                        d="M4 8.5A1.5 1.5 0 0 1 5.5 7h9A1.5 1.5 0 0 1 16 8.5v7A1.5 1.5 0 0 1 14.5 17h-9A1.5 1.5 0 0 1 4 15.5v-7Z"
-                        stroke="currentColor"
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        strokeWidth="1.5"
-                      />
-                      <path d="M16 10l4-2v8l-4-2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
-                    </svg>
-                  </IconActionButton>
-                  <button
-                    className="rounded-full bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
-                    onClick={exitEditMode}
-                    type="button"
-                  >
-                    Done
-                  </button>
-                </>
-              ) : null
-            }
-          />
+                ) : null
+              }
+              onBodyChange={(bodyMarkdown) => updateDocument({ bodyMarkdown })}
+              onTitleChange={(title) => updateDocument({ title })}
+              title={document.title}
+              topRight={
+                isEditing ? (
+                  <>
+                    <IconActionButton
+                      disabled={uploading}
+                      label="Upload and insert image"
+                      onClick={() => uploadAndInsertEditorAsset("image")}
+                    >
+                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <path
+                          d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5v-11Z"
+                          stroke="currentColor"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="1.5"
+                        />
+                        <path
+                          d="M8 11.5a1.25 1.25 0 1 0 0-2.5a1.25 1.25 0 0 0 0 2.5Zm-3.5 5L9 11l3.5 4 2-2 4 3.5"
+                          stroke="currentColor"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="1.5"
+                        />
+                      </svg>
+                    </IconActionButton>
+                    <IconActionButton
+                      disabled={uploading}
+                      label="Upload and insert audio"
+                      onClick={() => uploadAndInsertEditorAsset("audio")}
+                    >
+                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                        <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                        <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                      </svg>
+                    </IconActionButton>
+                    <IconActionButton
+                      disabled={uploading}
+                      label="Upload and insert video"
+                      onClick={() => uploadAndInsertEditorAsset("video")}
+                    >
+                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                        <path
+                          d="M4 8.5A1.5 1.5 0 0 1 5.5 7h9A1.5 1.5 0 0 1 16 8.5v7A1.5 1.5 0 0 1 14.5 17h-9A1.5 1.5 0 0 1 4 15.5v-7Z"
+                          stroke="currentColor"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          strokeWidth="1.5"
+                        />
+                        <path d="M16 10l4-2v8l-4-2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
+                      </svg>
+                    </IconActionButton>
+                    <button
+                      className="rounded-full bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
+                      onClick={exitEditMode}
+                      type="button"
+                    >
+                      Done
+                    </button>
+                  </>
+                ) : null
+              }
+            />
           </div>
 
           <div className="fixed bottom-4 right-4 z-40 rounded-full bg-ink px-4 py-2 text-xs font-medium uppercase tracking-[0.18em] text-white shadow-[0_14px_32px_rgba(15,23,42,0.2)]">

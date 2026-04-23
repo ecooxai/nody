@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "bash ./dev.sh",
+    "dev:cloud": "NODY_DEV_ENV_FILE=.env.deploy NODY_DEV_WORKER_BINDINGS_MODE=remote bash ./dev.sh --remote-bindings",
     "build": "rm -rf .next && next build",
     "start": "next start",
     "preview:direct": "set -a; . ./.env.deploy; set +a; opennextjs-cloudflare build && opennextjs-cloudflare preview",
