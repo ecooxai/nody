@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { AIChatPanel } from "@/components/chat/ai-chat-panel";
-import { RichEditor, type RichEditorHandle } from "@/components/editor/rich-editor";
+import { RichEditor, type RichEditorBodyChangeReason, type RichEditorHandle } from "@/components/editor/rich-editor";
 import { useErrorToast } from "@/components/notifications/error-toast";
 import { Panel } from "@/components/ui/panel";
 import { ProviderSettingsForm } from "@/components/settings/provider-settings-form";
@@ -70,8 +70,26 @@ type PendingAiScroll = {
   position: "top" | "middle" | "bottom";
   restoreView: boolean;
 };
+type BodyHistoryReason = RichEditorBodyChangeReason | "ai";
+type NoteHistorySnapshot = {
+  bodyMarkdown: string;
+};
+type NoteHistoryState = {
+  redo: NoteHistorySnapshot[];
+  undo: NoteHistorySnapshot[];
+};
+type NoteTypingHistoryTracker = {
+  baselineBodyMarkdown: string;
+  changedCharacters: number;
+};
 const RECENT_NOTE_LIMIT = 5;
 const RECENT_NOTE_HISTORY_LIMIT = 20;
+const NOTE_HISTORY_LIMIT = 80;
+const NOTE_TYPING_CHECKPOINT_CHARS = 5;
+const UNDO_LONG_PRESS_MS = 550;
+const UNDO_NOTICE_MS = 1800;
+const NOTE_CHANGE_SYNC_DELAY_MS = 10000;
+const BACKGROUND_SYNC_INTERVAL_MS = 12000;
 
 const formatCommands: Array<{ label: string; command: EditorCommand }> = [
   { label: "Bold", command: "bold" },
@@ -272,6 +290,34 @@ function normalizeSearchNeedle(query: string) {
   return query.trim().toLowerCase();
 }
 
+function documentHistoryKey(document: Pick<DocumentRecord, "id">) {
+  return document.id || "__active-draft__";
+}
+
+function countChangedCharacters(before: string, after: string) {
+  if (before === after) return 0;
+
+  let prefixLength = 0;
+  while (
+    prefixLength < before.length &&
+    prefixLength < after.length &&
+    before[prefixLength] === after[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let beforeEnd = before.length - 1;
+  let afterEnd = after.length - 1;
+  while (beforeEnd >= prefixLength && afterEnd >= prefixLength && before[beforeEnd] === after[afterEnd]) {
+    beforeEnd -= 1;
+    afterEnd -= 1;
+  }
+
+  const removed = Math.max(0, beforeEnd - prefixLength + 1);
+  const added = Math.max(0, afterEnd - prefixLength + 1);
+  return Math.max(removed, added);
+}
+
 function IconActionButton({
   active = false,
   children,
@@ -360,6 +406,8 @@ function WorkspaceClientContent() {
   const deviceId = useMemo(() => getDeviceId(), []);
   const editorRef = useRef<RichEditorHandle>(null);
   const noteSearchRef = useRef<{ noteId: string; query: string; index: number } | null>(null);
+  const noteHistoryRef = useRef<Map<string, NoteHistoryState>>(new Map());
+  const typingHistoryTrackerRef = useRef<Map<string, NoteTypingHistoryTracker>>(new Map());
   const cachedDocumentRef = useRef<DocumentRecord | null>(null);
   const [folders, setFolders] = useState<FolderRecord[]>([]);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
@@ -391,6 +439,7 @@ function WorkspaceClientContent() {
   const [activeWindow, setActiveWindow] = useState<WorkspaceWindow>(null);
   const [aiPanelMounted, setAiPanelMounted] = useState(false);
   const [aiPanelCompact, setAiPanelCompact] = useState(false);
+  const [historyVersion, setHistoryVersion] = useState(0);
   const [dirty, setDirty] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [pendingAiAttachment, setPendingAiAttachment] = useState<PendingAiAttachment | null>(null);
@@ -406,13 +455,20 @@ function WorkspaceClientContent() {
   const copyResetTimerRef = useRef<number | null>(null);
   const messagesRef = useRef<AIMessage[]>([]);
   const idleTimerRef = useRef<number | null>(null);
+  const undoNoticeTimerRef = useRef<number | null>(null);
+  const undoLongPressTimerRef = useRef<number | null>(null);
+  const undoLongPressTriggeredRef = useRef(false);
   const wasIdleRef = useRef(false);
   const syncInFlightRef = useRef(false);
+  const syncDelayTimerRef = useRef<number | null>(null);
+  const lastNoteChangeAtRef = useRef(0);
+  const isEditingStateRef = useRef(isEditing);
   const documentStateRef = useRef(document);
   const dirtyStateRef = useRef(dirty);
   const skippedInitialCacheSaveRef = useRef(false);
   const refreshDocumentsFromServerRef = useRef<(statusWhenFresh?: string) => Promise<void>>(async () => {});
   const [previewUrlCopied, setPreviewUrlCopied] = useState(false);
+  const [undoNoticeVisible, setUndoNoticeVisible] = useState(false);
 
   useEffect(() => {
     const cachedDocument = loadCachedDocument();
@@ -599,6 +655,13 @@ function WorkspaceClientContent() {
         scopeFolderId === null ? asset.folderId === null : asset.folderId !== null && assetPickerBranchIds.has(asset.folderId),
       );
   }, [assetPickerBranchIds, assetPickerFolderId, assetPickerKind, folderAssets]);
+  const currentHistoryStatus = useMemo(() => {
+    const history = noteHistoryRef.current.get(documentHistoryKey(document));
+    return {
+      canRedo: Boolean(history?.redo.length),
+      canUndo: Boolean(history?.undo.length),
+    };
+  }, [document.id, historyVersion]);
 
   useEffect(() => {
     documentStateRef.current = document;
@@ -611,6 +674,28 @@ function WorkspaceClientContent() {
   useEffect(() => {
     dirtyStateRef.current = dirty;
   }, [dirty]);
+
+  useEffect(() => {
+    isEditingStateRef.current = isEditing;
+  }, [isEditing]);
+
+  useEffect(
+    () => () => {
+      if (undoNoticeTimerRef.current) {
+        window.clearTimeout(undoNoticeTimerRef.current);
+        undoNoticeTimerRef.current = null;
+      }
+      if (undoLongPressTimerRef.current) {
+        window.clearTimeout(undoLongPressTimerRef.current);
+        undoLongPressTimerRef.current = null;
+      }
+      if (syncDelayTimerRef.current) {
+        window.clearTimeout(syncDelayTimerRef.current);
+        syncDelayTimerRef.current = null;
+      }
+    },
+    [],
+  );
 
   const markRecentDocument = (id: string) => {
     setRecentDocumentIds((current) => {
@@ -702,8 +787,78 @@ function WorkspaceClientContent() {
     editorRef.current?.runCommand(command);
   };
 
+  const clearDelayedSync = () => {
+    if (!syncDelayTimerRef.current) return;
+    window.clearTimeout(syncDelayTimerRef.current);
+    syncDelayTimerRef.current = null;
+  };
+
+  const isNoteChangeSyncPaused = () => Date.now() - lastNoteChangeAtRef.current < NOTE_CHANGE_SYNC_DELAY_MS;
+
+  const markNoteChangeForSyncDelay = () => {
+    lastNoteChangeAtRef.current = Date.now();
+  };
+
+  const shouldDelaySyncForBodyChange = (reason?: BodyHistoryReason) =>
+    !reason || reason === "typing" || reason === "paste" || reason === "cut" || reason === "delete";
+
+  const syncDirtyDocument = async () => {
+    if (!dirtyStateRef.current || syncInFlightRef.current) return false;
+    if (isNoteChangeSyncPaused()) {
+      scheduleDelayedSync();
+      return false;
+    }
+
+    syncInFlightRef.current = true;
+    try {
+      const currentDocument = documentStateRef.current;
+      if (!currentDocument.id) return false;
+      const shouldRestoreEditorFocus = isEditingStateRef.current && Boolean(editorRef.current?.isBodyFocused());
+      const restoreLineNumber = shouldRestoreEditorFocus ? editorRef.current?.getCursorLineNumber() ?? null : null;
+      const result = await apiClient.syncDocument(currentDocument.id, buildSyncPayload(currentDocument, deviceId));
+      const normalizedDocument = normalizeDocumentRecord(result.document);
+      documentStateRef.current = normalizedDocument;
+      dirtyStateRef.current = false;
+      setDocument(normalizedDocument);
+      setDocuments((current) => upsertDocument(current, normalizedDocument));
+      setDirty(false);
+      setSyncStatus(result.conflict ? "Conflict" : "Synced");
+      saveCachedDocument(normalizedDocument);
+      if (restoreLineNumber !== null) {
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            if (!editorRef.current?.isBodyFocused()) {
+              editorRef.current?.focusLineEnd(restoreLineNumber);
+            }
+          });
+        });
+      }
+      if (result.conflict) pushError(result.message ?? "Sync conflict detected");
+      return true;
+    } catch (error) {
+      setSyncStatus("Offline");
+      pushError(error instanceof Error ? error.message : "Sync failed");
+      return false;
+    } finally {
+      syncInFlightRef.current = false;
+    }
+  };
+
+  function scheduleDelayedSync(delayMs = NOTE_CHANGE_SYNC_DELAY_MS) {
+    clearDelayedSync();
+    const elapsedSinceChange = Date.now() - lastNoteChangeAtRef.current;
+    const nextDelayMs =
+      elapsedSinceChange < NOTE_CHANGE_SYNC_DELAY_MS ? Math.max(NOTE_CHANGE_SYNC_DELAY_MS - elapsedSinceChange, delayMs) : delayMs;
+
+    syncDelayTimerRef.current = window.setTimeout(() => {
+      syncDelayTimerRef.current = null;
+      void syncDirtyDocument();
+    }, nextDelayMs);
+  }
+
   refreshDocumentsFromServerRef.current = async (statusWhenFresh = "Live") => {
     if (syncInFlightRef.current) return;
+    if (isNoteChangeSyncPaused()) return;
     syncInFlightRef.current = true;
     try {
       const remoteDocs = (await apiClient.listDocuments()).map(normalizeDocumentRecord);
@@ -797,22 +952,11 @@ function WorkspaceClientContent() {
     if (!document.id) return;
     const interval = window.setInterval(async () => {
       if (syncInFlightRef.current) return;
+      if (isNoteChangeSyncPaused()) return;
 
       try {
-        const currentDocument = documentStateRef.current;
-
         if (dirtyStateRef.current) {
-          syncInFlightRef.current = true;
-          const result = await apiClient.syncDocument(currentDocument.id, buildSyncPayload(currentDocument, deviceId));
-          const normalizedDocument = normalizeDocumentRecord(result.document);
-          documentStateRef.current = normalizedDocument;
-          dirtyStateRef.current = false;
-          setDocument(normalizedDocument);
-          setDocuments((current) => upsertDocument(current, normalizedDocument));
-          setDirty(false);
-          setSyncStatus(result.conflict ? "Conflict" : "Synced");
-          saveCachedDocument(normalizedDocument);
-          if (result.conflict) pushError(result.message ?? "Sync conflict detected");
+          await syncDirtyDocument();
           return;
         }
 
@@ -823,7 +967,7 @@ function WorkspaceClientContent() {
       } finally {
         syncInFlightRef.current = false;
       }
-    }, 12000);
+    }, BACKGROUND_SYNC_INTERVAL_MS);
 
     return () => window.clearInterval(interval);
   }, [deviceId, document.id, pushError]);
@@ -863,6 +1007,7 @@ function WorkspaceClientContent() {
   }, []);
 
   const updateDocument = (next: Partial<DocumentRecord>) => {
+    markNoteChangeForSyncDelay();
     setDocument((current) => {
       const updated = { ...current, ...next, updatedAt: new Date().toISOString() };
       documentStateRef.current = updated;
@@ -873,6 +1018,174 @@ function WorkspaceClientContent() {
     dirtyStateRef.current = true;
     setDirty(true);
     setSyncStatus("Pending");
+    scheduleDelayedSync();
+  };
+
+  const getNoteHistory = (noteId: string) => {
+    const existing = noteHistoryRef.current.get(noteId);
+    if (existing) return existing;
+    const created: NoteHistoryState = { redo: [], undo: [] };
+    noteHistoryRef.current.set(noteId, created);
+    return created;
+  };
+
+  const bumpHistoryVersion = () => setHistoryVersion((current) => current + 1);
+
+  const clearRedoHistory = (noteId: string) => {
+    const history = noteHistoryRef.current.get(noteId);
+    if (!history || history.redo.length === 0) return;
+    history.redo = [];
+    bumpHistoryVersion();
+  };
+
+  const clearTypingHistoryTracker = (noteId: string) => {
+    typingHistoryTrackerRef.current.delete(noteId);
+  };
+
+  const pushUndoSnapshot = (noteId: string, bodyMarkdown: string) => {
+    const history = getNoteHistory(noteId);
+    let changed = false;
+    if (history.undo[history.undo.length - 1]?.bodyMarkdown !== bodyMarkdown) {
+      history.undo = [...history.undo, { bodyMarkdown }].slice(-NOTE_HISTORY_LIMIT);
+      changed = true;
+    }
+    if (history.redo.length > 0) {
+      history.redo = [];
+      changed = true;
+    }
+    if (changed) bumpHistoryVersion();
+  };
+
+  const pushRedoSnapshot = (noteId: string, bodyMarkdown: string) => {
+    const history = getNoteHistory(noteId);
+    history.redo = [...history.redo, { bodyMarkdown }].slice(-NOTE_HISTORY_LIMIT);
+  };
+
+  const prepareBodyHistory = (nextBodyMarkdown: string, reason: BodyHistoryReason = "typing") => {
+    const currentDocument = documentStateRef.current;
+    const currentBodyMarkdown = currentDocument.bodyMarkdown;
+    if (nextBodyMarkdown === currentBodyMarkdown || reason === "normalize") return;
+
+    const noteId = documentHistoryKey(currentDocument);
+    if (reason === "typing") {
+      const changedCharacters = countChangedCharacters(currentBodyMarkdown, nextBodyMarkdown);
+      if (changedCharacters <= 0) return;
+
+      const existingTracker = typingHistoryTrackerRef.current.get(noteId);
+      const tracker =
+        existingTracker ??
+        ({
+          baselineBodyMarkdown: currentBodyMarkdown,
+          changedCharacters: 0,
+        } satisfies NoteTypingHistoryTracker);
+
+      tracker.changedCharacters += changedCharacters;
+      if (tracker.changedCharacters >= NOTE_TYPING_CHECKPOINT_CHARS) {
+        pushUndoSnapshot(noteId, tracker.baselineBodyMarkdown);
+        typingHistoryTrackerRef.current.set(noteId, {
+          baselineBodyMarkdown: nextBodyMarkdown,
+          changedCharacters: 0,
+        });
+        return;
+      }
+
+      typingHistoryTrackerRef.current.set(noteId, tracker);
+      clearRedoHistory(noteId);
+      return;
+    }
+
+    clearTypingHistoryTracker(noteId);
+    pushUndoSnapshot(noteId, currentBodyMarkdown);
+  };
+
+  const updateDocumentBody = (bodyMarkdown: string, reason: BodyHistoryReason = "typing") => {
+    prepareBodyHistory(bodyMarkdown, reason);
+    if (shouldDelaySyncForBodyChange(reason)) {
+      markNoteChangeForSyncDelay();
+    }
+    updateDocument({ bodyMarkdown });
+  };
+
+  const showUndoNotice = () => {
+    setUndoNoticeVisible(true);
+    if (undoNoticeTimerRef.current) {
+      window.clearTimeout(undoNoticeTimerRef.current);
+    }
+    undoNoticeTimerRef.current = window.setTimeout(() => {
+      setUndoNoticeVisible(false);
+      undoNoticeTimerRef.current = null;
+    }, UNDO_NOTICE_MS);
+  };
+
+  const undoCurrentNoteEdit = () => {
+    editorRef.current?.flushBodyChanges();
+    const currentDocument = documentStateRef.current;
+    const noteId = documentHistoryKey(currentDocument);
+    const history = getNoteHistory(noteId);
+    let snapshot = history.undo.pop();
+
+    while (snapshot && snapshot.bodyMarkdown === currentDocument.bodyMarkdown) {
+      snapshot = history.undo.pop();
+    }
+
+    if (!snapshot) {
+      bumpHistoryVersion();
+      pushError("Nothing to undo for this note.");
+      return;
+    }
+
+    pushRedoSnapshot(noteId, currentDocument.bodyMarkdown);
+    clearTypingHistoryTracker(noteId);
+    bumpHistoryVersion();
+    updateDocument({ bodyMarkdown: snapshot.bodyMarkdown });
+  };
+
+  const redoCurrentNoteEdit = () => {
+    editorRef.current?.flushBodyChanges();
+    const currentDocument = documentStateRef.current;
+    const noteId = documentHistoryKey(currentDocument);
+    const history = getNoteHistory(noteId);
+    let snapshot = history.redo.pop();
+
+    while (snapshot && snapshot.bodyMarkdown === currentDocument.bodyMarkdown) {
+      snapshot = history.redo.pop();
+    }
+
+    if (!snapshot) {
+      bumpHistoryVersion();
+      pushError("Nothing to redo for this note.");
+      return;
+    }
+
+    history.undo = [...history.undo, { bodyMarkdown: currentDocument.bodyMarkdown }].slice(-NOTE_HISTORY_LIMIT);
+    clearTypingHistoryTracker(noteId);
+    bumpHistoryVersion();
+    updateDocument({ bodyMarkdown: snapshot.bodyMarkdown });
+  };
+
+  const clearUndoLongPressTimer = () => {
+    if (!undoLongPressTimerRef.current) return;
+    window.clearTimeout(undoLongPressTimerRef.current);
+    undoLongPressTimerRef.current = null;
+  };
+
+  const startUndoLongPressTimer = () => {
+    clearUndoLongPressTimer();
+    undoLongPressTriggeredRef.current = false;
+    undoLongPressTimerRef.current = window.setTimeout(() => {
+      undoLongPressTimerRef.current = null;
+      undoLongPressTriggeredRef.current = true;
+      redoCurrentNoteEdit();
+    }, UNDO_LONG_PRESS_MS);
+  };
+
+  const handleUndoButtonClick = () => {
+    if (undoLongPressTriggeredRef.current) {
+      undoLongPressTriggeredRef.current = false;
+      return;
+    }
+    showUndoNotice();
+    undoCurrentNoteEdit();
   };
 
   const applyAiEdits = (edits: TextSubstitution[]) => {
@@ -894,7 +1207,7 @@ function WorkspaceClientContent() {
   const confirmAiEdits = () => {
     if (!pendingAiEditPreview) return;
     const { firstStep, nextBodyMarkdown } = pendingAiEditPreview;
-    updateDocument({ bodyMarkdown: ensureTrailingNewlines(nextBodyMarkdown) });
+    updateDocumentBody(ensureTrailingNewlines(nextBodyMarkdown), "ai");
     setPendingAiEditPreview(null);
     window.requestAnimationFrame(() => {
       editorRef.current?.focusRange(firstStep.start, firstStep.start + firstStep.replace.length);
@@ -1163,9 +1476,7 @@ function WorkspaceClientContent() {
     if (!trimmedSummary) return;
     const currentBody = documentStateRef.current.bodyMarkdown;
     const separator = currentBody.trim() ? "\n\n" : "";
-    updateDocument({
-      bodyMarkdown: ensureTrailingNewlines(`${currentBody.replace(/\s+$/g, "")}${separator}${trimmedSummary}`),
-    });
+    updateDocumentBody(ensureTrailingNewlines(`${currentBody.replace(/\s+$/g, "")}${separator}${trimmedSummary}`), "ai");
   };
 
   const latestGeneratedImageAttachment = (preferred: AIMessageAttachment[] = []) =>
@@ -1857,6 +2168,40 @@ function WorkspaceClientContent() {
                     </svg>
                   )}
                 </MenuTriggerButton>
+                <div className="relative">
+                  <button
+                    aria-label="Undo. Long press for redo"
+                    className={`flex h-10 w-10 items-center justify-center rounded-xl text-sm font-medium transition ${
+                      currentHistoryStatus.canUndo || currentHistoryStatus.canRedo
+                        ? "bg-white text-ink hover:bg-mist"
+                        : "bg-transparent text-ink/45 hover:bg-black/[0.04]"
+                    }`}
+                    onBlur={clearUndoLongPressTimer}
+                    onClick={handleUndoButtonClick}
+                    onPointerCancel={clearUndoLongPressTimer}
+                    onPointerDown={startUndoLongPressTimer}
+                    onPointerLeave={clearUndoLongPressTimer}
+                    onPointerUp={clearUndoLongPressTimer}
+                    title="Undo. Press down for redo."
+                    type="button"
+                  >
+                    <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                      <path
+                        d="M9 7 5 11l4 4M5 11h8a5 5 0 0 1 5 5v1"
+                        stroke="currentColor"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth="1.7"
+                      />
+                    </svg>
+                    <span className="sr-only">Undo. Press down for redo.</span>
+                  </button>
+                  {undoNoticeVisible ? (
+                    <div className="absolute left-1/2 top-full z-50 mt-2 -translate-x-1/2 whitespace-nowrap rounded-full bg-ink px-3 py-1.5 text-[11px] font-medium text-white shadow-[0_10px_24px_rgba(15,23,42,0.18)]">
+                      undo, press down for redo
+                    </div>
+                  ) : null}
+                </div>
                 <div className="ml-auto flex items-center gap-2">
                   <div className="hidden rounded-full bg-black/[0.04] px-3 py-1.5 text-xs text-ink/60 sm:block">{selectedFolderName}</div>
                   {clerkClientConfigured ? (
@@ -2431,8 +2776,16 @@ function WorkspaceClientContent() {
                   </div>
                 ) : null
               }
-              onBodyChange={(bodyMarkdown) => updateDocument({ bodyMarkdown })}
-              onTitleChange={(title) => updateDocument({ title })}
+              onBodyChange={(bodyMarkdown, reason) => updateDocumentBody(bodyMarkdown, reason ?? "typing")}
+              onBodyDraftChange={(reason) => {
+                if (shouldDelaySyncForBodyChange(reason)) {
+                  markNoteChangeForSyncDelay();
+                  scheduleDelayedSync();
+                }
+              }}
+              onTitleChange={(title) => {
+                updateDocument({ title });
+              }}
               title={document.title}
               topRight={
                 isEditing ? (

@@ -27,9 +27,23 @@ import { assetToMarkdown } from "@/lib/editor/media";
 import { ensureTrailingNewlines, markdownToHtml } from "@/lib/editor/markdown";
 import type { AIMediaKind, DocumentAsset } from "@/shared/types";
 
+export type RichEditorBodyChangeReason =
+  | "typing"
+  | "paste"
+  | "cut"
+  | "delete"
+  | "media"
+  | "format"
+  | "remove-media"
+  | "normalize";
+
 export type RichEditorHandle = {
   focus: () => void;
   focusRange: (start: number, end: number) => void;
+  focusLineEnd: (lineNumber: number) => void;
+  flushBodyChanges: () => void;
+  getCursorLineNumber: () => number;
+  isBodyFocused: () => boolean;
   scrollToLine: (lineNumber: number, position?: "top" | "middle" | "bottom") => void;
   scrollByPixels: (pixels: number) => void;
   findText: (query: string, occurrence?: "first" | "next" | "previous") => void;
@@ -43,7 +57,8 @@ type RichEditorProps = {
   bodyMarkdown: string;
   editable: boolean;
   onTitleChange: (value: string) => void;
-  onBodyChange: (value: string) => void;
+  onBodyChange: (value: string, reason?: RichEditorBodyChangeReason) => void;
+  onBodyDraftChange?: (reason?: RichEditorBodyChangeReason) => void;
   onSelectionChange?: (selectedText: string) => void;
   onRequestEdit?: () => void;
   onNoteInteract?: () => void;
@@ -569,6 +584,12 @@ function insertBlockAtLine(value: string, block: string, lineNumber: number) {
   };
 }
 
+function getLineEndOffset(value: string, lineNumber: number) {
+  const start = findLineStartOffset(value, lineNumber);
+  const end = value.indexOf("\n", start);
+  return end >= 0 ? end : value.length;
+}
+
 function extractEmbeddedMedia(target: EventTarget | null): EmbeddedMedia | null {
   const element = target instanceof HTMLElement ? target.closest("img,video,audio") : null;
   if (!(element instanceof HTMLElement)) return null;
@@ -600,6 +621,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   editable,
   onTitleChange,
   onBodyChange,
+  onBodyDraftChange,
   onSelectionChange,
   onRequestEdit,
   onNoteInteract,
@@ -622,6 +644,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const lastPreviewSelectionRef = useRef("");
   const bodyChangeTimerRef = useRef<number | null>(null);
   const lastPublishedBodyRef = useRef(bodyMarkdown);
+  const pendingBodyChangeReasonRef = useRef<RichEditorBodyChangeReason>("typing");
   const viewerCopyTimerRef = useRef<number | null>(null);
   const editorMeasureWidthRef = useRef(0);
   const lineTapRef = useRef<{ key: string | null; count: number; startedAt: number }>({
@@ -729,7 +752,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     }
   };
 
-  const publishBodyChange = (value: string) => {
+  const publishBodyChange = (value: string, reason: RichEditorBodyChangeReason = "typing") => {
     const compactedValue = compactMediaTags(value);
     clearBodyChangeTimer();
     if (compactedValue !== bodyDraftRef.current) {
@@ -739,15 +762,15 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     if (compactedValue === lastPublishedBodyRef.current) return;
     lastPublishedBodyRef.current = compactedValue;
     bodyDraftRef.current = compactedValue;
-    onBodyChange(compactedValue);
+    onBodyChange(compactedValue, reason);
   };
 
-  const scheduleBodyChange = (value: string) => {
+  const scheduleBodyChange = (value: string, reason: RichEditorBodyChangeReason = "typing") => {
     if (value === lastPublishedBodyRef.current) return;
     clearBodyChangeTimer();
     bodyChangeTimerRef.current = window.setTimeout(() => {
       bodyChangeTimerRef.current = null;
-      publishBodyChange(value);
+      publishBodyChange(value, reason);
     }, 350);
   };
 
@@ -971,7 +994,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       clearBodyChangeTimer();
       clearViewerCopyTimer();
       if (bodyDraftRef.current !== lastPublishedBodyRef.current) {
-        onBodyChange(compactMediaTags(bodyDraftRef.current));
+        onBodyChange(compactMediaTags(bodyDraftRef.current), "typing");
       }
     },
     [],
@@ -984,7 +1007,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
       bodyDraftRef.current = compactedBodyMarkdown;
       setBodyDraft(compactedBodyMarkdown);
       clearBodyChangeTimer();
-      onBodyChange(compactedBodyMarkdown);
+      onBodyChange(compactedBodyMarkdown, "normalize");
       return;
     }
     if (compactedBodyMarkdown === lastPublishedBodyRef.current) return;
@@ -1009,7 +1032,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     syncSelectedGutterLines([]);
 
     if (!editable) {
-      publishBodyChange(bodyDraft);
+      publishBodyChange(bodyDraft, "typing");
       selectionRef.current = { start: 0, end: 0 };
       return;
     }
@@ -1201,10 +1224,17 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     if (selectedGutterLines.length > 0) {
       clearGutterLineSelection();
     }
+    const reason = pendingBodyChangeReasonRef.current;
+    pendingBodyChangeReasonRef.current = "typing";
+    onBodyDraftChange?.(reason);
     const value = restoreEditorDisplayValue(displayValue, editorDisplayModel.media);
     bodyDraftRef.current = value;
     setBodyDraft(value);
-    scheduleBodyChange(value);
+    if (reason === "paste" || reason === "cut" || reason === "delete") {
+      publishBodyChange(value, reason);
+      return;
+    }
+    scheduleBodyChange(value, reason);
   };
 
   const handleBodyTextareaKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -1212,17 +1242,27 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
 
     const selectionStart = event.currentTarget.selectionStart ?? 0;
     const selectionEnd = event.currentTarget.selectionEnd ?? selectionStart;
-    if (!shouldProtectEditorMediaKey(editorDisplayModel, event.key, selectionStart, selectionEnd)) return;
+    const shouldProtectMedia = shouldProtectEditorMediaKey(editorDisplayModel, event.key, selectionStart, selectionEnd);
+    if (!shouldProtectMedia) {
+      if ((event.key === "Backspace" || event.key === "Delete") && selectionStart !== selectionEnd) {
+        pendingBodyChangeReasonRef.current = "delete";
+      }
+      return;
+    }
 
     event.preventDefault();
     event.currentTarget.setSelectionRange(selectionStart, selectionEnd);
   };
 
-  const applyTextareaMutation = (nextValue: string, nextSelection: TextSelection) => {
+  const applyTextareaMutation = (
+    nextValue: string,
+    nextSelection: TextSelection,
+    reason: RichEditorBodyChangeReason = "format",
+  ) => {
     clearGutterLineSelection({ notify: false });
     bodyDraftRef.current = nextValue;
     setBodyDraft(nextValue);
-    publishBodyChange(nextValue);
+    publishBodyChange(nextValue, reason);
     selectionRef.current = nextSelection;
     const nextDisplayModel = buildEditorDisplayModel(ensureTrailingNewlines(nextValue));
     const displaySelection = {
@@ -1290,7 +1330,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     }
     const nextValue = `${noteBodyMarkdown.slice(0, removeStart)}${noteBodyMarkdown.slice(removeEnd)}`;
     setActiveEditorMediaKey(null);
-    applyTextareaMutation(nextValue, { start: removeStart, end: removeStart });
+    applyTextareaMutation(nextValue, { start: removeStart, end: removeStart }, "remove-media");
   };
 
   const copyViewerImageUrl = async () => {
@@ -1711,6 +1751,15 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         if (!editable) return;
         window.requestAnimationFrame(() => focusTextareaRange(start, end));
       },
+      focusLineEnd: (lineNumber) => {
+        if (!editable) return;
+        window.requestAnimationFrame(() => {
+          const lineEnd = getLineEndOffset(noteBodyMarkdown, lineNumber);
+          focusTextareaRange(lineEnd, lineEnd);
+        });
+      },
+      getCursorLineNumber: () => Math.max(1, noteBodyMarkdown.slice(0, selectionRef.current.end).split("\n").length),
+      isBodyFocused: () => textareaRef.current !== null && globalThis.document.activeElement === textareaRef.current,
       scrollToLine: (lineNumber, position = "top") => {
         const textarea = textareaRef.current;
         if (!textarea) {
@@ -1740,7 +1789,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         const snippet = assetToMarkdown(asset);
         const value = noteBodyMarkdown;
         if (position === "top") {
-          applyTextareaMutation(`${snippet}\n\n${value}`, { start: 0, end: 0 });
+          applyTextareaMutation(`${snippet}\n\n${value}`, { start: 0, end: 0 }, "media");
           scrollTextareaOffsetNearTop(0);
           return;
         }
@@ -1753,20 +1802,23 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         const inserted = `${spacerBefore}${snippet}${spacerAfter}`;
         const nextValue = `${value.slice(0, start)}${inserted}${value.slice(end)}`;
         const caret = start + inserted.length;
-        applyTextareaMutation(nextValue, { start: caret, end: caret });
+        applyTextareaMutation(nextValue, { start: caret, end: caret }, "media");
         scrollTextareaOffsetNearTop(start + spacerBefore.length);
       },
       insertAssetAtLine: (asset, lineNumber) => {
         if (!editable) return;
         const snippet = assetToMarkdown(asset);
         const next = insertBlockAtLine(noteBodyMarkdown, snippet, lineNumber);
-        applyTextareaMutation(next.value, { start: next.caret, end: next.caret });
+        applyTextareaMutation(next.value, { start: next.caret, end: next.caret }, "media");
         scrollTextareaOffsetNearTop(findLineStartOffset(noteBodyMarkdown, lineNumber));
       },
       runCommand: (command) => {
         if (!editable) return;
         const next = applyCommand(noteBodyMarkdown, selectionRef.current, command);
-        applyTextareaMutation(next.value, next.selection);
+        applyTextareaMutation(next.value, next.selection, "format");
+      },
+      flushBodyChanges: () => {
+        publishBodyChange(bodyDraftRef.current, "typing");
       },
     }),
     [noteBodyMarkdown, editable, lineStartTops, editorLineLayout, editorDisplayModel],
@@ -1824,10 +1876,23 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
                     className="min-h-[34rem] w-full resize-none overflow-hidden whitespace-pre-wrap break-words bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
                     onCopy={handleLineSelectionCopy}
                     onChange={(event) => handleBodyTextareaChange(event.target.value)}
+                    onCut={(event) => {
+                      if (event.currentTarget.selectionStart !== event.currentTarget.selectionEnd) {
+                        pendingBodyChangeReasonRef.current = "cut";
+                      }
+                    }}
                     onFocus={onNoteInteract}
                     onKeyDown={handleBodyTextareaKeyDown}
                     onKeyUp={(event) => syncTextareaSelection(event.currentTarget)}
                     onMouseUp={(event) => syncTextareaSelection(event.currentTarget)}
+                    onPaste={() => {
+                      pendingBodyChangeReasonRef.current = "paste";
+                      window.setTimeout(() => {
+                        if (pendingBodyChangeReasonRef.current === "paste") {
+                          pendingBodyChangeReasonRef.current = "typing";
+                        }
+                      }, 0);
+                    }}
                     onPointerDown={() => {
                       onNoteInteract?.();
                       if (selectedGutterLines.length > 0) {
