@@ -150,6 +150,7 @@ const builtInPrompts: PromptTemplate[] = [
 
 const COMPACT_PANEL_HEIGHT = 200;
 const SCROLL_EDGE_TOLERANCE = 1;
+const COMPOSER_CHROME_FRAME_HEIGHT = 72;
 
 function canScrollVertically(element: HTMLElement) {
   if (element.scrollHeight <= element.clientHeight + SCROLL_EDGE_TOLERANCE) return false;
@@ -369,7 +370,6 @@ function microphoneButtonStyle(level: number, options: { recording?: boolean; li
   if (options.recording) {
     return {
       backgroundColor: `hsl(7deg 61% ${46 - intensity * 10}%)`,
-      borderColor: `hsl(7deg 61% ${46 - intensity * 10}%)`,
       color: "#ffffff",
       boxShadow: intensity > 0.04 ? `0 0 0 ${2 + intensity * 5}px rgba(187,62,45,${0.12 + intensity * 0.18})` : undefined,
     };
@@ -380,8 +380,7 @@ function microphoneButtonStyle(level: number, options: { recording?: boolean; li
   }
 
   return {
-    backgroundColor: `hsl(188deg 47% ${93 - intensity * 46}%)`,
-    borderColor: `hsl(188deg 58% ${36 - intensity * 10}%)`,
+    backgroundColor: intensity > 0.04 ? `hsl(188deg 47% ${93 - intensity * 46}%)` : "transparent",
     color: intensity > 0.42 ? "#ffffff" : "#1f6f78",
     boxShadow: intensity > 0.04 ? `0 0 0 ${2 + intensity * 5}px rgba(31,111,120,${0.10 + intensity * 0.18})` : undefined,
   };
@@ -776,7 +775,6 @@ export function AIChatPanel({
   const [previewPrompt, setPreviewPrompt] = useState<AIMessagePrompt | null>(null);
   const [prompt, setPrompt] = useState("");
   const [fileDropActive, setFileDropActive] = useState(false);
-  const [composerCondensed, setComposerCondensed] = useState(false);
   const [composerFocused, setComposerFocused] = useState(false);
   const [cameraPreviewVisible, setCameraPreviewVisible] = useState(false);
   const [panelHeight, setPanelHeight] = useState(() => clampPanelHeight(storedPanelHeight ?? 640));
@@ -794,6 +792,7 @@ export function AIChatPanel({
   const [cameraPreparing, setCameraPreparing] = useState(false);
   const [cameraRecording, setCameraRecording] = useState(false);
   const [activeTab, setActiveTab] = useState<"chat" | "live">("chat");
+  const [historyOnly, setHistoryOnly] = useState(false);
   const [liveConnectionRequested, setLiveConnectionRequested] = useState(false);
   const [liveSessionState, setLiveSessionState] = useState<LiveSessionState>({
     listening: false,
@@ -821,8 +820,6 @@ export function AIChatPanel({
     hasGeneratedImage: false,
     generatedImages: [],
   });
-  const [historyExpanded, setHistoryExpanded] = useState(false);
-  const [composerChromeHeight, setComposerChromeHeight] = useState(0);
   const [liveMicrophoneEnabled, setLiveMicrophoneEnabled] = useState(true);
   const [liveMicrophoneLevel, setLiveMicrophoneLevel] = useState(0);
   const [microphoneSources, setMicrophoneSources] = useState<MicrophoneSource[]>([]);
@@ -833,7 +830,6 @@ export function AIChatPanel({
   const attachmentsRef = useRef<LocalAttachment[]>([]);
   const fileDropDepthRef = useRef(0);
   const composerItemsRef = useRef<HTMLDivElement>(null);
-  const composerChromeRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const lastAiPanelTouchYRef = useRef<number | null>(null);
   const latestAssistantMessageRef = useRef<HTMLDivElement>(null);
@@ -910,9 +906,9 @@ export function AIChatPanel({
       : chatGeneratedImages;
   const latestGeneratedImage = activeGeneratedImages[activeGeneratedImages.length - 1] ?? null;
   const displayedPanelHeight = compact ? COMPACT_PANEL_HEIGHT : panelHeight;
-  const compactComposerChrome = historyExpanded;
-  const composerChromeScale = compactComposerChrome ? 0.5 : 1;
-  const composerChromeFrameHeight = composerChromeHeight ? composerChromeHeight * composerChromeScale : undefined;
+  const composerHidden = historyOnly;
+  const composerFrameHeight = composerHidden ? 0 : COMPOSER_CHROME_FRAME_HEIGHT;
+  const composerTextareaHeight = promptExpanded ? 220 : composerFocused ? 72 : 32;
   const liveConnectButtonActive = activeTab === "live" && supportsLive && liveSessionState.listening;
   const liveConnectButtonReady = liveConnectButtonActive && liveSessionState.ready;
   const showLatestMessageShortcut = activeTab === "live" ? liveLatestMessageAvailable : chatLatestMessageAvailable;
@@ -925,7 +921,6 @@ export function AIChatPanel({
   const liveCameraShortcutFlashing = activeTab === "live" && liveVideoShareMode === "camera" && liveHistoryTargets.hasCamera;
   const selectedTextForReadAloud = selectedText?.trim() ?? "";
   const liveDisconnected = activeTab === "live" && !liveSessionState.listening;
-  const composerMenuOpen = microphoneMenuOpen || liveVideoMenuOpen;
   const activeLiveMicrophoneLevel = activeTab === "live" && liveMicrophoneEnabled ? liveMicrophoneLevel : 0;
 
   const triggerLatestMessageShortcutFlash = useCallback(() => {
@@ -985,20 +980,6 @@ export function AIChatPanel({
   }, [liveCameraShortcutFlashing]);
 
   useEffect(() => {
-    const element = composerChromeRef.current;
-    if (!element || typeof ResizeObserver === "undefined") return;
-
-    const updateLiveComposerHeight = () => {
-      setComposerChromeHeight(element.scrollHeight);
-    };
-    updateLiveComposerHeight();
-
-    const observer = new ResizeObserver(updateLiveComposerHeight);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [activeTab, provider]);
-
-  useEffect(() => {
     if (!liveVideoMenuOpen && !microphoneMenuOpen && !generatedImageTrayOpen) return;
 
     const handlePointerDown = (event: PointerEvent) => {
@@ -1017,18 +998,10 @@ export function AIChatPanel({
   }, [generatedImageTrayOpen, liveVideoMenuOpen, microphoneMenuOpen]);
 
   const focusHistory = useCallback(() => {
-    setHistoryExpanded(true);
     setFolderPickerOpen(false);
     setLiveVideoMenuOpen(false);
     setMicrophoneMenuOpen(false);
     setPromptPickerOpen(false);
-    if (!promptExpanded) {
-      setComposerCondensed(true);
-    }
-  }, [promptExpanded]);
-
-  const expandComposerChrome = useCallback(() => {
-    setHistoryExpanded(false);
   }, []);
 
   const containAiPanelWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -1128,12 +1101,7 @@ export function AIChatPanel({
     const container = messagesContainerRef.current;
     if (!container) return;
     focusHistory();
-    const latestAssistantMessage = latestAssistantMessageRef.current;
-    if (latestAssistantMessage) {
-      latestAssistantMessage.scrollIntoView({ behavior: "smooth", block: "start" });
-    } else {
-      container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-    }
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
     setChatLatestMessageAvailable(false);
     setLatestMessageShortcutFlashing(false);
   }, [focusHistory]);
@@ -1150,12 +1118,10 @@ export function AIChatPanel({
 
   const updateChatHistoryScrollState = useCallback(() => {
     const container = messagesContainerRef.current;
-    const latestAssistantMessage = latestAssistantMessageRef.current;
-    if (!container || !latestAssistantMessage) return;
-    const containerRect = container.getBoundingClientRect();
-    const latestRect = latestAssistantMessage.getBoundingClientRect();
-    const latestMessageInView = latestRect.top >= containerRect.top - 48 && latestRect.top <= containerRect.bottom;
-    if (latestMessageInView) {
+    if (!container) return;
+    const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 48;
+    setChatLatestMessageAvailable(!nearBottom);
+    if (nearBottom) {
       setChatLatestMessageAvailable(false);
       setLatestMessageShortcutFlashing(false);
     }
@@ -1263,12 +1229,9 @@ export function AIChatPanel({
     if (previousLatestAssistantMessageIdRef.current === latestAssistantMessageId) return;
 
     previousLatestAssistantMessageIdRef.current = latestAssistantMessageId;
-    if (!promptExpanded) {
-      setComposerCondensed(true);
-    }
     setChatLatestMessageAvailable(true);
     triggerLatestMessageShortcutFlash();
-  }, [latestAssistantMessageId, latestChatMessageRole, promptExpanded, triggerLatestMessageShortcutFlash]);
+  }, [latestAssistantMessageId, latestChatMessageRole, triggerLatestMessageShortcutFlash]);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -1329,7 +1292,21 @@ export function AIChatPanel({
   const openLiveTab = () => {
     if (!supportsLive) return;
     setActiveTab("live");
+    setHistoryOnly(false);
     setLiveConnectionRequested(true);
+  };
+
+  const openChatTab = () => {
+    setActiveTab("chat");
+    setHistoryOnly(false);
+  };
+
+  const toggleHistoryOnly = () => {
+    setHistoryOnly((current) => !current);
+    setFolderPickerOpen(false);
+    setLiveVideoMenuOpen(false);
+    setMicrophoneMenuOpen(false);
+    setPromptPickerOpen(false);
   };
 
   const clearMicrophoneLongPressTimer = () => {
@@ -1623,6 +1600,7 @@ export function AIChatPanel({
     });
     setPromptExpanded(true);
     setActiveTab("chat");
+    setHistoryOnly(false);
   };
 
   const addPromptTemplate = (template: PromptTemplate) => {
@@ -2059,9 +2037,9 @@ export function AIChatPanel({
   };
 
   const renderGeneratedImageCard = (attachment: AIMessageAttachment) => (
-    <div className="group relative overflow-hidden rounded-[16px] border border-ink/10 bg-white shadow-[0_12px_28px_rgba(15,23,42,0.08)]" key={attachment.id}>
+    <div className="group relative overflow-hidden rounded-[8px] bg-white shadow-[0_10px_22px_rgba(15,23,42,0.06)]" key={attachment.id}>
       <button
-        className="flex w-full items-center justify-center bg-[#f7f1e6] p-3"
+        className="flex w-full items-center justify-center bg-[#f7f1e6] p-2"
         data-chat-generated-image="true"
         data-chat-generated-image-id={attachment.id}
         onClick={() => {
@@ -2070,9 +2048,9 @@ export function AIChatPanel({
         }}
         type="button"
       >
-        <img alt={attachment.fileName} className="max-h-[220px] w-auto max-w-full object-contain" src={attachment.url} />
+        <img alt={attachment.fileName} className="max-h-[190px] w-auto max-w-full object-contain" src={attachment.url} />
       </button>
-      <div className="flex items-center justify-between gap-2 px-3 py-2">
+      <div className="flex items-center justify-between gap-2 px-2 py-1.5">
         <div className="min-w-0">
           <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Generated image</div>
           <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
@@ -2080,9 +2058,9 @@ export function AIChatPanel({
             <div className="mt-0.5 truncate text-[10px] text-ink/55">{formatGeneratedImageMetadata(attachment)}</div>
           ) : null}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1">
           <button
-            className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+            className="flex h-7 w-7 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
             onClick={() => attachGeneratedImageForEdit(attachment)}
             title="Edit with AI"
             type="button"
@@ -2093,7 +2071,7 @@ export function AIChatPanel({
             </svg>
           </button>
           <button
-            className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+            className="flex h-7 w-7 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
             onClick={() => {
               const preview = toPreviewAttachment(attachment);
               if (preview) setPreviewAttachment(preview);
@@ -2106,7 +2084,7 @@ export function AIChatPanel({
             </svg>
           </button>
           <button
-            className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+            className="flex h-7 w-7 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
             onClick={() => onAddAttachmentToNote(attachment)}
             title="Add to note"
             type="button"
@@ -2497,7 +2475,7 @@ export function AIChatPanel({
       onWheelCapture={containAiPanelWheel}
       style={{ height: displayedPanelHeight }}
     >
-      <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-7 rounded-full bg-ink/20 blur-xl" />
+      <div className="pointer-events-none absolute inset-x-8 -top-3 z-10 h-6 rounded-full bg-ink/15 blur-xl" />
       {fileDropActive ? (
         <div
           aria-hidden="true"
@@ -2508,22 +2486,22 @@ export function AIChatPanel({
           </svg>
         </div>
       ) : null}
-      <div className="flex items-center justify-between gap-2 px-0 py-0">
-        <div className="flex min-w-0 items-center gap-2">
-          <div className="inline-flex rounded-full bg-white p-0.5 text-xs shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
+      <div className="flex items-center justify-between gap-1 px-0 py-0">
+        <div className="flex min-w-0 items-center gap-1">
+          <div className="inline-flex h-7 items-center rounded-[4px] bg-white/60 p-0.5 text-xs">
             <button
-              className={`rounded-full px-2.5 py-1 font-medium transition ${activeTab === "chat" ? "bg-ink text-white" : "text-ink/65 hover:bg-mist"}`}
-              onClick={() => setActiveTab("chat")}
+              className={`rounded-[3px] px-2 py-0.5 font-medium transition ${!historyOnly && activeTab === "chat" ? "bg-white text-black shadow-sm" : "text-ink/45 hover:text-ink"}`}
+              onClick={openChatTab}
               type="button"
             >
               Chat
             </button>
             <button
-              className={`rounded-full px-2.5 py-1 font-medium transition ${
-                activeTab === "live"
-                  ? "bg-ink text-white"
+              className={`rounded-[3px] px-2 py-0.5 font-medium transition ${
+                !historyOnly && activeTab === "live"
+                  ? "bg-white text-black shadow-sm"
                   : supportsLive
-                    ? "text-ink/65 hover:bg-mist"
+                    ? "text-ink/45 hover:text-ink"
                     : "cursor-not-allowed text-ink/35"
               }`}
               disabled={!supportsLive}
@@ -2535,11 +2513,31 @@ export function AIChatPanel({
             </button>
           </div>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1">
+          <button
+            aria-label={historyOnly ? `Return to ${activeTab}` : activeTab === "live" ? "Show transcript" : "Show history"}
+            className={`flex h-7 w-7 items-center justify-center rounded-[4px] transition ${
+              historyOnly ? "bg-white text-black shadow-sm" : "bg-transparent text-ink/55 hover:bg-mist hover:text-ink"
+            }`}
+            onClick={toggleHistoryOnly}
+            title={historyOnly ? `Return to ${activeTab}` : activeTab === "live" ? "Transcript" : "History"}
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+              <path
+                d="M6 5.5h12A1.5 1.5 0 0 1 19.5 7v10A1.5 1.5 0 0 1 18 18.5H6A1.5 1.5 0 0 1 4.5 17V7A1.5 1.5 0 0 1 6 5.5Z"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.7"
+              />
+              <path d="M8 9h8M8 12h8M8 15h5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+            </svg>
+          </button>
           {showLatestMessageShortcut ? (
             <button
               aria-label="Scroll to latest message"
-              className={`flex h-7 w-7 items-center justify-center rounded-[4px] border border-[#bb3e2d]/25 bg-[#fff7e8] text-[#bb3e2d] transition hover:border-[#bb3e2d]/40 hover:bg-[#ffeacd] ${
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] bg-[#fff7e8] text-[#bb3e2d] transition hover:bg-[#ffeacd] ${
                 latestMessageShortcutFlashing ? "animate-pulse ring-2 ring-[#bb3e2d]/35" : ""
               }`}
               onClick={scrollToLatestMessage}
@@ -2562,10 +2560,10 @@ export function AIChatPanel({
             <div className="relative" ref={generatedImageTrayRef}>
               <button
                 aria-label={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
-                className={`flex h-7 w-7 items-center justify-center rounded-[4px] border transition ${
+                className={`flex h-7 w-7 items-center justify-center rounded-[4px] transition ${
                   imageGenerationActive
-                    ? "border-black bg-black text-white hover:border-black hover:bg-black"
-                    : "border-[#1f6f78]/20 bg-[#e5f5f7] text-[#1f6f78] hover:border-[#1f6f78]/35 hover:bg-[#d8eef1]"
+                    ? "bg-black text-white hover:bg-black"
+                    : "bg-[#e5f5f7] text-[#1f6f78] hover:bg-[#d8eef1]"
                 }`}
                 onClick={handleGeneratedImageShortcutClick}
                 title={imageGenerationActive ? "Generating image" : "Scroll to generated image"}
@@ -2584,7 +2582,7 @@ export function AIChatPanel({
                 </svg>
               </button>
               {generatedImageTrayOpen && activeGeneratedImages.length > 0 ? (
-                <div className="absolute right-0 top-[calc(100%+0.5rem)] z-30 w-[232px] rounded-[8px] border border-ink/10 bg-white p-2 shadow-[0_16px_34px_rgba(15,23,42,0.18)] sm:w-[340px]">
+                <div className="absolute right-0 top-[calc(100%+0.4rem)] z-30 w-[216px] rounded-[8px] bg-white p-2 shadow-[0_14px_30px_rgba(15,23,42,0.16)] sm:w-[312px]">
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Generated images</div>
                     <button
@@ -2603,8 +2601,8 @@ export function AIChatPanel({
                       const latest = image.id === latestGeneratedImage?.id;
                       return (
                         <button
-                          className={`h-[100px] w-[100px] overflow-hidden rounded-[6px] border bg-[#f7f1e6] transition hover:border-[#1f6f78]/45 ${
-                            latest ? "border-[#1f6f78] ring-2 ring-[#1f6f78]/15" : "border-ink/10"
+                          className={`h-[92px] w-[92px] overflow-hidden rounded-[5px] bg-[#f7f1e6] transition hover:opacity-90 ${
+                            latest ? "ring-2 ring-[#1f6f78]/25" : ""
                           }`}
                           key={image.id}
                           onClick={() => {
@@ -2626,12 +2624,12 @@ export function AIChatPanel({
           {showCameraShortcut ? (
             <button
               aria-label="Scroll to camera"
-              className={`flex h-7 w-7 items-center justify-center rounded-[4px] border transition ${
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] transition ${
                 liveCameraShortcutFlashing
                   ? liveCameraFlashOn
-                    ? "border-[#15803d] bg-[#15803d] text-white hover:border-[#166534] hover:bg-[#166534]"
-                    : "border-[#86efac] bg-[#dcfce7] text-[#166534] hover:border-[#4ade80] hover:bg-[#bbf7d0]"
-                  : "border-ink/10 bg-white text-ink hover:border-ink/25 hover:bg-mist"
+                    ? "bg-[#15803d] text-white hover:bg-[#166534]"
+                    : "bg-[#dcfce7] text-[#166534] hover:bg-[#bbf7d0]"
+                  : "bg-white text-ink hover:bg-mist"
               }`}
               onClick={scrollToCameraTarget}
               title="Scroll to camera"
@@ -2649,328 +2647,12 @@ export function AIChatPanel({
               </svg>
             </button>
           ) : null}
-          {activeTab === "live" && supportsLive ? (
-            <button
-              aria-label={liveConnectButtonActive ? "Turn off live standby" : "Enable live standby"}
-              className={`flex h-8 w-8 items-center justify-center rounded-[4px] border transition ${
-                liveConnectButtonReady
-                  ? "border-[#bb3e2d] bg-[#bb3e2d] text-white hover:border-[#a93526] hover:bg-[#a93526]"
-                  : liveConnectButtonActive
-                    ? "border-[#2563eb] bg-[#2563eb] text-white hover:border-[#1d4ed8] hover:bg-[#1d4ed8]"
-                  : "border-ink/10 bg-white text-ink hover:border-ink/20 hover:bg-mist"
-              }`}
-              onClick={() => setLiveConnectionRequested((current) => !current)}
-              title={liveConnectButtonActive ? "Turn off live standby" : "Enable live standby"}
-              type="button"
-            >
-              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                <path d="M12 4.5v7" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-                <path d="M8 6.8a7 7 0 1 0 8 0" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-              </svg>
-            </button>
-          ) : null}
-          <button
-            className="flex h-8 w-8 cursor-ns-resize touch-none items-center justify-center rounded-[4px] bg-white text-ink/45 transition hover:bg-mist"
-            onPointerDown={(event) => {
-              resizePointerIdRef.current = event.pointerId;
-              resizeStartYRef.current = event.clientY;
-              resizeStartHeightRef.current = panelHeight;
-              event.currentTarget.setPointerCapture(event.pointerId);
-            }}
-            title="Resize panel"
-            type="button"
-          >
-            <svg aria-hidden="true" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24">
-              <path
-                d="M12 4V20M8.5 7.5L12 4l3.5 3.5M8.5 16.5L12 20l3.5-3.5"
-                stroke="currentColor"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="1.7"
-              />
-              <path d="M7 12H17" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      {provider === "gemini" ? (
-        <>
-      <div
-        className={`min-h-0 shrink-0 transition-[height] duration-200 ease-out ${composerMenuOpen ? "overflow-visible" : "overflow-hidden"}`}
-        style={composerChromeFrameHeight === undefined ? undefined : { height: composerChromeFrameHeight }}
-      >
-        <div
-          className="origin-top-left transition-transform duration-200 ease-out"
-          onFocusCapture={expandComposerChrome}
-          onPointerDownCapture={expandComposerChrome}
-          ref={composerChromeRef}
-          style={{
-            transform: `scale(${composerChromeScale})`,
-            width: compactComposerChrome ? "200%" : "100%",
-          }}
-        >
-      <input
-        accept="image/*,audio/*,video/*"
-        className="hidden"
-        multiple
-        onChange={(event) => {
-          const files = Array.from(event.target.files ?? []);
-          if (files.length > 0) appendFiles(files);
-          event.target.value = "";
-        }}
-        ref={fileInputRef}
-        type="file"
-      />
-
-      <textarea
-        className={`hide-scrollbar w-full resize-none overflow-y-auto rounded-[10px] border px-4 py-3 text-sm leading-6 overscroll-contain transition-[height,background-color,border-color,color] duration-200 ease-out ${
-          liveDisconnected
-            ? "border-ink/10 bg-[#e8e8e8] text-ink/55 placeholder:text-ink/40"
-            : "border-pine/40 bg-[#fffdf8] text-ink placeholder:text-ink/35"
-        }`}
-        onChange={(event) => {
-          setComposerCondensed(false);
-          setPrompt(event.target.value);
-        }}
-        onFocus={() => {
-          setComposerFocused(true);
-          setComposerCondensed(false);
-        }}
-        onBlur={() => setComposerFocused(false)}
-        onKeyDown={(event) => {
-          if (event.nativeEvent.isComposing) return;
-          if (event.key === "Enter" && !event.shiftKey) {
-            event.preventDefault();
-            void handleComposerSubmit();
-          }
-        }}
-        onPaste={(event) => {
-          const files = Array.from(event.clipboardData.items)
-            .map((item) => item.getAsFile())
-            .filter((file): file is File => Boolean(file))
-            .filter((file) => Boolean(inferMediaKindFromFile(file)));
-          if (files.length === 0) return;
-          event.preventDefault();
-          appendFiles(files);
-        }}
-        placeholder={
-          activeTab === "live"
-            ? liveSessionState.ready
-              ? "Live talk on, speak with AI now."
-              : liveSessionState.listening
-                ? liveSessionState.standby
-                  ? "Standby listening. Speak or type to reconnect."
-                  : liveSessionState.status
-                : liveSessionState.status
-            : supportsMedia
-              ? "Ask Gemini about this note. Press Enter to send, Shift+Enter for a new line."
-              : "Send the whole document or ask questions. Press Enter to send, Shift+Enter for a new line."
-        }
-        style={{ height: composerFocused ? (promptExpanded ? 300 : composerCondensed ? 50 : 130) : 44 }}
-        value={prompt}
-      />
-
-      {selectedPrompts.length > 0 || attachments.length > 0 ? (
-        <div className="mt-3 flex gap-2 overflow-x-auto overscroll-contain pb-1" ref={composerItemsRef}>
-          {selectedPrompts.map((selectedPrompt) => (
-            <div className="relative shrink-0" key={selectedPrompt.id}>
-              <button
-                className="group flex h-11 w-[172px] items-center gap-2 overflow-hidden rounded-[10px] border border-ink/10 bg-white px-2 py-2 text-left transition hover:border-ink/25 hover:bg-mist"
-                onClick={() => setPreviewPrompt(buildMessagePrompt(selectedPrompt))}
-                type="button"
-              >
-                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] bg-mist text-ink/70">
-                  <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
-                    <path d="M7 7.5h10M7 12h10M7 16.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-                  </svg>
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Prompt</div>
-                  <div className="truncate text-xs font-medium text-ink">{selectedPrompt.name}</div>
-                </div>
-              </button>
-              <button
-                aria-label={`Remove ${selectedPrompt.name}`}
-                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
-                onClick={() => removePromptTemplate(selectedPrompt.id)}
-                type="button"
-              >
-                <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
-                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-                </svg>
-              </button>
-            </div>
-          ))}
-
-          {attachments.map((attachment) => (
-            <div className="relative shrink-0" key={attachment.id}>
-              <button
-                className="group flex h-11 w-[172px] items-center gap-2 overflow-hidden rounded-[10px] border border-ink/10 bg-white px-2 py-2 text-left transition hover:border-ink/25 hover:bg-mist"
-                onClick={() =>
-                  setPreviewAttachment(
-                    toPreviewAttachment({
-                      fileName: attachment.fileName,
-                      kind: attachment.kind,
-                      mimeType: attachment.mimeType,
-                      url: attachment.previewUrl,
-                    }),
-                  )
-                }
-                type="button"
-              >
-                {attachment.kind === "image" ? (
-                  <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[8px] object-cover" src={attachment.previewUrl} />
-                ) : attachment.kind === "video" ? (
-                  <video className="h-7 w-7 shrink-0 rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.previewUrl} />
-                ) : (
-                  <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] bg-mist text-ink/70">
-                    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
-                      <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                      <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                      <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                    </svg>
-                  </div>
-                )}
-                <div className="min-w-0 flex-1">
-                  <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">{attachmentBadge(attachment.kind)}</div>
-                  <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
-                </div>
-              </button>
-              <button
-                aria-label={`Remove ${attachment.fileName}`}
-                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
-                onClick={() => removeAttachment(attachment.id)}
-                type="button"
-              >
-                <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
-                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-                </svg>
-              </button>
-            </div>
-          ))}
-        </div>
-      ) : null}
-
-      <div className="relative mt-3 flex flex-wrap items-center justify-between gap-2 px-0">
-        <div className="flex items-center gap-2">
-          <button
-            aria-expanded={promptPickerOpen}
-            aria-label="Add prompt"
-            className="relative flex h-10 w-10 items-center justify-center rounded-[10px] border border-ink/10 bg-white text-ink transition hover:border-ink/30 hover:bg-mist"
-            onClick={() => {
-              setPromptPickerOpen((current) => !current);
-              setFolderPickerOpen(false);
-            }}
-            title="Add prompt"
-            type="button"
-          >
-            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-              <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
-            </svg>
-            {selectedPrompts.length > 0 ? (
-              <span className="absolute -right-1 -top-1 rounded-full bg-mist px-1.5 py-0.5 text-[9px] font-semibold leading-none text-ink/70">
-                {selectedPrompts.length}
-              </span>
-            ) : null}
-          </button>
-          <button
-            aria-label="Upload media"
-            className="flex h-10 w-10 items-center justify-center rounded-[4px] border border-ink/10 bg-white text-ink transition hover:border-ink/30 hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={!supportsMedia}
-            onClick={() => {
-              setPromptPickerOpen(false);
-              fileInputRef.current?.click();
-            }}
-            title={supportsMedia ? "Upload media" : "Switch to Gemini to upload media"}
-            type="button"
-          >
-            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-              <path d="M12 16V6M8.5 9.5 12 6l3.5 3.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-              <path d="M5 16.5V19h14v-2.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-            </svg>
-          </button>
-          <button
-            aria-expanded={folderPickerOpen}
-            aria-label="Choose file from current folder"
-            className="flex h-10 w-10 items-center justify-center rounded-[4px] border border-ink/10 bg-white text-ink transition hover:border-ink/30 hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
-            disabled={!supportsMedia}
-            onClick={() => {
-              setPromptPickerOpen(false);
-              setFolderPickerOpen((current) => !current);
-            }}
-            title={supportsMedia ? "Choose file from current folder" : "Switch to Gemini to attach workspace files"}
-            type="button"
-          >
-            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-              <path
-                d="M4 7.5A1.5 1.5 0 0 1 5.5 6H10l1.4 1.5h7.1A1.5 1.5 0 0 1 20 9v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5v-10Z"
-                stroke="currentColor"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="1.6"
-              />
-              <path d="M8 12h8M12 8v8" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
-            </svg>
-          </button>
-          <button
-            aria-label={promptExpanded ? "Collapse prompt" : "Expand prompt"}
-            className="flex h-10 w-10 items-center justify-center rounded-[4px] border border-ink/10 bg-white text-ink transition hover:border-ink/30 hover:bg-mist"
-            onClick={() => setPromptExpanded((current) => !current)}
-            title={promptExpanded ? "Collapse prompt" : "Expand prompt"}
-            type="button"
-          >
-            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-              {promptExpanded ? (
-                <path
-                  d="M8 10l4-4l4 4M8 14l4 4l4-4"
-                  stroke="currentColor"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="1.8"
-                />
-              ) : (
-                <path
-                  d="M14 4h6v6M10 20H4v-6M20 10V4h-6M4 14v6h6"
-                  stroke="currentColor"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  strokeWidth="1.8"
-                />
-              )}
-            </svg>
-          </button>
-          {selectedTextForReadAloud ? (
-            <button
-              aria-label="Read selected text aloud"
-              className="flex h-10 w-10 items-center justify-center rounded-[4px] border border-[#1f6f78]/20 bg-[#e5f5f7] text-[#1f6f78] transition hover:border-[#1f6f78]/35 hover:bg-[#d8eef1] disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={!providerSettings.apiKey || readingSelection || (activeTab === "live" ? !liveSendHandle : busy)}
-              onClick={() => void handleReadSelectedText()}
-              title={activeTab === "live" ? "Read selected text in Live" : "Generate read-aloud audio"}
-              type="button"
-            >
-              {readingSelection ? (
-                <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
-              ) : (
-                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                  <path d="M5 10v4h3l4 3.5v-11L8 10H5Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.7" />
-                  <path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
-                </svg>
-              )}
-            </button>
-          ) : null}
-        </div>
-        <div className="flex items-center gap-2">
           <div className={`relative ${microphoneMenuOpen ? "z-[90]" : ""}`} ref={microphoneMenuRef}>
             <button
               aria-expanded={microphoneMenuOpen}
               aria-label={recording ? "Release to stop recording" : "Quick tap for microphones, hold 2 seconds to record audio"}
-              className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition-[background-color,border-color,color,box-shadow] duration-150 disabled:cursor-not-allowed disabled:opacity-50 ${
-                recording
-                  ? "border-[#bb3e2d] bg-[#bb3e2d] text-white"
-                  : activeTab === "live" && liveMicrophoneEnabled
-                    ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]"
-                    : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] bg-transparent transition-[background-color,color,box-shadow] duration-150 hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50 ${
+                recording ? "text-white" : "text-ink"
               }`}
               disabled={!supportsMedia || cameraPreparing || cameraRecording}
               onPointerCancel={() => {
@@ -3021,7 +2703,7 @@ export function AIChatPanel({
               )}
             </button>
             {microphoneMenuOpen ? (
-              <div className="absolute bottom-12 right-0 z-[100] grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
+              <div className="absolute right-0 top-[calc(100%+0.35rem)] z-[100] grid min-w-[224px] gap-1.5 rounded-[8px] bg-white p-2 shadow-[0_14px_30px_rgba(15,23,42,0.14)]">
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Microphones</div>
@@ -3034,7 +2716,7 @@ export function AIChatPanel({
                     </div>
                   </div>
                   <button
-                    className="rounded-full border border-ink/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="rounded-[4px] bg-mist px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:bg-[#efe5d3]"
                     onClick={() => (liveMicrophoneEnabled ? disableLiveMicrophone() : enableLiveMicrophone())}
                     type="button"
                   >
@@ -3043,10 +2725,10 @@ export function AIChatPanel({
                 </div>
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Available microphones</div>
                 {microphoneMenuLoading ? (
-                  <div className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-xs text-ink/45">Loading microphones...</div>
+                  <div className="rounded-[6px] bg-mist/50 px-2 py-2 text-xs text-ink/45">Loading microphones...</div>
                 ) : microphoneSources.length === 0 ? (
                   <button
-                    className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-left text-xs text-ink/55 transition hover:border-ink/20 hover:bg-mist"
+                    className="rounded-[6px] bg-mist/50 px-2 py-2 text-left text-xs text-ink/55 transition hover:bg-mist"
                     onClick={() => void refreshMicrophoneSources()}
                     type="button"
                   >
@@ -3057,8 +2739,8 @@ export function AIChatPanel({
                     const selected = selectedMicrophoneId === source.deviceId;
                     return (
                       <button
-                        className={`rounded-[12px] border px-3 py-2 text-left text-sm transition ${
-                          selected ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]" : "border-ink/10 bg-[#fffdfa] text-ink hover:border-ink/20 hover:bg-mist"
+                        className={`rounded-[6px] px-2 py-1.5 text-left text-sm transition ${
+                          selected ? "bg-[#e5f5f7] text-[#1f6f78]" : "bg-[#fffdfa] text-ink hover:bg-mist"
                         }`}
                         key={source.deviceId}
                         onClick={() => selectMicrophoneSource(source.deviceId)}
@@ -3077,8 +2759,8 @@ export function AIChatPanel({
               <button
                 aria-expanded={liveVideoMenuOpen}
                 aria-label={liveVideoShareMode ? "Manage live video share" : "Share camera or screen"}
-                className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                  liveVideoShareMode ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]" : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
+                className={`flex h-7 w-7 items-center justify-center rounded-[4px] bg-transparent transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50 ${
+                  liveVideoShareMode ? "text-[#1f6f78]" : "text-ink"
                 }`}
                 disabled={!liveSendHandle}
                 onClick={() => void toggleLiveVideoMenu()}
@@ -3096,7 +2778,7 @@ export function AIChatPanel({
                 </svg>
               </button>
               {liveVideoMenuOpen ? (
-                <div className="absolute bottom-12 right-0 z-[100] grid min-w-[240px] gap-2 rounded-[16px] border border-ink/10 bg-white p-3 shadow-[0_18px_38px_rgba(15,23,42,0.16)]">
+                <div className="absolute right-0 top-[calc(100%+0.35rem)] z-[100] grid min-w-[224px] gap-1.5 rounded-[8px] bg-white p-2 shadow-[0_14px_30px_rgba(15,23,42,0.14)]">
                   <div className="flex items-center justify-between gap-3">
                     <div>
                       <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Live video</div>
@@ -3111,7 +2793,7 @@ export function AIChatPanel({
                       </div>
                     </div>
                     <button
-                      className="rounded-full border border-ink/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                      className="rounded-[4px] bg-mist px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:bg-[#efe5d3]"
                       onClick={() => {
                         liveVideoControls?.stopVideoShare();
                         setLiveVideoMenuOpen(false);
@@ -3122,7 +2804,7 @@ export function AIChatPanel({
                     </button>
                   </div>
                   <button
-                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex items-center justify-between rounded-[6px] bg-[#fffdfa] px-2 py-1.5 text-left text-sm text-ink transition hover:bg-mist"
                     onClick={() => void switchLiveCameraShare()}
                     type="button"
                   >
@@ -3133,7 +2815,7 @@ export function AIChatPanel({
                     </svg>
                   </button>
                   <button
-                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex items-center justify-between rounded-[6px] bg-[#fffdfa] px-2 py-1.5 text-left text-sm text-ink transition hover:bg-mist"
                     onClick={() => void startLiveScreenShare()}
                     type="button"
                   >
@@ -3144,7 +2826,7 @@ export function AIChatPanel({
                     </svg>
                   </button>
                   <button
-                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex items-center justify-between rounded-[6px] bg-[#fffdfa] px-2 py-1.5 text-left text-sm text-ink transition hover:bg-mist"
                     onClick={() => void startLiveScreenShare({ video: true })}
                     type="button"
                   >
@@ -3160,7 +2842,7 @@ export function AIChatPanel({
                     </svg>
                   </button>
                   <button
-                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex items-center justify-between rounded-[6px] bg-[#fffdfa] px-2 py-1.5 text-left text-sm text-ink transition hover:bg-mist"
                     onClick={() => void startLiveCameraShare(undefined, { video: false })}
                     type="button"
                   >
@@ -3176,7 +2858,7 @@ export function AIChatPanel({
                     </svg>
                   </button>
                   <button
-                    className="flex items-center justify-between rounded-[12px] border border-ink/10 bg-[#fffdfa] px-3 py-2 text-left text-sm text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex items-center justify-between rounded-[6px] bg-[#fffdfa] px-2 py-1.5 text-left text-sm text-ink transition hover:bg-mist"
                     onClick={() => void startLiveCameraShare(undefined, { video: true })}
                     type="button"
                   >
@@ -3193,10 +2875,10 @@ export function AIChatPanel({
                   </button>
                   <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Camera devices</div>
                   {liveVideoMenuLoading ? (
-                    <div className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-xs text-ink/45">Loading cameras...</div>
+                    <div className="rounded-[6px] bg-mist/50 px-2 py-2 text-xs text-ink/45">Loading cameras...</div>
                   ) : liveVideoSources.length === 0 ? (
                     <button
-                      className="rounded-[12px] border border-dashed border-ink/10 px-3 py-3 text-left text-xs text-ink/55 transition hover:border-ink/20 hover:bg-mist"
+                      className="rounded-[6px] bg-mist/50 px-2 py-2 text-left text-xs text-ink/55 transition hover:bg-mist"
                       onClick={() => void refreshLiveVideoSources()}
                       type="button"
                     >
@@ -3207,8 +2889,8 @@ export function AIChatPanel({
                       const selected = preferredLiveCameraDeviceId === source.deviceId;
                       return (
                         <button
-                          className={`rounded-[12px] border px-3 py-2 text-left text-sm transition ${
-                            selected ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]" : "border-ink/10 bg-[#fffdfa] text-ink hover:border-ink/20 hover:bg-mist"
+                          className={`rounded-[6px] px-2 py-1.5 text-left text-sm transition ${
+                            selected ? "bg-[#e5f5f7] text-[#1f6f78]" : "bg-[#fffdfa] text-ink hover:bg-mist"
                           }`}
                           key={source.deviceId}
                           onClick={() => void startLiveCameraShare(source.deviceId)}
@@ -3225,60 +2907,362 @@ export function AIChatPanel({
           ) : null}
           {activeTab === "chat" ? (
             <button
-                aria-label={cameraRecording ? "Release to stop video recording" : "Click for photo, hold for video"}
-                className={`flex h-10 w-10 items-center justify-center rounded-[4px] border transition disabled:cursor-not-allowed disabled:opacity-50 ${
-                  cameraRecording
-                    ? "border-[#1f6f78] bg-[#1f6f78] text-white"
-                    : cameraPreparing
-                      ? "border-[#1f6f78] bg-[#e5f5f7] text-[#1f6f78]"
-                      : "border-ink/10 bg-white text-ink hover:border-ink/30 hover:bg-mist"
-                }`}
-                disabled={!supportsMedia || busy || preparingRecording || recording}
-                onPointerCancel={() => void releaseCameraCapture()}
-                onPointerDown={(event) => {
-                  cameraHoldActiveRef.current = true;
-                  cameraLongPressTriggeredRef.current = false;
-                  clearCameraLongPressTimer();
-                  cameraLongPressTimerRef.current = window.setTimeout(() => {
-                    cameraLongPressTimerRef.current = null;
-                    cameraLongPressTriggeredRef.current = true;
-                    if (cameraHoldActiveRef.current && cameraStreamRef.current && cameraRecorderRef.current?.state !== "recording") {
-                      startVideoRecording();
-                    }
-                  }, 2000);
-                  event.currentTarget.setPointerCapture(event.pointerId);
-                  void startCameraCapture();
-                }}
-                onPointerUp={(event) => {
-                  if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-                    event.currentTarget.releasePointerCapture(event.pointerId);
+              aria-label={cameraRecording ? "Release to stop video recording" : "Click for photo, hold for video"}
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                cameraRecording
+                  ? "bg-[#1f6f78] text-white"
+                  : cameraPreparing
+                    ? "bg-transparent text-[#1f6f78]"
+                    : "bg-transparent text-ink hover:bg-mist"
+              }`}
+              disabled={!supportsMedia || busy || preparingRecording || recording}
+              onPointerCancel={() => void releaseCameraCapture()}
+              onPointerDown={(event) => {
+                cameraHoldActiveRef.current = true;
+                cameraLongPressTriggeredRef.current = false;
+                clearCameraLongPressTimer();
+                cameraLongPressTimerRef.current = window.setTimeout(() => {
+                  cameraLongPressTimerRef.current = null;
+                  cameraLongPressTriggeredRef.current = true;
+                  if (cameraHoldActiveRef.current && cameraStreamRef.current && cameraRecorderRef.current?.state !== "recording") {
+                    startVideoRecording();
                   }
-                  void releaseCameraCapture();
-                }}
-                title={
-                  supportsMedia
-                    ? cameraRecording
-                      ? "Release to stop and send video"
-                      : "Click for photo, hold 2 seconds for video"
-                    : "Switch to Gemini to use camera capture"
+                }, 2000);
+                event.currentTarget.setPointerCapture(event.pointerId);
+                void startCameraCapture();
+              }}
+              onPointerUp={(event) => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+                void releaseCameraCapture();
+              }}
+              title={
+                supportsMedia
+                  ? cameraRecording
+                    ? "Release to stop and send video"
+                    : "Click for photo, hold 2 seconds for video"
+                  : "Switch to Gemini to use camera capture"
+              }
+              type="button"
+            >
+              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                <path
+                  d="M5.5 8.5A1.5 1.5 0 0 1 7 7h2l1.2-1.5h3.6L15 7h2a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 17 18H7a1.5 1.5 0 0 1-1.5-1.5v-8Z"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.7"
+                />
+                <circle cx="12" cy="12.5" r="3" stroke="currentColor" strokeWidth="1.7" />
+              </svg>
+            </button>
+          ) : null}
+          {activeTab === "live" && supportsLive ? (
+            <button
+              aria-label={liveConnectButtonActive ? "Turn off live standby" : "Enable live standby"}
+              className={`flex h-7 w-7 items-center justify-center rounded-[4px] transition ${
+                liveConnectButtonReady
+                  ? "bg-[#bb3e2d] text-white hover:bg-[#a93526]"
+                  : liveConnectButtonActive
+                    ? "bg-[#e5f5f7] text-[#1f6f78] hover:bg-[#d8eef1]"
+                  : "bg-white text-ink hover:bg-mist"
+              }`}
+              onClick={() => setLiveConnectionRequested((current) => !current)}
+              title={liveConnectButtonActive ? "Turn off live standby" : "Enable live standby"}
+              type="button"
+            >
+              <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                <path d="M12 4.5v7" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                <path d="M8 6.8a7 7 0 1 0 8 0" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+              </svg>
+            </button>
+          ) : null}
+          <button
+            className="flex h-7 w-7 cursor-ns-resize touch-none items-center justify-center rounded-[4px] bg-white/75 text-ink/45 transition hover:bg-mist"
+            onPointerDown={(event) => {
+              resizePointerIdRef.current = event.pointerId;
+              resizeStartYRef.current = event.clientY;
+              resizeStartHeightRef.current = panelHeight;
+              event.currentTarget.setPointerCapture(event.pointerId);
+            }}
+            title="Resize panel"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-[18px] w-[18px]" fill="none" viewBox="0 0 24 24">
+              <path
+                d="M12 4V20M8.5 7.5L12 4l3.5 3.5M8.5 16.5L12 20l3.5-3.5"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.7"
+              />
+              <path d="M7 12H17" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      {provider === "gemini" ? (
+        <>
+      <div
+        className={`relative shrink-0 transition-[height] duration-200 ease-out ${composerHidden ? "pointer-events-none overflow-hidden" : "overflow-visible"}`}
+        style={{ height: composerFrameHeight }}
+      >
+        {!composerHidden ? (
+        <div className="absolute inset-x-0 top-0 z-20">
+      <input
+        accept="image/*,audio/*,video/*"
+        className="hidden"
+        multiple
+        onChange={(event) => {
+          const files = Array.from(event.target.files ?? []);
+          if (files.length > 0) appendFiles(files);
+          event.target.value = "";
+        }}
+        ref={fileInputRef}
+        type="file"
+      />
+
+      <textarea
+        className={`hide-scrollbar w-full resize-none overflow-y-auto rounded-[6px] border-0 px-2 py-1.5 text-sm leading-5 overscroll-contain outline-none transition-[height,background-color,color] duration-200 ease-out ${
+          liveDisconnected
+            ? "bg-[#e8e8e8] text-ink/55 placeholder:text-ink/40"
+            : "bg-[#fffdf8] text-ink placeholder:text-ink/35"
+        }`}
+        onChange={(event) => {
+          setPrompt(event.target.value);
+        }}
+        onFocus={() => {
+          setComposerFocused(true);
+        }}
+        onBlur={() => setComposerFocused(false)}
+        onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing) return;
+          if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            void handleComposerSubmit();
+          }
+        }}
+        onPaste={(event) => {
+          const files = Array.from(event.clipboardData.items)
+            .map((item) => item.getAsFile())
+            .filter((file): file is File => Boolean(file))
+            .filter((file) => Boolean(inferMediaKindFromFile(file)));
+          if (files.length === 0) return;
+          event.preventDefault();
+          appendFiles(files);
+        }}
+        placeholder={
+          activeTab === "live"
+            ? liveSessionState.ready
+              ? "Live talk on, speak with AI now."
+              : liveSessionState.listening
+                ? liveSessionState.standby
+                  ? "Standby listening. Speak or type to reconnect."
+                  : liveSessionState.status
+                : liveSessionState.status
+            : supportsMedia
+              ? "Ask Gemini about this note. Press Enter to send, Shift+Enter for a new line."
+              : "Send the whole document or ask questions. Press Enter to send, Shift+Enter for a new line."
+        }
+        style={{ height: composerTextareaHeight }}
+        value={prompt}
+      />
+
+      {selectedPrompts.length > 0 || attachments.length > 0 ? (
+        <div className="mt-1.5 flex gap-1.5 overflow-x-auto overscroll-contain pb-1" ref={composerItemsRef}>
+          {selectedPrompts.map((selectedPrompt) => (
+            <div className="relative shrink-0" key={selectedPrompt.id}>
+              <button
+                className="group flex h-10 w-[156px] items-center gap-2 overflow-hidden rounded-[6px] bg-white px-2 py-1.5 text-left transition hover:bg-mist"
+                onClick={() => setPreviewPrompt(buildMessagePrompt(selectedPrompt))}
+                type="button"
+              >
+                <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] bg-mist text-ink/70">
+                  <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                    <path d="M7 7.5h10M7 12h10M7 16.5h6" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                  </svg>
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Prompt</div>
+                  <div className="truncate text-xs font-medium text-ink">{selectedPrompt.name}</div>
+                </div>
+              </button>
+              <button
+                aria-label={`Remove ${selectedPrompt.name}`}
+                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
+                onClick={() => removePromptTemplate(selectedPrompt.id)}
+                type="button"
+              >
+                <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
+                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                </svg>
+              </button>
+            </div>
+          ))}
+
+          {attachments.map((attachment) => (
+            <div className="relative shrink-0" key={attachment.id}>
+              <button
+                className="group flex h-10 w-[156px] items-center gap-2 overflow-hidden rounded-[6px] bg-white px-2 py-1.5 text-left transition hover:bg-mist"
+                onClick={() =>
+                  setPreviewAttachment(
+                    toPreviewAttachment({
+                      fileName: attachment.fileName,
+                      kind: attachment.kind,
+                      mimeType: attachment.mimeType,
+                      url: attachment.previewUrl,
+                    }),
+                  )
                 }
                 type="button"
               >
-                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                  <path
-                    d="M5.5 8.5A1.5 1.5 0 0 1 7 7h2l1.2-1.5h3.6L15 7h2a1.5 1.5 0 0 1 1.5 1.5v8A1.5 1.5 0 0 1 17 18H7a1.5 1.5 0 0 1-1.5-1.5v-8Z"
-                    stroke="currentColor"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    strokeWidth="1.7"
-                  />
-                  <circle cx="12" cy="12.5" r="3" stroke="currentColor" strokeWidth="1.7" />
+                {attachment.kind === "image" ? (
+                  <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[6px] object-cover" src={attachment.previewUrl} />
+                ) : attachment.kind === "video" ? (
+                  <video className="h-7 w-7 shrink-0 rounded-[6px] object-cover" muted playsInline preload="metadata" src={attachment.previewUrl} />
+                ) : (
+                  <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] bg-mist text-ink/70">
+                    <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                      <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+                      <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                      <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
+                    </svg>
+                  </div>
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">{attachmentBadge(attachment.kind)}</div>
+                  <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
+                </div>
+              </button>
+              <button
+                aria-label={`Remove ${attachment.fileName}`}
+                className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-white text-ink shadow-sm transition hover:bg-mist"
+                onClick={() => removeAttachment(attachment.id)}
+                type="button"
+              >
+                <svg aria-hidden="true" className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24">
+                  <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
                 </svg>
               </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="relative mt-1 flex flex-wrap items-center justify-between gap-1 px-0">
+        <div className="flex items-center gap-1">
+          <button
+            aria-expanded={promptPickerOpen}
+            aria-label="Add prompt"
+            className="relative flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => {
+              setPromptPickerOpen((current) => !current);
+              setFolderPickerOpen(false);
+            }}
+            title="Add prompt"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+            </svg>
+            {selectedPrompts.length > 0 ? (
+              <span className="absolute -right-1 -top-1 rounded-full bg-mist px-1.5 py-0.5 text-[9px] font-semibold leading-none text-ink/70">
+                {selectedPrompts.length}
+              </span>
+            ) : null}
+          </button>
+          <button
+            aria-label="Upload media"
+            className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!supportsMedia}
+            onClick={() => {
+              setPromptPickerOpen(false);
+              fileInputRef.current?.click();
+            }}
+            title={supportsMedia ? "Upload media" : "Switch to Gemini to upload media"}
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path d="M12 16V6M8.5 9.5 12 6l3.5 3.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+              <path d="M5 16.5V19h14v-2.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
+            </svg>
+          </button>
+          <button
+            aria-expanded={folderPickerOpen}
+            aria-label="Choose file from current folder"
+            className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!supportsMedia}
+            onClick={() => {
+              setPromptPickerOpen(false);
+              setFolderPickerOpen((current) => !current);
+            }}
+            title={supportsMedia ? "Choose file from current folder" : "Switch to Gemini to attach workspace files"}
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path
+                d="M4 7.5A1.5 1.5 0 0 1 5.5 6H10l1.4 1.5h7.1A1.5 1.5 0 0 1 20 9v8.5a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5v-10Z"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.6"
+              />
+              <path d="M8 12h8M12 8v8" stroke="currentColor" strokeLinecap="round" strokeWidth="1.6" />
+            </svg>
+          </button>
+          <button
+            aria-label={promptExpanded ? "Collapse prompt" : "Expand prompt"}
+            className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-ink transition hover:bg-mist"
+            onClick={() => setPromptExpanded((current) => !current)}
+            title={promptExpanded ? "Collapse prompt" : "Expand prompt"}
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              {promptExpanded ? (
+                <path
+                  d="M8 10l4-4l4 4M8 14l4 4l4-4"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.8"
+                />
+              ) : (
+                <path
+                  d="M14 4h6v6M10 20H4v-6M20 10V4h-6M4 14v6h6"
+                  stroke="currentColor"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth="1.8"
+                />
+              )}
+            </svg>
+          </button>
+          {selectedTextForReadAloud ? (
+            <button
+              aria-label="Read selected text aloud"
+              className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-[#1f6f78] transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={!providerSettings.apiKey || readingSelection || (activeTab === "live" ? !liveSendHandle : busy)}
+              onClick={() => void handleReadSelectedText()}
+              title={activeTab === "live" ? "Read selected text in Live" : "Generate read-aloud audio"}
+              type="button"
+            >
+              {readingSelection ? (
+                <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
+              ) : (
+                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <path d="M5 10v4h3l4 3.5v-11L8 10H5Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.7" />
+                  <path d="M15 9a4 4 0 0 1 0 6M17.5 6.5a7.5 7.5 0 0 1 0 11" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
+                </svg>
+              )}
+            </button>
           ) : null}
+        </div>
+        <div className="flex items-center gap-1">
           <button
             aria-label={activeTab === "live" ? "Send to live" : "Ask"}
-            className="flex h-10 w-10 items-center justify-center rounded-[4px] bg-ember text-ink transition hover:bg-ember/90 disabled:cursor-not-allowed disabled:opacity-50"
+            className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-ink transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
             disabled={
               activeTab === "live"
                 ? !liveSendHandle || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)
@@ -3306,15 +3290,15 @@ export function AIChatPanel({
         </div>
 
       {promptPickerOpen ? (
-          <div className="mt-3 flex max-h-[360px] w-full flex-col overflow-hidden rounded-[18px] border border-ink/10 bg-white p-3 shadow-[0_12px_28px_rgba(15,23,42,0.08)]">
-            <div className="mb-3 shrink-0 flex items-center justify-between gap-2">
+          <div className="absolute left-0 top-[calc(100%+0.25rem)] z-[80] flex max-h-[300px] w-full flex-col overflow-hidden rounded-[8px] bg-white p-2 shadow-[0_14px_30px_rgba(15,23,42,0.16)]">
+            <div className="mb-2 flex shrink-0 items-center justify-between gap-2">
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Prompt Library</div>
                 <div className="text-xs text-ink/55">Saved prompts</div>
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  className="rounded-full border border-ink/10 px-3 py-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-mist"
+                  className="rounded-[4px] bg-mist px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:bg-[#efe5d3]"
                   onClick={() => {
                     if (promptCreateOpen) {
                       resetPromptEditor();
@@ -3327,7 +3311,7 @@ export function AIChatPanel({
                   {promptCreateOpen ? "Close" : "Create"}
                 </button>
                 <button
-                  className="flex h-7 w-7 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                  className="flex h-7 w-7 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                   onClick={() => setPromptPickerOpen(false)}
                   type="button"
                 >
@@ -3338,14 +3322,14 @@ export function AIChatPanel({
               </div>
             </div>
             {promptCreateOpen ? (
-              <div className="mb-3 shrink-0 grid gap-2 rounded-[10px] border border-ink/10 bg-mist/50 p-3">
+              <div className="mb-2 grid shrink-0 gap-2 rounded-[6px] bg-mist/50 p-2">
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-ink/55">
                     {editingPromptId ? "Edit Prompt" : "Create Prompt"}
                   </div>
                   {editingPromptId ? (
                     <button
-                      className="rounded-full border border-ink/10 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-white"
+                      className="rounded-[4px] bg-white px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-ink transition hover:bg-mist"
                       onClick={resetPromptEditor}
                       type="button"
                     >
@@ -3354,20 +3338,20 @@ export function AIChatPanel({
                   ) : null}
                 </div>
                 <input
-                  className="rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:border-ink/30"
+                  className="rounded-[6px] border-0 bg-white px-2.5 py-1.5 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:bg-[#fffdf8]"
                   onChange={(event) => setPromptNameDraft(event.target.value)}
                   placeholder="Prompt name"
                   value={promptNameDraft}
                 />
                 <textarea
-                  className="min-h-28 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:border-ink/30"
+                  className="min-h-24 rounded-[6px] border-0 bg-white px-2.5 py-1.5 text-sm text-ink outline-none transition placeholder:text-ink/35 focus:bg-[#fffdf8]"
                   onChange={(event) => setPromptContentDraft(event.target.value)}
                   placeholder="Prompt content"
                   value={promptContentDraft}
                 />
                 <div className="flex justify-end">
                   <button
-                    className="rounded-[10px] bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-60"
+                    className="rounded-[4px] bg-ink px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-60"
                     disabled={creatingPrompt || !promptNameDraft.trim() || !promptContentDraft.trim()}
                     onClick={() => void savePromptTemplate()}
                     type="button"
@@ -3378,27 +3362,27 @@ export function AIChatPanel({
               </div>
             ) : null}
             <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pr-1 touch-pan-y">
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-1.5">
               {availablePrompts.map((item) => {
                 const selected = selectedPrompts.some((promptItem) => promptItem.id === item.id);
                 return (
                   <div className="relative" key={item.id}>
                     <button
-                      className={`flex h-[100px] w-[140px] flex-col overflow-hidden rounded-[12px] border px-4 py-4 text-left transition ${
-                        selected ? "border-ink bg-mist" : "border-ink/10 bg-[#fffdfa] hover:border-ink/20 hover:bg-mist"
+                      className={`flex h-[82px] w-[126px] flex-col overflow-hidden rounded-[6px] px-2.5 py-2 text-left transition ${
+                        selected ? "bg-mist text-ink" : "bg-[#fffdfa] text-ink hover:bg-mist"
                       }`}
                       onClick={() => addPromptTemplate(item)}
                       type="button"
                     >
                       <div className="min-w-0 pr-3">
                         <div className="line-clamp-2 break-words text-[10px] font-semibold leading-4 text-ink">{item.name}</div>
-                        <div className="mt-2 line-clamp-3 break-words text-[9px] leading-3 text-ink/50">{item.content}</div>
+                        <div className="mt-1 line-clamp-3 break-words text-[9px] leading-3 text-ink/50">{item.content}</div>
                       </div>
                     </button>
                     {!item.builtin ? (
                       <button
                         aria-label={`Edit ${item.name}`}
-                        className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-[8px] border border-ink/10 bg-white/95 text-ink transition hover:border-ink/20 hover:bg-mist"
+                        className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-[4px] bg-white/95 text-ink transition hover:bg-mist"
                         onClick={() => openPromptEditor(item)}
                         type="button"
                       >
@@ -3423,14 +3407,14 @@ export function AIChatPanel({
         ) : null}
 
         {folderPickerOpen ? (
-          <div className="mt-3 w-full rounded-[18px] border border-ink/10 bg-white p-3 shadow-[0_12px_28px_rgba(15,23,42,0.08)]">
-            <div className="mb-3 flex items-center justify-between gap-2">
+          <div className="absolute left-0 top-[calc(100%+0.25rem)] z-[80] w-full rounded-[8px] bg-white p-2 shadow-[0_14px_30px_rgba(15,23,42,0.16)]">
+            <div className="mb-2 flex items-center justify-between gap-2">
               <div>
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Current Folder Files</div>
                 <div className="text-xs text-ink/55">{currentFolderName}</div>
               </div>
               <button
-                className="flex h-7 w-7 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                className="flex h-7 w-7 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                 onClick={() => setFolderPickerOpen(false)}
                 type="button"
               >
@@ -3441,14 +3425,14 @@ export function AIChatPanel({
             </div>
             <div className="max-h-52 overflow-auto overscroll-contain pr-1">
               {currentFolderFiles.length === 0 ? (
-                <div className="rounded-[10px] border border-dashed border-ink/10 px-3 py-4 text-sm text-ink/45">
+                <div className="rounded-[6px] bg-mist/50 px-2 py-3 text-sm text-ink/45">
                   No image, audio, or video files in this folder yet.
                 </div>
               ) : (
                 <div className="grid gap-2 sm:grid-cols-2">
                   {currentFolderFiles.map((asset) => (
                     <button
-                      className="flex items-start justify-between gap-3 rounded-[14px] border border-ink/10 bg-[#fffdfa] px-3 py-3 text-left transition hover:border-ink/20 hover:bg-mist"
+                      className="flex items-start justify-between gap-2 rounded-[6px] bg-[#fffdfa] px-2 py-2 text-left transition hover:bg-mist"
                       key={asset.id}
                       onClick={() => addFolderAsset(asset)}
                       type="button"
@@ -3469,17 +3453,15 @@ export function AIChatPanel({
         ) : null}
       </div>
         </div>
+        ) : null}
       </div>
 
-      <div className={`${compactComposerChrome ? "mt-1" : "mt-4"} min-h-0 flex-1 transition-[margin] duration-200 ease-out`}>
+      <div className="relative mt-1 min-h-0 flex-1">
         <div
-          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/80 pb-0 pl-3 pr-0 pt-3"
+          className="h-full overflow-auto overscroll-contain rounded-[4px] bg-mist/75 p-2 pb-0"
           hidden={activeTab !== "chat"}
           onClick={() => {
             focusHistory();
-            if (!promptExpanded) {
-              setComposerCondensed(true);
-            }
           }}
           onPointerDown={focusHistory}
           onScroll={updateChatHistoryScrollState}
@@ -3487,7 +3469,7 @@ export function AIChatPanel({
           onWheel={focusHistory}
           ref={messagesContainerRef}
         >
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
             {messages.map((message) => {
               const edits = message.substitutions ?? [];
               const generatedImageAttachments =
@@ -3508,19 +3490,21 @@ export function AIChatPanel({
                   : (message.attachments ?? []);
               return (
                 <div
-                  className={`max-w-[92%] rounded-[4px] px-3 py-2 text-sm ${message.role === "assistant" ? "bg-white" : "self-end bg-ink text-white"}`}
+                  className={`max-w-[92%] rounded-[4px] px-2.5 py-1.5 text-[13px] leading-5 ${
+                    message.role === "assistant" ? "bg-white text-ink" : "self-end bg-[#fff7e8] text-ink"
+                  }`}
                   key={message.id}
                   ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
-                  style={message.role === "user" ? { minWidth: "min(400px, 92%)" } : undefined}
+                  style={message.role === "user" ? { minWidth: "min(320px, 92%)" } : undefined}
                 >
                   {message.prompts?.length || compactAttachments.length ? (
-                    <div className="flex gap-2 overflow-x-auto overscroll-contain pb-1">
+                    <div className="flex gap-1.5 overflow-x-auto overscroll-contain pb-1">
                       {message.prompts?.map((promptItem) => (
                         <button
-                          className={`shrink-0 rounded-[10px] border px-3 py-2 text-left text-xs transition ${
+                          className={`shrink-0 rounded-[6px] px-2 py-1.5 text-left text-xs transition ${
                             message.role === "assistant"
-                              ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
-                              : "border-white/10 bg-white/10 text-white hover:bg-white/15"
+                              ? "bg-mist text-ink hover:bg-[#efe5d3]"
+                              : "bg-white/70 text-ink hover:bg-white"
                           }`}
                           key={promptItem.id}
                           onClick={() => setPreviewPrompt(promptItem)}
@@ -3533,15 +3517,15 @@ export function AIChatPanel({
                       {compactAttachments.map((attachment) => {
                         const cardTone =
                           message.role === "assistant"
-                            ? "border-ink/10 bg-mist text-ink hover:border-ink/20"
-                            : "border-white/10 bg-white/10 text-white hover:bg-white/15";
-                        const labelTone = message.role === "assistant" ? "text-ink/45" : "text-white/65";
-                        const iconTone = message.role === "assistant" ? "bg-white text-ink/70" : "bg-white/10 text-white/80";
+                            ? "bg-mist text-ink hover:bg-[#efe5d3]"
+                            : "bg-white/70 text-ink hover:bg-white";
+                        const labelTone = "text-ink/45";
+                        const iconTone = "bg-white text-ink/70";
                         const cameraCapture =
                           message.role === "user" && (attachment.fileName.startsWith("photo-") || attachment.fileName.startsWith("video-"));
                         return (
                           <button
-                            className={`flex h-11 w-[172px] shrink-0 items-center gap-2 overflow-hidden rounded-[10px] border px-2 py-2 text-left transition ${cardTone}`}
+                            className={`flex h-10 w-[156px] shrink-0 items-center gap-2 overflow-hidden rounded-[6px] px-2 py-1.5 text-left transition ${cardTone}`}
                             data-chat-camera-media={cameraCapture ? "true" : undefined}
                             data-chat-camera-media-id={cameraCapture ? attachment.id : undefined}
                             disabled={!attachment.url}
@@ -3553,13 +3537,13 @@ export function AIChatPanel({
                             type="button"
                           >
                             {attachment.kind === "image" && attachment.url ? (
-                              <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[8px] object-cover" src={attachment.url} />
+                              <img alt={attachment.fileName} className="h-7 w-7 shrink-0 rounded-[6px] object-cover" src={attachment.url} />
                             ) : null}
                             {attachment.kind === "video" && attachment.url ? (
-                              <video className="h-7 w-7 shrink-0 rounded-[8px] object-cover" muted playsInline preload="metadata" src={attachment.url} />
+                              <video className="h-7 w-7 shrink-0 rounded-[6px] object-cover" muted playsInline preload="metadata" src={attachment.url} />
                             ) : null}
                             {attachment.kind === "audio" ? (
-                              <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] ${iconTone}`}>
+                              <div className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-[6px] ${iconTone}`}>
                                 <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
                                   <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
                                   <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
@@ -3579,19 +3563,19 @@ export function AIChatPanel({
                     </div>
                   ) : null}
                   {generatedImageAttachments.length > 0 ? (
-                    <div className={`${message.prompts?.length || compactAttachments.length ? "mt-3" : ""} grid gap-3 sm:grid-cols-2`}>
+                    <div className={`${message.prompts?.length || compactAttachments.length ? "mt-2" : ""} grid gap-2 sm:grid-cols-2`}>
                       {generatedImageAttachments.map((attachment) => renderGeneratedImageCard(attachment))}
                     </div>
                   ) : null}
                   {generatedAudioAttachments.length > 0 ? (
                     <div
                       className={`${
-                        message.prompts?.length || compactAttachments.length || generatedImageAttachments.length ? "mt-3" : ""
-                      } grid gap-2`}
+                        message.prompts?.length || compactAttachments.length || generatedImageAttachments.length ? "mt-2" : ""
+                      } grid gap-1.5`}
                     >
                       {generatedAudioAttachments.map((attachment) => (
-                        <div className="rounded-[8px] border border-ink/10 bg-mist/70 px-3 py-3" key={attachment.id}>
-                          <div className="mb-2 flex items-center justify-between gap-2">
+                        <div className="rounded-[6px] bg-mist/70 px-2 py-2" key={attachment.id}>
+                          <div className="mb-1.5 flex items-center justify-between gap-2">
                             <div className="min-w-0">
                               <div className="text-[9px] font-semibold uppercase tracking-[0.14em] text-ink/45">Read aloud</div>
                               <div className="truncate text-xs font-medium text-ink">{attachment.fileName}</div>
@@ -3604,15 +3588,15 @@ export function AIChatPanel({
                   ) : null}
                   <div
                     className={`${
-                      message.prompts?.length || compactAttachments.length || generatedImageAttachments.length || generatedAudioAttachments.length ? "mt-3" : ""
+                      message.prompts?.length || compactAttachments.length || generatedImageAttachments.length || generatedAudioAttachments.length ? "mt-2" : ""
                     } whitespace-pre-wrap break-words`}
                   >
                     {message.content}
                   </div>
                   {message.role === "assistant" && edits.length > 0 ? (
-                    <div className="mt-3 grid gap-2">
+                    <div className="mt-2 grid gap-1.5">
                       {edits.map((edit, index) => (
-                        <div className="rounded-[14px] border border-ink/10 bg-[#fff7e8] px-3 py-3" key={`${message.id}:edit:${index}`}>
+                        <div className="rounded-[6px] bg-[#fff7e8] px-2 py-2" key={`${message.id}:edit:${index}`}>
                           <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Suggested replace</div>
                           <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#8c5c54] line-through">{edit.find}</div>
                           <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#1f6f78]">{edit.replace}</div>
@@ -3623,7 +3607,7 @@ export function AIChatPanel({
                 </div>
               );
             })}
-            <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 300 }} />
+            <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 128 }} />
           </div>
         </div>
 
@@ -3661,11 +3645,26 @@ export function AIChatPanel({
             speechPrompt={composePrompt(prompt, selectedPrompts)}
           />
         </div>
+        {showLatestMessageShortcut ? (
+          <button
+            aria-label="Scroll to bottom"
+            className={`absolute bottom-3 right-3 z-20 flex h-9 w-9 items-center justify-center rounded-[6px] bg-white text-ink shadow-[0_10px_24px_rgba(15,23,42,0.14)] transition hover:bg-mist ${
+              latestMessageShortcutFlashing ? "animate-pulse ring-2 ring-[#bb3e2d]/30" : ""
+            }`}
+            onClick={scrollToLatestMessage}
+            title="Scroll to bottom"
+            type="button"
+          >
+            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+              <path d="M12 5v14M7 14l5 5l5-5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8" />
+            </svg>
+          </button>
+        ) : null}
       </div>
 
       {previewAttachment ? (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/45 p-4">
-          <div className="max-h-[92vh] w-full max-w-[90vw] overflow-auto rounded-[16px] border border-white/10 bg-[#fff9ef] p-4 shadow-[0_20px_42px_rgba(15,23,42,0.24)]">
+          <div className="max-h-[92vh] w-full max-w-[90vw] overflow-auto rounded-[8px] bg-[#fff9ef] p-3 shadow-[0_18px_36px_rgba(15,23,42,0.2)]">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">{attachmentBadge(previewAttachment.kind)}</div>
@@ -3678,7 +3677,7 @@ export function AIChatPanel({
                 {previewAttachment.kind === "image" ? (
                   <button
                     aria-label="Upload image to current folder"
-                    className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                     onClick={confirmUploadPreviewImage}
                     title="Upload to current folder"
                     type="button"
@@ -3690,7 +3689,7 @@ export function AIChatPanel({
                 ) : null}
                 <button
                   aria-label="Close preview"
-                  className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                  className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                   onClick={() => setPreviewAttachment(null)}
                   type="button"
                 >
@@ -3700,7 +3699,7 @@ export function AIChatPanel({
                 </button>
               </div>
             </div>
-            <div className="mt-3 flex justify-center overflow-auto rounded-[12px] border border-ink/10 bg-black/5 p-2">
+            <div className="mt-2 flex justify-center overflow-auto rounded-[8px] bg-black/5 p-2">
               {previewAttachment.kind === "image" ? (
                 <img alt={previewAttachment.fileName} className="h-auto max-w-[90%] object-contain" src={previewAttachment.previewUrl} />
               ) : previewAttachment.kind === "video" ? (
@@ -3714,14 +3713,14 @@ export function AIChatPanel({
       ) : null}
       {previewPrompt ? (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/45 p-4">
-          <div className="w-full max-w-lg rounded-[16px] border border-white/10 bg-[#fff9ef] p-4 shadow-[0_20px_42px_rgba(15,23,42,0.24)]">
+          <div className="w-full max-w-lg rounded-[8px] bg-[#fff9ef] p-3 shadow-[0_18px_36px_rgba(15,23,42,0.2)]">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Prompt</div>
                 <div className="truncate text-sm font-medium text-ink">{previewPrompt.name}</div>
               </div>
               <button
-                className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                 onClick={() => setPreviewPrompt(null)}
                 type="button"
               >
@@ -3730,14 +3729,14 @@ export function AIChatPanel({
                 </svg>
               </button>
             </div>
-            <div className="mt-3 max-h-[320px] overflow-auto whitespace-pre-wrap rounded-[12px] border border-ink/10 bg-white px-3 py-3 text-sm leading-6 text-ink">
+            <div className="mt-2 max-h-[320px] overflow-auto whitespace-pre-wrap rounded-[8px] bg-white px-3 py-2 text-sm leading-6 text-ink">
               {previewPrompt.content}
             </div>
           </div>
         </div>
       ) : null}
       <div
-        className={`pointer-events-none absolute left-3 top-3 z-20 inline-flex max-w-[calc(100%_-_24px)] overflow-hidden rounded-[8px] border border-white/20 bg-black shadow-[0_14px_32px_rgba(0,0,0,0.28)] transition-opacity ${
+        className={`pointer-events-none absolute left-3 top-3 z-20 inline-flex max-w-[calc(100%_-_24px)] overflow-hidden rounded-[8px] bg-black shadow-[0_14px_32px_rgba(0,0,0,0.28)] transition-opacity ${
           cameraPreviewVisible ? "opacity-100" : "opacity-0"
         }`}
         data-chat-camera-preview="true"
@@ -3747,7 +3746,7 @@ export function AIChatPanel({
       </>
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center p-6 text-center">
-          <div className="max-w-md rounded-[4px] border border-ink/10 bg-mist/40 px-4 py-6 text-sm text-ink/65">
+          <div className="max-w-md rounded-[4px] bg-mist/40 px-4 py-4 text-sm text-ink/65">
             Live talk is only available with the Gemini provider.
           </div>
         </div>

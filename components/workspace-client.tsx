@@ -2374,12 +2374,12 @@ function WorkspaceClientContent() {
                 aiPanelMounted ? (
                   <div
                     aria-hidden={activeWindow !== "ai"}
-                    className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-4"
+                    className="pointer-events-none fixed inset-x-0 bottom-0 top-0 z-40 flex items-end justify-center overscroll-contain p-0 sm:inset-0 sm:items-end sm:justify-end sm:p-2"
                     hidden={activeWindow !== "ai"}
                     style={activeWindow !== "ai" ? { display: "none" } : undefined}
                   >
                     <div
-                      className="pointer-events-auto w-full max-w-[100vw] rounded-t-[16px] bg-[#fff9ef] shadow-[0_16px_36px_rgba(15,23,42,0.08)] sm:w-[600px] sm:rounded-[4px]"
+                      className="pointer-events-auto w-full max-w-[100vw] rounded-t-[10px] bg-[#fff9ef] shadow-[0_10px_26px_rgba(15,23,42,0.08)] sm:w-[560px] sm:rounded-[4px]"
                       data-ai-panel="true"
                       onFocusCapture={expandAiPanelToUserHeight}
                       onPointerDownCapture={expandAiPanelToUserHeight}

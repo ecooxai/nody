@@ -249,7 +249,7 @@ export default {
         const requestPayload = await request.json() as AIRequest;
         const settings = (await getSettings(env.DB, userId)) ?? createDefaultSettings();
         if (url.searchParams.get("stream") === "1") {
-          return streamProvider(env, userId, settings, requestPayload);
+          return await streamProvider(env, userId, settings, requestPayload);
         }
         return json(await askProvider(env, userId, settings, requestPayload));
       }

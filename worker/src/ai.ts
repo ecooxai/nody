@@ -107,13 +107,7 @@ export async function streamProvider(env: Env, userId: string, settings: Provide
   }
   if (request.mode === "image" || request.mode === "tts") {
     const response = await askProvider(env, userId, settings, request);
-    const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode(`event: done\ndata: ${JSON.stringify(response)}\n\n`));
-        controller.close();
-      },
-    });
-    return new Response(stream, { headers: streamHeaders });
+    return doneStream(response);
   }
 
   const upstream =
@@ -122,7 +116,13 @@ export async function streamProvider(env: Env, userId: string, settings: Provide
       : await askOpenAIStream(settings, request);
 
   if (!upstream.ok) {
-    throw new Error(await readProviderError(upstream, `${settings.provider === "gemini" ? "Gemini" : "OpenAI"} request failed`));
+    const streamError = await readProviderError(upstream, `${settings.provider === "gemini" ? "Gemini" : "OpenAI"} streaming request failed`);
+    try {
+      return doneStream(await askProvider(env, userId, settings, request));
+    } catch (error) {
+      const fallbackError = error instanceof Error ? error.message : "Fallback request failed";
+      throw new Error(`${streamError}; fallback failed: ${fallbackError}`);
+    }
   }
   if (!upstream.body) {
     throw new Error("Provider stream did not return a readable body.");
@@ -150,6 +150,16 @@ export async function streamProvider(env: Env, userId: string, settings: Provide
     },
   });
 
+  return new Response(stream, { headers: streamHeaders });
+}
+
+function doneStream(response: AIResponse) {
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(`event: done\ndata: ${JSON.stringify(response)}\n\n`));
+      controller.close();
+    },
+  });
   return new Response(stream, { headers: streamHeaders });
 }
 

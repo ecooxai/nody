@@ -1832,19 +1832,7 @@ export function LiveTalkPanel({
   const updateLiveHistoryScrollState = useCallback(() => {
     const container = liveHistoryRef.current;
     if (!container) return;
-    const activeVideo = container.querySelector<HTMLElement>('[data-active-live-video="true"]');
-    const liveTurns = container.querySelectorAll<HTMLElement>('[data-live-turn="true"]');
-    const latestTurn = liveTurns[liveTurns.length - 1];
-    const containerRect = container.getBoundingClientRect();
-    const activeVideoRect = activeVideo?.getBoundingClientRect();
-    const latestTurnRect = latestTurn?.getBoundingClientRect();
-    const activeVideoInView = Boolean(
-      activeVideoRect && activeVideoRect.bottom <= containerRect.bottom + 48 && activeVideoRect.bottom >= containerRect.top,
-    );
-    const latestTurnInView = Boolean(
-      latestTurnRect && latestTurnRect.top >= containerRect.top - 48 && latestTurnRect.top <= containerRect.bottom,
-    );
-    const nearLatest = container.scrollHeight - container.scrollTop - container.clientHeight < 48 || activeVideoInView || latestTurnInView;
+    const nearLatest = container.scrollHeight - container.scrollTop - container.clientHeight < 48;
     wasNearLiveHistoryBottomRef.current = nearLatest;
     setLatestMessageAvailable(!nearLatest);
   }, [setLatestMessageAvailable]);
@@ -1853,18 +1841,7 @@ export function LiveTalkPanel({
     const container = liveHistoryRef.current;
     if (!container) return;
     onHistoryInteract?.();
-    const activeVideo = container.querySelector<HTMLElement>('[data-active-live-video="true"]');
-    if (activeVideo) {
-      activeVideo.scrollIntoView({ behavior: "smooth", block: "start" });
-    } else {
-      const liveTurns = container.querySelectorAll<HTMLElement>('[data-live-turn="true"]');
-      const latestTurn = liveTurns[liveTurns.length - 1];
-      if (latestTurn) {
-        latestTurn.scrollIntoView({ behavior: "smooth", block: "start" });
-      } else {
-        container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
-      }
-    }
+    container.scrollTo({ top: container.scrollHeight, behavior: "smooth" });
     wasNearLiveHistoryBottomRef.current = true;
     setLatestMessageAvailable(false);
   }, [onHistoryInteract, setLatestMessageAvailable]);
@@ -4402,28 +4379,27 @@ export function LiveTalkPanel({
     "Live talk ready.",
     "Sent.",
   ]);
-  const showStatus = !hiddenStatuses.has(status);
+  const showStandbyNotice = status.toLowerCase().includes("standby listening");
+  const showStatus = !hiddenStatuses.has(status) && !showStandbyNotice;
+  const bottomNoticeContent = historyNotice?.content ?? (showStandbyNotice ? "Standby Listening ...." : null);
 
   return (
     <div className="relative flex h-full min-h-0 flex-col gap-0 bg-transparent p-0">
       {showStatus ? (
-        <div className="bg-mist/40 px-2 py-1 text-sm text-ink/70">{status}</div>
+        <div className="pointer-events-none absolute left-2 top-2 z-20 rounded-[4px] bg-white/90 px-2 py-0.5 text-xs text-ink/70 shadow-[0_8px_18px_rgba(15,23,42,0.10)]">
+          {status}
+        </div>
       ) : null}
 
       <div
-        className="min-h-0 flex-1 overflow-auto bg-transparent p-0"
+        className="min-h-0 flex-1 overflow-auto rounded-[4px] bg-mist/75 p-2 pb-0"
         onPointerDown={onHistoryInteract}
         onScroll={updateLiveHistoryScrollState}
         onTouchMove={onHistoryInteract}
         onWheel={onHistoryInteract}
         ref={liveHistoryRef}
       >
-        <div className="flex flex-col gap-2">
-          {orderedTurns.length === 0 ? (
-            <div className="px-2 py-3 text-sm text-ink/45">
-              The conversation will appear here once Gemini starts speaking.
-            </div>
-          ) : null}
+        <div className="flex min-h-full flex-col gap-1.5">
           {orderedTurns.map((turn) => {
             if (userAudioDisplay.foldedIds.has(turn.id)) {
               return null;
@@ -4432,19 +4408,19 @@ export function LiveTalkPanel({
             const videoExpanded = expandedVideoTurnIds.has(turn.id);
             return (
               <div
-                className={`rounded-[4px] px-3 py-2 text-sm ${
-                  turn.role === "assistant" ? "bg-white" : turn.role === "user" ? "self-end bg-ink text-white" : "bg-mist text-ink/60"
+                className={`rounded-[4px] px-2.5 py-1.5 text-[13px] leading-5 ${
+                  turn.role === "assistant" ? "bg-white text-ink" : turn.role === "user" ? "self-end bg-[#fff7e8] text-ink" : "bg-mist text-ink/60"
                 } ${turn.role === "user" ? "max-w-[92%]" : "max-w-[92%]"}`}
                 data-active-live-video={turn.id === activeVideoTurnId && turn.videoStream ? "true" : undefined}
                 data-live-turn="true"
                 key={turn.id}
-                style={turn.role === "user" ? { minWidth: "min(400px, 92%)" } : undefined}
+                style={turn.role === "user" ? { minWidth: "min(320px, 92%)" } : undefined}
               >
                 {turn.images?.length ? (
                   <div className={`${turn.content || turn.videoStream ? "mb-2" : ""} grid gap-2`}>
                     {turn.images.map((image) => (
                       <button
-                        className="flex flex-col overflow-hidden rounded-[8px] border border-ink/10 bg-[#f7f1e6] p-3 text-left"
+                        className="flex flex-col overflow-hidden rounded-[6px] bg-[#f7f1e6] p-2 text-left transition hover:opacity-90"
                         data-live-generated-image={image.origin === "generated" ? "true" : undefined}
                         data-live-generated-image-id={image.origin === "generated" ? image.id : undefined}
                         key={image.id}
@@ -4466,7 +4442,7 @@ export function LiveTalkPanel({
                 {turn.content ? <div className="whitespace-pre-wrap break-words">{turn.content}</div> : null}
                 {turn.videoStream ? (
                   <div
-                    className="group relative mt-2 inline-flex max-w-full overflow-hidden rounded-[8px] border border-white/10 bg-black/20"
+                    className="group relative mt-2 inline-flex max-w-full overflow-hidden rounded-[6px] bg-black/20"
                     onClick={() => setFocusedVideoTurnId(turn.id)}
                     role="presentation"
                   >
@@ -4536,9 +4512,9 @@ export function LiveTalkPanel({
                   </div>
                 ) : null}
                 {turn.role === "assistant" && turn.substitutions?.length ? (
-                  <div className="mt-3 grid gap-2">
+                  <div className="mt-2 grid gap-1.5">
                     {turn.substitutions.map((edit, index) => (
-                      <div className="rounded-[14px] border border-ink/10 bg-[#fff7e8] px-3 py-3" key={`${turn.id}:edit:${index}`}>
+                      <div className="rounded-[6px] bg-[#fff7e8] px-2 py-2" key={`${turn.id}:edit:${index}`}>
                         <div className="text-[10px] font-semibold uppercase tracking-[0.16em] text-ink/45">Suggested replace</div>
                         <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#8c5c54] line-through">{edit.find}</div>
                         <div className="mt-2 whitespace-pre-wrap break-words text-sm text-[#1f6f78]">{edit.replace}</div>
@@ -4547,7 +4523,7 @@ export function LiveTalkPanel({
                     {onApplyEdits ? (
                       <div className="flex justify-end">
                         <button
-                          className="rounded-full border border-ink/10 bg-mist px-3 py-2 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:border-ink/20 hover:bg-[#efe5d3]"
+                          className="rounded-[4px] bg-mist px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em] text-ink transition hover:bg-[#efe5d3]"
                           onClick={() => onApplyEdits(turn.substitutions ?? [])}
                           type="button"
                         >
@@ -4558,45 +4534,50 @@ export function LiveTalkPanel({
                   </div>
                 ) : null}
                 {turn.audioUrl && (turn.role !== "user" || userAudioDisplay.inlineIds.has(turn.id)) ? (
-                  <audio
-                    className={`mt-2 h-10 w-full ${turn.role === "user" ? "[color-scheme:dark]" : ""}`}
-                    controls
-                    preload="metadata"
-                    src={turn.audioUrl}
-                  />
+                  <audio className="mt-2 h-10 w-full" controls preload="metadata" src={turn.audioUrl} />
                 ) : null}
               </div>
             );
           })}
           {userAudioDisplay.foldedClips.length > 0 ? (
-            <details className="self-end rounded-[4px] bg-ink px-3 py-2 text-sm text-white" style={{ minWidth: "min(400px, 92%)", maxWidth: "92%" }}>
-              <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.14em] text-white/75">
+            <details className="self-end rounded-[4px] bg-[#fff7e8] px-2.5 py-1.5 text-[13px] leading-5 text-ink" style={{ minWidth: "min(320px, 92%)", maxWidth: "92%" }}>
+              <summary className="cursor-pointer select-none text-xs font-semibold uppercase tracking-[0.14em] text-ink/55">
                 User audio clips ({userAudioDisplay.foldedClips.length})
               </summary>
-              <div className="mt-3 grid gap-3">
+              <div className="mt-2 grid gap-2">
                 {userAudioDisplay.foldedClips.map((clip, index) => (
-                  <div className="rounded-[8px] border border-white/10 bg-white/10 p-2" key={clip.id}>
-                    <div className="mb-2 truncate text-xs text-white/75">
+                  <div className="rounded-[6px] bg-white/70 p-2" key={clip.id}>
+                    <div className="mb-2 truncate text-xs text-ink/55">
                       {index + 1}. {clip.label}
                     </div>
-                    <audio className="h-10 w-full [color-scheme:dark]" controls preload="metadata" src={clip.audioUrl} />
+                    <audio className="h-10 w-full" controls preload="metadata" src={clip.audioUrl} />
                   </div>
                 ))}
               </div>
             </details>
           ) : null}
-          {historyNotice ? (
-            <div className="self-center rounded-[4px] bg-mist/80 px-2 py-1 text-xs text-ink/65" key={historyNotice.id}>
-              {historyNotice.content}
+          {orderedTurns.length === 0 ? (
+            <div className="mt-auto px-1 py-2 text-sm text-ink/45">
+              Live transcript history appears here once Gemini starts speaking.
             </div>
           ) : null}
-          <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 300 }} />
+          {orderedTurns.length > 0 ? <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 128 }} /> : null}
         </div>
       </div>
+      {bottomNoticeContent ? (
+        <div className="pointer-events-none absolute inset-x-2 bottom-3 z-20 flex justify-center" key={historyNotice?.id ?? "standby-listening-notice"}>
+          <div
+            aria-live={showStandbyNotice && !historyNotice ? "polite" : undefined}
+            className="rounded-[4px] bg-white/90 px-2 py-1 text-xs text-ink/65 shadow-[0_8px_18px_rgba(15,23,42,0.10)]"
+          >
+            {bottomNoticeContent}
+          </div>
+        </div>
+      ) : null}
 
       {previewImage ? (
         <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/45 p-4">
-          <div className="max-h-[92vh] w-full max-w-[90vw] overflow-auto rounded-[16px] border border-white/10 bg-[#fff9ef] p-4 shadow-[0_20px_42px_rgba(15,23,42,0.24)]">
+          <div className="max-h-[92vh] w-full max-w-[90vw] overflow-auto rounded-[8px] bg-[#fff9ef] p-3 shadow-[0_18px_36px_rgba(15,23,42,0.2)]">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-[10px] font-semibold uppercase tracking-[0.18em] text-ink/45">Image</div>
@@ -4609,7 +4590,7 @@ export function LiveTalkPanel({
                 {onUploadImageToCurrentFolder ? (
                   <button
                     aria-label="Upload image to current folder"
-                    className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                    className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                     onClick={confirmUploadPreviewImage}
                     title="Upload to current folder"
                     type="button"
@@ -4621,7 +4602,7 @@ export function LiveTalkPanel({
                 ) : null}
                 <button
                   aria-label="Close preview"
-                  className="flex h-8 w-8 items-center justify-center rounded-full border border-ink/10 bg-white text-ink transition hover:border-ink/20 hover:bg-mist"
+                  className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-white text-ink transition hover:bg-mist"
                   onClick={() => setPreviewImage(null)}
                   type="button"
                 >
@@ -4631,7 +4612,7 @@ export function LiveTalkPanel({
                 </button>
               </div>
             </div>
-            <div className="mt-3 flex justify-center overflow-auto rounded-[12px] border border-ink/10 bg-black/5 p-2">
+            <div className="mt-2 flex justify-center overflow-auto rounded-[8px] bg-black/5 p-2">
               <img alt={previewImage.fileName} className="h-auto max-w-[90%] object-contain" src={previewImage.url} />
             </div>
           </div>

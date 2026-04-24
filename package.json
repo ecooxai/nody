@@ -19,8 +19,8 @@
     "test:watch": "vitest",
     "worker:migrate:local": "wrangler d1 migrations apply nody-db --local --config worker/wrangler.jsonc",
     "worker:migrate:remote": "set -a; . ./.env.deploy; set +a; wrangler d1 migrations apply nody-db --remote --config worker/wrangler.jsonc",
-    "worker:check": "set -a; . ./.env.deploy; set +a; wrangler deploy --dry-run --config worker/wrangler.jsonc",
-    "worker:deploy": "set -a; . ./.env.deploy; set +a; wrangler deploy --config worker/wrangler.jsonc",
+    "worker:check": "set -a; . ./.env.deploy; set +a; wrangler deploy --dry-run --config worker/wrangler.jsonc --experimental-autoconfig=false",
+    "worker:deploy": "set -a; . ./.env.deploy; set +a; wrangler deploy --config worker/wrangler.jsonc --experimental-autoconfig=false",
     "worker:types": "wrangler types worker/src/env.d.ts --config worker/wrangler.jsonc"
   },
   "dependencies": {
