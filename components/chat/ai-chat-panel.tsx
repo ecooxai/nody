@@ -935,6 +935,15 @@ export function AIChatPanel({
   const selectedTextForReadAloud = selectedText?.trim() ?? "";
   const liveDisconnected = activeTab === "live" && !liveSessionState.listening;
   const activeLiveMicrophoneLevel = activeTab === "live" && liveMicrophoneEnabled ? liveMicrophoneLevel : 0;
+  const liveSpeechAttachments: LiveSendAttachment[] = attachments
+    .filter((attachment) => attachment.kind === "image" || attachment.kind === "video")
+    .map((attachment) => ({
+      kind: attachment.kind,
+      fileName: attachment.fileName,
+      mimeType: attachment.mimeType,
+      file: attachment.file,
+      url: attachment.assetUrl ?? attachment.previewUrl,
+    }));
 
   const triggerLatestMessageShortcutFlash = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -3702,7 +3711,8 @@ export function AIChatPanel({
             onUploadImageToCurrentFolder={onUploadImageToCurrentFolder}
             providerSettings={providerSettings}
             sessionRequested={supportsLive && liveConnectionRequested}
-            speechPrompt={composePrompt(prompt, selectedPrompts)}
+            speechAttachments={liveSpeechAttachments}
+            speechPrompt={composeLivePrompt(prompt, selectedPrompts, attachments)}
           />
         </div>
         {showLatestMessageShortcut ? (
