@@ -96,6 +96,7 @@ const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
 const LIVE_STANDBY_PREROLL_MS = 5_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
 const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
+const LIVE_STANDBY_SPEECH_PREROLL_MS = 2_000;
 const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
 const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
 const LIVE_STANDBY_VOICE_TRIGGER_MS = 2_000;
@@ -2192,13 +2193,14 @@ export function LiveTalkPanel({
               standbyVoiceBurstTimesRef.current = [];
               standbyVoiceBurstActiveRef.current = false;
               const speechStartChunks: typeof standbyPreRollRef.current = [];
+              const speechStartTargetMs = LIVE_STANDBY_VOICE_TRIGGER_MS + LIVE_STANDBY_SPEECH_PREROLL_MS + 500;
               let speechStartDurationMs = 0;
               for (let index = standbyPreRollRef.current.length - 1; index >= 0; index -= 1) {
                 const chunk = standbyPreRollRef.current[index];
                 if (!chunk) continue;
                 speechStartChunks.unshift(chunk);
                 speechStartDurationMs += chunk.durationMs;
-                if (speechStartDurationMs >= LIVE_STANDBY_VOICE_TRIGGER_MS + 500) {
+                if (speechStartDurationMs >= speechStartTargetMs) {
                   break;
                 }
               }
