@@ -84,9 +84,18 @@ type MicrophoneSource = {
   label: string;
 };
 
+type RawAudioRecorderSession = {
+  audioContext: AudioContext;
+  chunks: Float32Array[];
+  processor: ScriptProcessorNode;
+  sampleRate: number;
+  sinkGain: GainNode;
+  source: MediaStreamAudioSourceNode;
+  stream: MediaStream;
+};
+
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
-const AUDIO_RECORDING_BITS_PER_SECOND = 192_000;
-const AUDIO_RECORDING_SEND_GAIN = 3;
+const AUDIO_RECORDING_TARGET_SAMPLE_RATE = 16_000;
 const SPEECH_CAPTURE_SAMPLE_RATE = 48_000;
 const SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
 const SPEECH_LOW_PASS_CUTOFF_HZ = 7_000;
@@ -106,11 +115,15 @@ function buildSpeechMicAudioConstraints(settings: LiveRecordingSettings): MediaT
   return {
     echoCancellation: settings.echoCancellation,
     noiseSuppression: settings.noiseSuppression,
-    autoGainControl: false,
+    autoGainControl: settings.autoGainControl,
     channelCount: { ideal: 1 },
     sampleRate: { ideal: SPEECH_CAPTURE_SAMPLE_RATE },
     sampleSize: { ideal: 16 },
   };
+}
+
+function normalizeRecordingGain(value: number) {
+  return [1, 2, 3, 4].includes(value) ? value : defaultLiveRecordingSettings.recordingGain;
 }
 
 function preferSpeechQualityAudio(stream: MediaStream) {
@@ -434,6 +447,34 @@ function createSpeechAudioContext() {
   }
 }
 
+function concatenateFloat32Arrays(chunks: Float32Array[]) {
+  const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+  const output = new Float32Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return output;
+}
+
+function resampleFloat32Array(input: Float32Array, inputRate: number, outputRate: number) {
+  if (inputRate === outputRate) return input;
+  const ratio = outputRate / inputRate;
+  const outputLength = Math.max(1, Math.round(input.length * ratio));
+  const output = new Float32Array(outputLength);
+
+  for (let index = 0; index < outputLength; index += 1) {
+    const sourceIndex = index / ratio;
+    const left = Math.floor(sourceIndex);
+    const right = Math.min(left + 1, input.length - 1);
+    const weight = sourceIndex - left;
+    output[index] = (input[left] ?? 0) * (1 - weight) + (input[right] ?? 0) * weight;
+  }
+
+  return output;
+}
+
 function highPassSpeechSamples(samples: Float32Array, sampleRate: number) {
   if (samples.length === 0) return samples;
 
@@ -580,11 +621,10 @@ async function normalizeRecordingBlob(blob: Blob) {
       return { blob, extension: recordingExtensionForMimeType(blob.type), mimeType: blob.type || "audio/webm" };
     }
 
-    const cleaned = cleanSpeechSamples(mono, decoded.sampleRate);
-    const amplified = amplifySpeechSamples(cleaned, AUDIO_RECORDING_SEND_GAIN);
+    const resampled = resampleFloat32Array(mono, decoded.sampleRate, AUDIO_RECORDING_TARGET_SAMPLE_RATE);
 
     return {
-      blob: new Blob([encodeMonoPcm16Wav(amplified, decoded.sampleRate)], { type: "audio/wav" }),
+      blob: new Blob([encodeMonoPcm16Wav(resampled, AUDIO_RECORDING_TARGET_SAMPLE_RATE)], { type: "audio/wav" }),
       extension: "wav",
       mimeType: "audio/wav",
     };
@@ -833,6 +873,7 @@ export function AIChatPanel({
   const latestAssistantMessageRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const rawAudioRecorderRef = useRef<RawAudioRecorderSession | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
   const recordingTargetRef = useRef<"chat" | "live">("chat");
@@ -1307,6 +1348,7 @@ export function AIChatPanel({
     () => () => {
       attachmentsRef.current.forEach(revokeAttachmentPreview);
       mediaRecorderRef.current?.stop?.();
+      stopRawAudioRecorder();
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
       if (microphoneLongPressTimerRef.current) {
         window.clearTimeout(microphoneLongPressTimerRef.current);
@@ -1330,6 +1372,67 @@ export function AIChatPanel({
   const stopRecordingStream = () => {
     mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     mediaStreamRef.current = null;
+  };
+
+  const stopRawAudioRecorder = () => {
+    const session = rawAudioRecorderRef.current;
+    if (!session) return;
+    session.processor.onaudioprocess = null;
+    session.processor.disconnect();
+    session.sinkGain.disconnect();
+    session.source.disconnect();
+    session.stream.getTracks().forEach((track) => track.stop());
+    void session.audioContext.close().catch(() => undefined);
+    rawAudioRecorderRef.current = null;
+    if (mediaStreamRef.current === session.stream) {
+      mediaStreamRef.current = null;
+    }
+  };
+
+  const createRawAudioRecorder = async (deviceId?: string | null) => {
+    const stream = await requestMicrophoneStream(deviceId);
+    const audioContext = createSpeechAudioContext();
+    if (!audioContext) {
+      stream.getTracks().forEach((track) => track.stop());
+      throw new Error("Audio recording is not supported in this browser.");
+    }
+    if (audioContext.state === "suspended") {
+      await audioContext.resume().catch(() => undefined);
+    }
+
+    const source = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    const sinkGain = audioContext.createGain();
+    sinkGain.gain.value = 0;
+
+    const session: RawAudioRecorderSession = {
+      audioContext,
+      chunks: [],
+      processor,
+      sampleRate: audioContext.sampleRate,
+      sinkGain,
+      source,
+      stream,
+    };
+
+    processor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.numberOfChannels > 0 ? event.inputBuffer.getChannelData(0) : null;
+      if (input && input.length > 0) {
+        session.chunks.push(new Float32Array(input));
+      }
+    };
+
+    source.connect(processor);
+    processor.connect(sinkGain);
+    sinkGain.connect(audioContext.destination);
+    return session;
+  };
+
+  const rawAudioRecorderToWavBlob = (session: RawAudioRecorderSession) => {
+    const samples = concatenateFloat32Arrays(session.chunks);
+    const resampled = resampleFloat32Array(samples, session.sampleRate, AUDIO_RECORDING_TARGET_SAMPLE_RATE);
+    const amplified = amplifySpeechSamples(resampled, normalizeRecordingGain(liveRecordingSettings.recordingGain));
+    return new Blob([encodeMonoPcm16Wav(amplified, AUDIO_RECORDING_TARGET_SAMPLE_RATE)], { type: "audio/wav" });
   };
 
   const openLiveTab = () => {
@@ -2162,18 +2265,16 @@ export function AIChatPanel({
   );
 
   const stopRecordingAndSend = async () => {
-    const recorder = mediaRecorderRef.current;
-    if (!recorder) return;
+    const rawRecorder = rawAudioRecorderRef.current;
+    if (!rawRecorder) return;
 
     await new Promise<void>((resolve, reject) => {
-      recorder.onstop = async () => {
+      void (async () => {
         try {
-          const mimeType = recorder.mimeType || "audio/webm";
-          const originalBlob = new Blob(recordedChunksRef.current, { type: mimeType });
-          const normalizedRecording = await normalizeRecordingBlob(originalBlob);
+          const recordingBlob = rawAudioRecorderToWavBlob(rawRecorder);
           recordedChunksRef.current = [];
-          const file = new File([normalizedRecording.blob], `recording-${Date.now()}.${normalizedRecording.extension}`, {
-            type: normalizedRecording.mimeType,
+          const file = new File([recordingBlob], `recording-${Date.now()}.wav`, {
+            type: "audio/wav",
             lastModified: Date.now(),
           });
           if (recordingTargetRef.current === "live") {
@@ -2202,20 +2303,11 @@ export function AIChatPanel({
           reject(error);
         } finally {
           mediaRecorderRef.current = null;
+          stopRawAudioRecorder();
           setRecording(false);
           stopRecordingStream();
         }
-      };
-
-      recorder.onerror = () => {
-        mediaRecorderRef.current = null;
-        recordedChunksRef.current = [];
-        setRecording(false);
-        stopRecordingStream();
-        reject(new Error("Audio recording failed."));
-      };
-
-      recorder.stop();
+      })();
     }).catch((error) => {
       onError(error instanceof Error ? error.message : "Audio recording failed.");
     });
@@ -2232,21 +2324,11 @@ export function AIChatPanel({
       onError(liveSessionState.status);
       return;
     }
-    if (typeof MediaRecorder === "undefined") {
-      onError("Audio recording is not supported in this browser.");
-      return;
-    }
-
-    const mimeType = getPreferredRecordingMimeType();
-    if (!mimeType) {
-      onError("This browser cannot record audio as m4a, webm, or wav.");
-      return;
-    }
-
     setPreparingRecording(true);
 
     try {
-      const stream = await requestMicrophoneStream(selectedMicrophoneId);
+      const session = await createRawAudioRecorder(selectedMicrophoneId);
+      const stream = session.stream;
       mediaStreamRef.current = stream;
       const resolvedDeviceId = stream.getAudioTracks()[0]?.getSettings().deviceId ?? null;
       if (resolvedDeviceId && resolvedDeviceId !== selectedMicrophoneId) {
@@ -2255,21 +2337,15 @@ export function AIChatPanel({
         setSelectedMicrophoneId(null);
       }
       recordedChunksRef.current = [];
-      const recorder = new MediaRecorder(stream, { audioBitsPerSecond: AUDIO_RECORDING_BITS_PER_SECOND, mimeType });
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          recordedChunksRef.current.push(event.data);
-        }
-      };
-      mediaRecorderRef.current = recorder;
-      recorder.start();
+      rawAudioRecorderRef.current = session;
       setRecording(true);
     } catch (error) {
+      stopRawAudioRecorder();
       stopRecordingStream();
       onError(error instanceof Error ? error.message : "Microphone access was denied.");
     } finally {
       setPreparingRecording(false);
-      if (!recordHoldActiveRef.current && mediaRecorderRef.current?.state === "recording") {
+      if (!recordHoldActiveRef.current && rawAudioRecorderRef.current) {
         await stopRecordingAndSend();
       }
     }
@@ -2279,7 +2355,7 @@ export function AIChatPanel({
     recordHoldActiveRef.current = false;
     clearMicrophoneLongPressTimer();
     if (preparingRecording) return;
-    if (mediaRecorderRef.current?.state === "recording") {
+    if (rawAudioRecorderRef.current) {
       await stopRecordingAndSend();
     }
   };

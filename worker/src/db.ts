@@ -296,20 +296,15 @@ export async function getSettings(db: DB, userId: string): Promise<ProviderSetti
           : defaultGeminiLiveModel
         : "",
     imageModel: imageModel.trim() ? imageModel : provider === "gemini" ? defaultGeminiImageModel : "",
-    liveRecording: {
-      echoCancellation: Boolean(Number(row.live_echo_cancellation)),
-      noiseSuppression: Boolean(Number(row.live_noise_suppression)),
-      standbyEnabled: Boolean(Number(row.live_standby_enabled)),
-    },
+    liveRecording: { ...defaultLiveRecordingSettings },
   };
 }
 
 export async function saveSettings(db: DB, userId: string, settings: ProviderSettings) {
   const now = new Date().toISOString();
-  const liveRecording = { ...defaultLiveRecordingSettings, ...(settings.liveRecording ?? {}) };
   await db
     .prepare(
-      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_model, image_model, live_echo_cancellation, live_noise_suppression, live_standby_enabled, live_auto_gain_control, live_silence_trim, live_speech_threshold, live_trim_sensitivity, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_model = excluded.live_model, image_model = excluded.image_model, live_echo_cancellation = excluded.live_echo_cancellation, live_noise_suppression = excluded.live_noise_suppression, live_standby_enabled = excluded.live_standby_enabled, live_auto_gain_control = excluded.live_auto_gain_control, live_silence_trim = excluded.live_silence_trim, live_speech_threshold = excluded.live_speech_threshold, live_trim_sensitivity = excluded.live_trim_sensitivity, updated_at = excluded.updated_at",
+      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_model, image_model, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_model = excluded.live_model, image_model = excluded.image_model, updated_at = excluded.updated_at",
     )
     .bind(
       userId,
@@ -319,17 +314,10 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
       settings.model,
       settings.liveModel ?? "",
       settings.imageModel ?? "",
-      liveRecording.echoCancellation ? 1 : 0,
-      liveRecording.noiseSuppression ? 1 : 0,
-      liveRecording.standbyEnabled ? 1 : 0,
-      0,
-      0,
-      0.007,
-      0.18,
       now,
     )
     .run();
-  return { ...settings, liveRecording: { ...liveRecording } };
+  return { ...settings, liveRecording: { ...defaultLiveRecordingSettings } };
 }
 
 export async function listPromptTemplates(db: DB, userId: string) {

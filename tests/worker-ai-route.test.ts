@@ -19,8 +19,10 @@ const geminiSettings: ProviderSettings = {
   liveModel: "gemini-3.1-flash-live-preview",
   imageModel: "gemini-3.1-flash-image-preview",
   liveRecording: {
+    autoGainControl: false,
     echoCancellation: false,
     noiseSuppression: false,
+    recordingGain: 2,
     standbyEnabled: true,
   },
 };

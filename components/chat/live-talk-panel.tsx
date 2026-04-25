@@ -81,10 +81,8 @@ const HIDDEN_LIVE_STATUSES = new Set([
 ]);
 
 const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.9;
-const LIVE_RECORDING_SEND_GAIN = 3;
-const LIVE_RECORDING_BITS_PER_SECOND = 192_000;
 const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
-const LIVE_AUDIO_CAPTURE_SAMPLE_RATE = LIVE_AUDIO_STREAM_SAMPLE_RATE;
+const LIVE_AUDIO_ANALYSIS_SAMPLE_RATE = 1000;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
 const LIVE_MICROPHONE_LEVEL_REFERENCE_RMS = 0.12;
 const LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS = 1200;
@@ -94,11 +92,6 @@ const LIVE_SPEECH_LOW_PASS_CUTOFF_HZ = 7000;
 const LIVE_SPEECH_NOISE_GATE_FLOOR_RMS = 0.004;
 const LIVE_SPEECH_NOISE_GATE_OPEN_RMS = 0.018;
 const LIVE_SPEECH_NOISE_GATE_MIN_GAIN = 0.25;
-const LIVE_RECORDER_MIN_SIGNAL_RMS = 0.0005;
-const LIVE_RECORDER_MIN_SIGNAL_PEAK = 0.005;
-const LIVE_USER_PLAYBACK_TARGET_RMS = 0.22;
-const LIVE_USER_PLAYBACK_PEAK_CEILING = 0.95;
-const LIVE_USER_PLAYBACK_MAX_GAIN = 30;
 const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
 const LIVE_STANDBY_PREROLL_MS = 5_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
@@ -207,8 +200,7 @@ type SpeechNoiseGateState = {
 };
 
 type LiveTurnRecorderSession = {
-  chunks: Blob[];
-  recorder: MediaRecorder;
+  chunks: Uint8Array[];
   turnId: string;
 };
 
@@ -357,8 +349,7 @@ function audioBufferToMonoFloat32Array(buffer: AudioBuffer) {
 }
 
 function getLiveRecordingCaptureGain(settings: LiveRecordingSettings) {
-  void settings;
-  return LIVE_RECORDING_SEND_GAIN;
+  return [1, 2, 3, 4].includes(settings.recordingGain) ? settings.recordingGain : defaultLiveRecordingSettings.recordingGain;
 }
 
 function isAndroidChromeBrowser() {
@@ -371,9 +362,8 @@ function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTra
   return {
     echoCancellation: settings.echoCancellation,
     noiseSuppression: settings.noiseSuppression,
-    autoGainControl: false,
+    autoGainControl: settings.autoGainControl,
     channelCount: { ideal: 1 },
-    sampleRate: { ideal: LIVE_AUDIO_CAPTURE_SAMPLE_RATE },
     sampleSize: { ideal: 16 },
   };
 }
@@ -393,31 +383,7 @@ function normalizeLiveRecordingSettings(settings?: Partial<LiveRecordingSettings
 function createSpeechAudioContext() {
   const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
   if (!AudioContextCtor) return null;
-  try {
-    return new AudioContextCtor({ sampleRate: LIVE_AUDIO_CAPTURE_SAMPLE_RATE });
-  } catch {
-    return new AudioContextCtor();
-  }
-}
-
-function getPreferredLiveRecordingMimeType() {
-  if (typeof MediaRecorder === "undefined") return null;
-  const candidates = [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/mp4;codecs=mp4a.40.2",
-    "audio/mp4",
-    "audio/x-m4a",
-    "audio/wav",
-  ];
-
-  for (const candidate of candidates) {
-    if (MediaRecorder.isTypeSupported(candidate)) {
-      return candidate;
-    }
-  }
-
-  return null;
+  return new AudioContextCtor();
 }
 
 function createSpeechHighPassState(): SpeechHighPassState {
@@ -543,57 +509,6 @@ function normalizeMicrophoneUiLevel(rms: number) {
   return Math.max(0, Math.min(1, Math.sqrt(Math.min(1, rms / LIVE_MICROPHONE_LEVEL_REFERENCE_RMS))));
 }
 
-function normalizeUserPlaybackSamples(samples: Float32Array, minimumGain = LIVE_RECORDING_SEND_GAIN) {
-  if (samples.length === 0) return samples;
-
-  let sumSquares = 0;
-  let peak = 0;
-  for (let index = 0; index < samples.length; index += 1) {
-    const sample = samples[index] ?? 0;
-    sumSquares += sample * sample;
-    peak = Math.max(peak, Math.abs(sample));
-  }
-
-  if (peak <= 0) return samples;
-
-  const rms = Math.sqrt(sumSquares / samples.length);
-  const rmsGain = rms > 0 ? LIVE_USER_PLAYBACK_TARGET_RMS / rms : LIVE_USER_PLAYBACK_MAX_GAIN;
-  const peakGain = LIVE_USER_PLAYBACK_PEAK_CEILING / peak;
-  const gain = Math.min(LIVE_USER_PLAYBACK_MAX_GAIN, peakGain, Math.max(minimumGain, rmsGain));
-  return amplifySpeechSamples(samples, gain);
-}
-
-async function recorderBlobToSpeechWavUrl(blob: Blob) {
-  const context = createSpeechAudioContext();
-  if (!context) {
-    return null;
-  }
-
-  try {
-    const decoded = await context.decodeAudioData(await blob.arrayBuffer());
-    const mono = audioBufferToMonoFloat32Array(decoded);
-    let sumSquares = 0;
-    let peak = 0;
-    for (let index = 0; index < mono.length; index += 1) {
-      const sample = mono[index] ?? 0;
-      sumSquares += sample * sample;
-      peak = Math.max(peak, Math.abs(sample));
-    }
-    const rms = Math.sqrt(sumSquares / Math.max(1, mono.length));
-    if (rms < LIVE_RECORDER_MIN_SIGNAL_RMS || peak < LIVE_RECORDER_MIN_SIGNAL_PEAK) {
-      return null;
-    }
-
-    const cleaned = cleanSpeechSamples(mono, decoded.sampleRate);
-    const amplified = normalizeUserPlaybackSamples(cleaned);
-    return pcm16ChunksToWavUrl([float32ToPcm16Bytes(amplified)], decoded.sampleRate);
-  } catch {
-    return null;
-  } finally {
-    context.close().catch(() => undefined);
-  }
-}
-
 async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000, chunkSize = 3200) {
   const context = createSpeechAudioContext();
   if (!context) {
@@ -623,28 +538,8 @@ async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000
   }
 }
 
-function pcm16ChunksToPlaybackWavUrl(chunks: Uint8Array[], sampleRate: number) {
-  const sampleCount = chunks.reduce((total, chunk) => total + Math.floor(chunk.byteLength / 2), 0);
-  if (sampleCount === 0) return null;
-
-  const samples = new Float32Array(sampleCount);
-  let offset = 0;
-  for (const chunk of chunks) {
-    const chunkSamples = pcm16ToFloat32Array(chunk);
-    samples.set(chunkSamples, offset);
-    offset += chunkSamples.length;
-  }
-
-  const normalized = normalizeUserPlaybackSamples(samples);
-  return pcm16ChunksToWavUrl([float32ToPcm16Bytes(normalized)], sampleRate);
-}
-
-function pcm16ChunksToWavUrl(chunks: Uint8Array[], sampleRate: number) {
-  const dataLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-  if (dataLength === 0) {
-    return null;
-  }
-
+function pcm16BytesToWavBytes(pcmBytes: Uint8Array, sampleRate: number) {
+  const dataLength = pcmBytes.byteLength;
   const wavBuffer = new ArrayBuffer(44 + dataLength);
   const view = new DataView(wavBuffer);
   const bytes = new Uint8Array(wavBuffer);
@@ -679,13 +574,24 @@ function pcm16ChunksToWavUrl(chunks: Uint8Array[], sampleRate: number) {
   writeString("data");
   view.setUint32(offset, dataLength, true);
   offset += 4;
+  bytes.set(pcmBytes, offset);
+  return wavBuffer;
+}
 
+function pcm16ChunksToWavUrl(chunks: Uint8Array[], sampleRate: number) {
+  const dataLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  if (dataLength === 0) {
+    return null;
+  }
+
+  const pcmBytes = new Uint8Array(dataLength);
+  let offset = 0;
   for (const chunk of chunks) {
-    bytes.set(chunk, offset);
+    pcmBytes.set(chunk, offset);
     offset += chunk.byteLength;
   }
 
-  return URL.createObjectURL(new Blob([wavBuffer], { type: "audio/wav" }));
+  return URL.createObjectURL(new Blob([pcm16BytesToWavBytes(pcmBytes, sampleRate)], { type: "audio/wav" }));
 }
 
 function base64ToObjectUrl(base64: string, mimeType: string) {
@@ -1448,6 +1354,7 @@ export function LiveTalkPanel({
     const enabledProcessing = [
       liveRecordingSettingsRef.current.echoCancellation ? "echo cancellation" : "",
       liveRecordingSettingsRef.current.noiseSuppression ? "noise reduction" : "",
+      liveRecordingSettingsRef.current.autoGainControl ? "auto gain" : "",
     ].filter(Boolean);
 
     if (enabledProcessing.length === 0) return "";
@@ -1706,8 +1613,10 @@ export function LiveTalkPanel({
     microphoneDeviceId,
     microphoneEnabled,
     providerSettings.liveRecording,
+    providerSettings.liveRecording?.autoGainControl,
     providerSettings.liveRecording?.echoCancellation,
     providerSettings.liveRecording?.noiseSuppression,
+    providerSettings.liveRecording?.recordingGain,
     sessionRequested,
   ]);
 
@@ -2020,16 +1929,6 @@ export function LiveTalkPanel({
       microphoneAudioContextRef.current = null;
       const recorderSession = liveTurnRecorderSessionRef.current;
       if (recorderSession) {
-        recorderSession.recorder.ondataavailable = null;
-        recorderSession.recorder.onerror = null;
-        recorderSession.recorder.onstop = null;
-        try {
-          if (recorderSession.recorder.state !== "inactive") {
-            recorderSession.recorder.stop();
-          }
-        } catch {
-          // Ignore recorder cleanup errors.
-        }
         liveTurnRecorderSessionRef.current = null;
       }
       microphoneHighPassStateRef.current = createSpeechHighPassState();
@@ -2168,14 +2067,16 @@ export function LiveTalkPanel({
               const processed = amplifySpeechSamples(cleaned, getLiveRecordingCaptureGain(liveRecordingSettingsRef.current));
               const durationMs = (resampled.length / LIVE_AUDIO_STREAM_SAMPLE_RATE) * 1000;
               const pcm16Bytes = float32ToPcm16Bytes(processed);
+              liveTurnRecorderSessionRef.current?.chunks.push(pcm16Bytes);
               const base64Pcm16 = float32ToBase64Pcm16(processed);
               appendStandbyPreRoll(pcm16Bytes, base64Pcm16, durationMs);
+              const analysisSamples = resampleFloat32Array(processed, LIVE_AUDIO_STREAM_SAMPLE_RATE, LIVE_AUDIO_ANALYSIS_SAMPLE_RATE);
               let sumSquares = 0;
-              for (let index = 0; index < processed.length; index += 1) {
-                const sample = processed[index] ?? 0;
+              for (let index = 0; index < analysisSamples.length; index += 1) {
+                const sample = analysisSamples[index] ?? 0;
                 sumSquares += sample * sample;
               }
-              const rms = Math.sqrt(sumSquares / processed.length);
+              const rms = Math.sqrt(sumSquares / Math.max(1, analysisSamples.length));
               microphoneLastFrameAtRef.current = performance.now();
               onMicrophoneLevelChangeRef.current?.(normalizeMicrophoneUiLevel(rms));
               const currentDb = 20 * Math.log10(Math.max(rms, 1e-6));
@@ -2495,16 +2396,6 @@ export function LiveTalkPanel({
 
     const discardLiveTurnRecorder = (session = liveTurnRecorderSessionRef.current) => {
       if (!session) return;
-      session.recorder.ondataavailable = null;
-      session.recorder.onerror = null;
-      session.recorder.onstop = null;
-      try {
-        if (session.recorder.state !== "inactive") {
-          session.recorder.stop();
-        }
-      } catch {
-        // Ignore recorder cleanup errors.
-      }
       if (liveTurnRecorderSessionRef.current === session) {
         liveTurnRecorderSessionRef.current = null;
       }
@@ -2515,79 +2406,24 @@ export function LiveTalkPanel({
         return null;
       }
 
-      return await new Promise<Blob | null>((resolve) => {
-        let settled = false;
-        const { recorder } = session;
-        const mimeType = recorder.mimeType || "audio/webm";
-        const finish = () => {
-          if (settled) return;
-          settled = true;
-          recorder.ondataavailable = null;
-          recorder.onerror = null;
-          recorder.onstop = null;
-          if (liveTurnRecorderSessionRef.current === session) {
-            liveTurnRecorderSessionRef.current = null;
-          }
-          resolve(session.chunks.length > 0 ? new Blob(session.chunks, { type: mimeType }) : null);
-        };
-
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            session.chunks.push(event.data);
-          }
-        };
-        recorder.onerror = () => finish();
-        recorder.onstop = () => finish();
-
-        try {
-          if (recorder.state === "inactive") {
-            finish();
-            return;
-          }
-          recorder.requestData();
-          recorder.stop();
-        } catch {
-          finish();
-        }
-      });
+      if (liveTurnRecorderSessionRef.current === session) {
+        liveTurnRecorderSessionRef.current = null;
+      }
+      return session.chunks.length > 0 ? new Blob([pcm16BytesToWavBytes(concatenateBytes(session.chunks), LIVE_AUDIO_STREAM_SAMPLE_RATE)], { type: "audio/wav" }) : null;
     };
 
     const startLiveTurnRecorder = (turnId: string) => {
-      if (typeof MediaRecorder === "undefined") return;
       const stream = microphoneStreamRef.current;
       if (!stream?.active) return;
       const existingSession = liveTurnRecorderSessionRef.current;
-      if (existingSession?.recorder.state === "recording" && existingSession.turnId === turnId) return;
+      if (existingSession?.turnId === turnId) return;
 
       discardLiveTurnRecorder(existingSession);
-      const mimeType = getPreferredLiveRecordingMimeType();
-      if (!mimeType) return;
 
-      try {
-        const recorder = new MediaRecorder(stream, {
-          audioBitsPerSecond: LIVE_RECORDING_BITS_PER_SECOND,
-          mimeType,
-        });
-        const session: LiveTurnRecorderSession = {
-          chunks: [],
-          recorder,
-          turnId,
-        };
-        recorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            session.chunks.push(event.data);
-          }
-        };
-        recorder.onerror = () => {
-          if (liveTurnRecorderSessionRef.current === session) {
-            liveTurnRecorderSessionRef.current = null;
-          }
-        };
-        liveTurnRecorderSessionRef.current = session;
-        recorder.start(250);
-      } catch {
-        liveTurnRecorderSessionRef.current = null;
-      }
+      liveTurnRecorderSessionRef.current = {
+        chunks: [],
+        turnId,
+      };
     };
 
     const buildSpeechPromptContext = () => {
@@ -2669,11 +2505,11 @@ export function LiveTalkPanel({
 
       if (userTurnId && streamedChunks.length > 0) {
         discardLiveTurnRecorder(recorderSession);
-        applyUserAudioUrl(pcm16ChunksToPlaybackWavUrl(streamedChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE));
+        applyUserAudioUrl(pcm16ChunksToWavUrl(streamedChunks, LIVE_AUDIO_STREAM_SAMPLE_RATE));
       } else if (userTurnId && recorderSession) {
         void (async () => {
           const recorderBlob = await stopLiveTurnRecorder(recorderSession);
-          const recorderAudioUrl = recorderBlob && recorderBlob.size > 0 ? await recorderBlobToSpeechWavUrl(recorderBlob) : null;
+          const recorderAudioUrl = recorderBlob && recorderBlob.size > 0 ? URL.createObjectURL(recorderBlob) : null;
           applyUserAudioUrl(recorderAudioUrl);
         })();
       } else {

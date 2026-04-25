@@ -2,8 +2,10 @@ export type ProviderName = "openai" | "gemini";
 export type AIMediaKind = "image" | "audio" | "video";
 
 export type LiveRecordingSettings = {
+  autoGainControl: boolean;
   echoCancellation: boolean;
   noiseSuppression: boolean;
+  recordingGain: number;
   standbyEnabled: boolean;
 };
 

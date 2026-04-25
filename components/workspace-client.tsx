@@ -20,9 +20,11 @@ import { DEFAULT_FOLDER_NAME, UNTITLED_NOTE_TITLE, WELCOME_NOTE_TITLE, loadNoteT
 import {
   loadCachedDocument,
   loadAiPanelHeight,
+  loadLiveRecordingSettings,
   loadRecentDocumentIds,
   saveCachedDocument,
   saveAiPanelHeight,
+  saveLiveRecordingSettings,
   saveRecentDocumentIds,
 } from "@/lib/storage/local-cache";
 import { buildSubstitutionReplay, type TextSubstitutionReplayStep } from "@/shared/substitutions";
@@ -431,6 +433,10 @@ function WorkspaceClientContent() {
   const [syncStatus, setSyncStatus] = useState("Loading");
   const [uploading, setUploading] = useState(false);
   const [thinking, setThinking] = useState(false);
+
+  useEffect(() => {
+    setSettings((current) => ({ ...current, liveRecording: loadLiveRecordingSettings() }));
+  }, []);
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [creatingNote, setCreatingNote] = useState(false);
   const [folderCreateOpen, setFolderCreateOpen] = useState(false);
@@ -897,7 +903,7 @@ function WorkspaceClientContent() {
         ]);
         const normalizedRemoteDocs = remoteDocs.map(normalizeDocumentRecord);
         setFolders(sortFolders(remoteFolders));
-        setSettings(remoteSettings);
+        setSettings({ ...remoteSettings, liveRecording: loadLiveRecordingSettings() });
         setDocuments(sortDocuments(normalizedRemoteDocs));
         setFolderAssets(remoteFolderAssets);
 
@@ -2630,8 +2636,9 @@ function WorkspaceClientContent() {
                     initialValue={settings}
                     onSave={async (value) => {
                       try {
-                        const saved = await apiClient.saveSettings(value);
-                        setSettings(saved);
+                        saveLiveRecordingSettings(value.liveRecording);
+                        const saved = await apiClient.saveSettings({ ...value, liveRecording: settings.liveRecording });
+                        setSettings({ ...saved, liveRecording: value.liveRecording });
                       } catch (error) {
                         pushError(error instanceof Error ? error.message : "Failed to save provider settings");
                       }

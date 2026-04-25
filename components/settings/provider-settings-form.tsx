@@ -109,7 +109,7 @@ export function ProviderSettingsForm({
           <div>
             <h3 className="text-sm font-semibold">Live recording</h3>
             <p className="text-xs text-ink/55">
-              Gemini Live receives mono PCM16 audio at 16 kHz. Echo cancellation and noise reduction are off by default for cleaner capture.
+              Stored only on this device. Gemini Live receives mono PCM16 audio at 16 kHz with browser audio processing off by default.
             </p>
           </div>
           <label className="flex items-center justify-between gap-3 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
@@ -139,6 +139,38 @@ export function ProviderSettingsForm({
               }
               type="checkbox"
             />
+          </label>
+          <label className="flex items-center justify-between gap-3 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
+            <span>Auto gain</span>
+            <input
+              checked={liveRecording.autoGainControl}
+              className="h-4 w-4"
+              onChange={(event) =>
+                setValue({
+                  ...value,
+                  liveRecording: { ...liveRecording, autoGainControl: event.target.checked },
+                })
+              }
+              type="checkbox"
+            />
+          </label>
+          <label className="grid gap-1 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
+            <span>Recording gain</span>
+            <select
+              className="rounded-[8px] border border-ink/10 bg-white px-3 py-2"
+              onChange={(event) =>
+                setValue({
+                  ...value,
+                  liveRecording: { ...liveRecording, recordingGain: Number(event.target.value) },
+                })
+              }
+              value={liveRecording.recordingGain}
+            >
+              <option value={1}>Off</option>
+              <option value={2}>2x</option>
+              <option value={3}>3x</option>
+              <option value={4}>4x</option>
+            </select>
           </label>
           <label className="grid gap-1 rounded-[10px] border border-ink/10 bg-white px-3 py-2 text-sm">
             <div className="flex items-center justify-between gap-3">
