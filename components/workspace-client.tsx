@@ -1610,6 +1610,7 @@ function WorkspaceClientContent() {
     mode,
     prompts,
     displayPrompt,
+    signal,
   }: {
     prompt: string;
     attachments: AIRequestAttachment[];
@@ -1617,6 +1618,7 @@ function WorkspaceClientContent() {
     mode: AIRequestMode;
     prompts: AIMessagePrompt[];
     displayPrompt?: string;
+    signal?: AbortSignal;
   }) => {
     setThinking(true);
     const promptSummary =
@@ -1654,6 +1656,7 @@ function WorkspaceClientContent() {
         attachments,
         availableNotes: aiAvailableNotes,
       }, {
+        signal,
         onDelta: (delta) => {
           setMessages((current) =>
             current.map((message) =>
@@ -1718,6 +1721,10 @@ function WorkspaceClientContent() {
       });
       return true;
     } catch (error) {
+      if (signal?.aborted) {
+        setMessages((current) => current.filter((message) => message.id !== assistantMessageId && message.id !== userMessage.id));
+        return false;
+      }
       setMessages((current) => current.filter((message) => message.id !== assistantMessageId));
       pushError(error instanceof Error ? error.message : "AI request failed");
       return false;

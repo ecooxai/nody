@@ -1,7 +1,7 @@
 const clerkPublishableKey = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 const clerkSecretKey = process.env.CLERK_SECRET_KEY;
 const clerkDevKeysAllowed =
-  process.env.NEXT_PUBLIC_ALLOW_CLERK_DEV_KEYS === "true" || process.env.ALLOW_CLERK_DEV_KEYS === "true" || process.env.NODE_ENV !== "production";
+  process.env.NEXT_PUBLIC_ALLOW_CLERK_DEV_KEYS === "true" || process.env.ALLOW_CLERK_DEV_KEYS === "true";
 
 function isAllowedClerkKey(key: string | undefined, testPrefix: string) {
   if (!key) return false;

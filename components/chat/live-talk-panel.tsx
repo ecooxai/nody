@@ -106,6 +106,7 @@ const LIVE_STANDBY_RECONNECT_GRACE_MS = 2_500;
 const LIVE_SPEECH_END_TRIGGER_DB = 6;
 const LIVE_SPEECH_END_MIN_SPEECH_MS = 350;
 const LIVE_SPEECH_END_TRAILING_SILENCE_MS = 900;
+const LIVE_RECONNECT_TRANSCRIPT_MAX_CHARS = 6000;
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
 
 export type LiveSendAttachment = {
@@ -693,6 +694,23 @@ function buildLiveWebSocketUrl(apiUrl: string, apiKey: string) {
   const base = apiUrl.replace(/\/$/, "");
   const wsBase = base.replace(/^https:/, "wss:").replace(/^http:/, "ws:");
   return `${wsBase}/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(apiKey)}&alt=ws`;
+}
+
+function trimToLastChars(text: string, maxChars: number) {
+  return text.length > maxChars ? text.slice(-maxChars) : text;
+}
+
+function buildLiveTranscriptText(turns: LiveTurn[]) {
+  const transcript = turns
+    .filter((turn) => turn.role === "user" || turn.role === "assistant")
+    .map((turn) => {
+      const speaker = turn.role === "user" ? "user" : "AI";
+      const message = turn.content.trim() || (turn.images?.length ? "[image turn]" : "[audio turn]");
+      return turn.role === "user" ? `${speaker}:\n ${message}` : `${speaker}:\n${message}`;
+    })
+    .join("\n\n");
+
+  return trimToLastChars(transcript, LIVE_RECONNECT_TRANSCRIPT_MAX_CHARS);
 }
 
 function buildNoteContext(noteId: string, title: string, bodyMarkdown: string, noteCatalog: AINoteReference[]) {
@@ -2847,7 +2865,20 @@ export function LiveTalkPanel({
 
     const sendSetup = () => {
       appliedNoteContextRef.current = noteContextRef.current;
-      liveContextTokensRef.current = estimateTokenCount(noteContextRef.current);
+      const transcriptContext = buildLiveTranscriptText(turnsRef.current);
+      const liveContext = [
+        noteContextRef.current,
+        transcriptContext
+          ? [
+              "",
+              `Previous live chat transcript, last ${LIVE_RECONNECT_TRANSCRIPT_MAX_CHARS} characters:`,
+              transcriptContext,
+            ].join("\n")
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+      liveContextTokensRef.current = estimateTokenCount(liveContext);
       contextLimitHandlingRef.current = false;
       socket.send(
         JSON.stringify({
@@ -2866,7 +2897,7 @@ export function LiveTalkPanel({
             systemInstruction: {
               parts: [
                 {
-                  text: noteContextRef.current,
+                  text: liveContext,
                 },
               ],
             },
@@ -3576,22 +3607,12 @@ export function LiveTalkPanel({
     performLiveTextSendRef.current = sendLiveText;
     performLiveAttachmentSendRef.current = sendLiveAttachment;
 
-    const buildLiveTranscriptMarkdown = () =>
-      turnsRef.current
-        .filter((turn) => turn.role === "user" || turn.role === "assistant")
-        .map((turn) => {
-          const speaker = turn.role === "user" ? "User" : "Assistant";
-          const imageSummary = turn.images?.length ? `\n[${turn.images.length} image${turn.images.length === 1 ? "" : "s"} attached]` : "";
-          return `### ${speaker}\n${turn.content.trim() || "[audio/image turn]"}${imageSummary}`;
-        })
-        .join("\n\n");
-
     const disconnectForContextLimit = async () => {
       if (contextLimitHandlingRef.current) return;
       contextLimitHandlingRef.current = true;
       setStatus("Live context exceeded 16k tokens. Summarizing before disconnect...");
       try {
-        const transcript = buildLiveTranscriptMarkdown();
+        const transcript = buildLiveTranscriptText(turnsRef.current);
         const response = await apiClient.askAi({
           prompt: [
             "Summarize the important content from this live chat so it can be preserved at the end of the note.",

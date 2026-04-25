@@ -151,6 +151,7 @@ const builtInPrompts: PromptTemplate[] = [
 const COMPACT_PANEL_HEIGHT = 200;
 const SCROLL_EDGE_TOLERANCE = 1;
 const COMPOSER_CHROME_FRAME_HEIGHT = 72;
+const AUTO_READ_SELECTION_DELAY_MS = 3000;
 
 function canScrollVertically(element: HTMLElement) {
   if (element.scrollHeight <= element.clientHeight + SCROLL_EDGE_TOLERANCE) return false;
@@ -344,10 +345,6 @@ function shouldUseImageGeneration(prompt: string, templates: PromptTemplate[], a
 
 function composePromptTextForModeDetection(messagePrompt: string, templates: PromptTemplate[]) {
   return [messagePrompt.trim(), ...templates.map((template) => template.content.trim())].filter(Boolean).join("\n");
-}
-
-function formatSelectedTextContext(selection: string) {
-  return `user selected:${selection.trim()}\nendselected\n\n`;
 }
 
 function buildReadAloudPrompt(text: string) {
@@ -739,6 +736,7 @@ export function AIChatPanel({
     prompts: AIMessagePrompt[];
     mode: AIRequestMode;
     displayPrompt?: string;
+    signal?: AbortSignal;
   }) => Promise<boolean>;
   onApply: (edits: TextSubstitution[]) => void;
   onAddAttachmentToNote: (attachment: AIMessageAttachment, options?: { lineNumber?: number }) => void;
@@ -842,6 +840,7 @@ export function AIChatPanel({
   const microphoneLongPressTimerRef = useRef<number | null>(null);
   const microphoneLongPressTriggeredRef = useRef(false);
   const autoReadSelectionTimerRef = useRef<number | null>(null);
+  const autoReadSelectionAbortControllerRef = useRef<AbortController | null>(null);
   const lastAutoReadSelectionKeyRef = useRef<string | null>(null);
   const cameraVideoRef = useRef<HTMLVideoElement>(null);
   const cameraStreamRef = useRef<MediaStream | null>(null);
@@ -855,6 +854,7 @@ export function AIChatPanel({
   const latestMessageFlashTimerRef = useRef<number | null>(null);
   const generatedImageTrayRef = useRef<HTMLDivElement>(null);
   const latestGeneratedImageIdRef = useRef<string | null>(null);
+  const latestGeneratedAudioIdRef = useRef<string | null>(null);
   const generatedImageWatcherReadyRef = useRef(false);
   const microphoneMenuRef = useRef<HTMLDivElement>(null);
   const liveVideoMenuRef = useRef<HTMLDivElement>(null);
@@ -866,13 +866,26 @@ export function AIChatPanel({
   const imageGenerationCueActiveRef = useRef(false);
   const latestChatMessageRole = messages[messages.length - 1]?.role ?? null;
   let latestChatGeneratedImageId: string | null = null;
+  let latestChatGeneratedAudioId: string | null = null;
+  let latestChatGeneratedAudioMessageId: string | null = null;
   let latestChatCameraAttachmentId: string | null = null;
-  for (let index = messages.length - 1; index >= 0 && (!latestChatGeneratedImageId || !latestChatCameraAttachmentId); index -= 1) {
+  for (
+    let index = messages.length - 1;
+    index >= 0 && (!latestChatGeneratedImageId || !latestChatGeneratedAudioId || !latestChatCameraAttachmentId);
+    index -= 1
+  ) {
     const message = messages[index];
     const attachmentsReversed = [...(message.attachments ?? [])].reverse();
     if (!latestChatGeneratedImageId && message.role === "assistant") {
       latestChatGeneratedImageId =
         attachmentsReversed.find((attachment) => attachment.kind === "image" && Boolean(attachment.url))?.id ?? null;
+    }
+    if (!latestChatGeneratedAudioId && message.role === "assistant") {
+      const generatedAudio = attachmentsReversed.find(
+        (attachment) => attachment.kind === "audio" && Boolean(attachment.url) && attachment.origin === "generated",
+      );
+      latestChatGeneratedAudioId = generatedAudio?.id ?? null;
+      latestChatGeneratedAudioMessageId = generatedAudio ? message.id : null;
     }
     if (!latestChatCameraAttachmentId && message.role === "user") {
       latestChatCameraAttachmentId =
@@ -1007,6 +1020,8 @@ export function AIChatPanel({
   const containAiPanelWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
     if (event.ctrlKey || event.metaKey || event.deltaY === 0) return;
 
+    event.stopPropagation();
+    focusHistory();
     const deltaY = normalizeWheelDeltaY(event);
     const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
     if (!scrollContainer || !canConsumeVerticalDelta(scrollContainer, deltaY)) {
@@ -1015,7 +1030,7 @@ export function AIChatPanel({
       }
       event.preventDefault();
     }
-  }, []);
+  }, [focusHistory]);
 
   const rememberAiPanelTouch = useCallback((event: TouchEvent<HTMLDivElement>) => {
     lastAiPanelTouchYRef.current = event.touches[0]?.clientY ?? null;
@@ -1024,6 +1039,8 @@ export function AIChatPanel({
   const containAiPanelTouch = useCallback((event: TouchEvent<HTMLDivElement>) => {
     if (event.touches.length !== 1) return;
 
+    event.stopPropagation();
+    focusHistory();
     const currentY = event.touches[0].clientY;
     const previousY = lastAiPanelTouchYRef.current;
     lastAiPanelTouchYRef.current = currentY;
@@ -1039,7 +1056,7 @@ export function AIChatPanel({
       }
       event.preventDefault();
     }
-  }, []);
+  }, [focusHistory]);
 
   const scrollToChatHistoryTarget = useCallback((selector: string) => {
     const container = messagesContainerRef.current;
@@ -1128,12 +1145,6 @@ export function AIChatPanel({
   }, []);
 
   useEffect(() => {
-    const trimmedSelection = selectedText?.trim();
-    if (!trimmedSelection) return;
-    setPrompt(formatSelectedTextContext(trimmedSelection));
-  }, [selectedText]);
-
-  useEffect(() => {
     attachmentsRef.current = attachments;
   }, [attachments]);
 
@@ -1220,6 +1231,28 @@ export function AIChatPanel({
   }, [activeGeneratedImages.length]);
 
   useEffect(() => {
+    if (activeTab !== "chat") return;
+    if (!latestChatGeneratedAudioId || !latestChatGeneratedAudioMessageId) return;
+    if (latestGeneratedAudioIdRef.current === latestChatGeneratedAudioId) return;
+
+    latestGeneratedAudioIdRef.current = latestChatGeneratedAudioId;
+    window.requestAnimationFrame(() => {
+      const container = messagesContainerRef.current;
+      const target = container?.querySelector<HTMLElement>(`[data-chat-message-id="${latestChatGeneratedAudioMessageId}"]`);
+      if (!container || !target) return;
+      focusHistory();
+      const containerTop = container.getBoundingClientRect().top;
+      const targetTop = target.getBoundingClientRect().top;
+      container.scrollTo({
+        top: container.scrollTop + targetTop - containerTop,
+        behavior: "smooth",
+      });
+      setChatLatestMessageAvailable(false);
+      setLatestMessageShortcutFlashing(false);
+    });
+  }, [activeTab, focusHistory, latestChatGeneratedAudioId, latestChatGeneratedAudioMessageId]);
+
+  useEffect(() => {
     if (!latestAssistantMessageId) {
       previousLatestAssistantMessageIdRef.current = null;
       setChatLatestMessageAvailable(false);
@@ -1272,6 +1305,7 @@ export function AIChatPanel({
       if (autoReadSelectionTimerRef.current) {
         window.clearTimeout(autoReadSelectionTimerRef.current);
       }
+      autoReadSelectionAbortControllerRef.current?.abort();
       if (cameraLongPressTimerRef.current) {
         window.clearTimeout(cameraLongPressTimerRef.current);
       }
@@ -1328,6 +1362,11 @@ export function AIChatPanel({
       window.clearTimeout(autoReadSelectionTimerRef.current);
       autoReadSelectionTimerRef.current = null;
     }
+  };
+
+  const cancelAutoReadSelectionRequest = () => {
+    autoReadSelectionAbortControllerRef.current?.abort();
+    autoReadSelectionAbortControllerRef.current = null;
   };
 
   const stopCameraStream = () => {
@@ -1698,13 +1737,14 @@ export function AIChatPanel({
       );
 
       const submittedPrompt = prompt;
+      const displayPrompt = options?.displayPrompt ?? (!submittedPrompt.trim() && selectedTextForReadAloud ? "Selected text" : undefined);
       const askPromise = onAsk({
         prompt: finalPrompt,
         attachments: requestAttachments,
         messageAttachments: items.map(buildMessageAttachment),
         prompts: selectedMessagePrompts,
         mode: options?.mode ?? "chat",
-        displayPrompt: options?.displayPrompt,
+        displayPrompt,
       });
       if (submittedPrompt) {
         setPrompt("");
@@ -1728,7 +1768,7 @@ export function AIChatPanel({
   };
 
   const handleSend = async () => {
-    if (busy || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)) return;
+    if (busy || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0 && !selectedTextForReadAloud)) return;
     const mode: AIRequestMode =
       provider === "gemini" && providerSettings.imageModel.trim() && shouldUseImageGeneration(prompt, selectedPrompts, attachments)
         ? "image"
@@ -1745,7 +1785,7 @@ export function AIChatPanel({
     }
   };
 
-  const handleReadSelectedText = useCallback(async () => {
+  const handleReadSelectedText = useCallback(async (options?: { automatic?: boolean }) => {
     const text = selectedTextForReadAloud;
     if (!text || readingSelection) return false;
 
@@ -1768,6 +1808,12 @@ export function AIChatPanel({
       return true;
     }
 
+    const abortController = options?.automatic ? new AbortController() : null;
+    if (abortController) {
+      cancelAutoReadSelectionRequest();
+      autoReadSelectionAbortControllerRef.current = abortController;
+    }
+
     setReadingSelection(true);
     try {
       const sent = await onAsk({
@@ -1777,15 +1823,23 @@ export function AIChatPanel({
         prompts: [],
         mode: "tts",
         displayPrompt: "Read selected text aloud.",
+        signal: abortController?.signal,
       });
-      if (sent) {
+      if (sent && !abortController?.signal.aborted) {
         lastAutoReadSelectionKeyRef.current = readKey;
       }
       return sent;
     } finally {
+      if (autoReadSelectionAbortControllerRef.current === abortController) {
+        autoReadSelectionAbortControllerRef.current = null;
+      }
       setReadingSelection(false);
     }
   }, [activeTab, liveSendHandle, liveSessionState.status, onAsk, onError, readingSelection, selectedTextForReadAloud]);
+
+  useEffect(() => {
+    cancelAutoReadSelectionRequest();
+  }, [selectedTextForReadAloud]);
 
   useEffect(() => {
     clearAutoReadSelectionTimer();
@@ -1809,8 +1863,8 @@ export function AIChatPanel({
       if (!liveSendHandle) return;
       autoReadSelectionTimerRef.current = window.setTimeout(() => {
         autoReadSelectionTimerRef.current = null;
-        void handleReadSelectedText();
-      }, 0);
+        void handleReadSelectedText({ automatic: true });
+      }, AUTO_READ_SELECTION_DELAY_MS);
       return clearAutoReadSelectionTimer;
     }
 
@@ -1818,8 +1872,8 @@ export function AIChatPanel({
 
     autoReadSelectionTimerRef.current = window.setTimeout(() => {
       autoReadSelectionTimerRef.current = null;
-      void handleReadSelectedText();
-    }, 2000);
+      void handleReadSelectedText({ automatic: true });
+    }, AUTO_READ_SELECTION_DELAY_MS);
 
     return clearAutoReadSelectionTimer;
   }, [
@@ -3266,7 +3320,12 @@ export function AIChatPanel({
             disabled={
               activeTab === "live"
                 ? !liveSendHandle || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)
-                : busy || preparingRecording || recording || cameraPreparing || cameraRecording || (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0)
+                : busy ||
+                  preparingRecording ||
+                  recording ||
+                  cameraPreparing ||
+                  cameraRecording ||
+                  (!prompt.trim() && attachments.length === 0 && selectedPrompts.length === 0 && !selectedTextForReadAloud)
             }
             onClick={() => void handleComposerSubmit()}
             type="button"
@@ -3493,6 +3552,7 @@ export function AIChatPanel({
                   className={`max-w-[92%] rounded-[4px] px-2.5 py-1.5 text-[13px] leading-5 ${
                     message.role === "assistant" ? "bg-white text-ink" : "self-end bg-[#fff7e8] text-ink"
                   }`}
+                  data-chat-message-id={message.id}
                   key={message.id}
                   ref={message.id === latestAssistantMessageId ? latestAssistantMessageRef : null}
                   style={message.role === "user" ? { minWidth: "min(320px, 92%)" } : undefined}

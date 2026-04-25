@@ -14,6 +14,7 @@ import type {
 type AIStreamHandlers = {
   onDelta: (delta: string) => void;
   onDone: (response: AIResponse) => Promise<void> | void;
+  signal?: AbortSignal;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -131,6 +132,7 @@ export const apiClient = {
         "content-type": "application/json",
       },
       body: JSON.stringify(payload),
+      signal: handlers.signal,
     });
 
     if (!response.ok) {
