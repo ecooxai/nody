@@ -10,8 +10,10 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Nody",
   description: "Cloud-synced rich text workspace with AI editing.",
+  manifest: "/manifest.webmanifest",
   icons: {
     icon: "/icon.svg",
+    apple: "/icons/icon-192.png",
   },
 };
 

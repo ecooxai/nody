@@ -1,19 +1,56 @@
 "use client";
 
-import { createContext, useCallback, useContext, useMemo, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+
+import { writeBrowserClipboardText } from "@/lib/clipboard";
 
 type ErrorNotice = { code: string; message: string };
 type ErrorContextValue = { pushError: (message: string) => void };
 
 const ErrorContext = createContext<ErrorContextValue | null>(null);
 
+function isClipboardFocusFailure(value: unknown) {
+  const message =
+    value instanceof Error
+      ? value.message
+      : typeof value === "string"
+        ? value
+        : typeof value === "object" && value !== null && "message" in value && typeof value.message === "string"
+          ? value.message
+          : "";
+
+  return (
+    message.includes("local_clipboard_read_failed") ||
+    (message.includes("Clipboard") && message.includes("Document is not focused"))
+  );
+}
+
 export function ErrorToastProvider({ children }: { children: React.ReactNode }) {
   const [notice, setNotice] = useState<ErrorNotice | null>(null);
 
   const pushError = useCallback((message: string) => {
+    if (isClipboardFocusFailure(message)) return;
     const code = `ERR-${Date.now().toString(36).toUpperCase()}`;
     setNotice({ code, message });
     window.setTimeout(() => setNotice(null), 10000);
+  }, []);
+
+  useEffect(() => {
+    const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
+      if (!isClipboardFocusFailure(event.reason)) return;
+      event.preventDefault();
+    };
+    const handleWindowError = (event: ErrorEvent) => {
+      if (!isClipboardFocusFailure(event.error ?? event.message)) return;
+      event.preventDefault();
+    };
+
+    window.addEventListener("unhandledrejection", handleUnhandledRejection);
+    window.addEventListener("error", handleWindowError);
+    return () => {
+      window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+      window.removeEventListener("error", handleWindowError);
+    };
   }, []);
 
   const value = useMemo(() => ({ pushError }), [pushError]);
@@ -28,7 +65,11 @@ export function ErrorToastProvider({ children }: { children: React.ReactNode }) 
 
 function Toast({ notice }: { notice: ErrorNotice }) {
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(`${notice.code}: ${notice.message}`);
+    try {
+      await writeBrowserClipboardText(`${notice.code}: ${notice.message}`);
+    } catch {
+      // Clipboard access can fail when focus changes between click and write.
+    }
   };
 
   return (

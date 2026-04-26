@@ -11,6 +11,7 @@ import { Panel } from "@/components/ui/panel";
 import { ProviderSettingsForm } from "@/components/settings/provider-settings-form";
 import { apiClient } from "@/lib/api/client";
 import { clerkClientConfigured } from "@/lib/auth/config";
+import { writeBrowserClipboardText } from "@/lib/clipboard";
 import type { EditorCommand } from "@/lib/editor/commands";
 import { createStarterMarkdown, ensureTrailingNewlines, normalizeStoredMarkdown } from "@/lib/editor/markdown";
 import { useServiceWorker } from "@/lib/hooks/use-service-worker";
@@ -2109,7 +2110,8 @@ function WorkspaceClientContent() {
     if (!selectedFolderAsset) return;
     try {
       const fullUrl = new URL(getFolderAssetDirectPath(selectedFolderAsset), window.location.origin).toString();
-      await navigator.clipboard.writeText(fullUrl);
+      const copied = await writeBrowserClipboardText(fullUrl);
+      if (!copied) return;
       setPreviewUrlCopied(true);
       if (copyResetTimerRef.current) window.clearTimeout(copyResetTimerRef.current);
       copyResetTimerRef.current = window.setTimeout(() => {

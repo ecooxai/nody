@@ -16,6 +16,7 @@ import {
 } from "react";
 
 import type { EditorCommand } from "@/lib/editor/commands";
+import { writeBrowserClipboardText } from "@/lib/clipboard";
 import {
   findLineStartOffset,
   getLineSourceRange,
@@ -1381,7 +1382,8 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const copyViewerImageUrl = async () => {
     if (!viewerMedia || viewerMedia.kind !== "image") return;
     try {
-      await navigator.clipboard.writeText(absoluteMediaUrl(viewerMedia.assetUrl));
+      const copied = await writeBrowserClipboardText(absoluteMediaUrl(viewerMedia.assetUrl));
+      if (!copied) return;
       clearViewerCopyTimer();
       setViewerImageInfo((current) => ({ ...current, copied: true }));
       viewerCopyTimerRef.current = window.setTimeout(() => {
