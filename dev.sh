@@ -187,7 +187,7 @@ fi
 
 rm -rf .next
 NEXT_STATUS=0
-./node_modules/.bin/next dev --disable-source-maps --hostname :: &
+./node_modules/.bin/next dev --disable-source-maps --hostname :: --port 3000 &
 NEXT_PID=$!
 wait "${NEXT_PID}" || NEXT_STATUS=$?
 NEXT_PID=""

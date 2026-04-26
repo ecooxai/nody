@@ -82,7 +82,7 @@ const HIDDEN_LIVE_STATUSES = new Set([
 
 const LIVE_ASSISTANT_PLAYBACK_GAIN = 0.9;
 const LIVE_AUDIO_STREAM_SAMPLE_RATE = 16000;
-const LIVE_AUDIO_ANALYSIS_SAMPLE_RATE = 1000;
+const LIVE_AUDIO_ANALYSIS_INTERVAL_MS = 240;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
 const LIVE_MICROPHONE_LEVEL_REFERENCE_RMS = 0.12;
 const LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS = 1200;
@@ -98,21 +98,14 @@ const LIVE_STANDBY_INTERACTION_IDLE_DELAY_MS = 2_000;
 const LIVE_PLAYBACK_STALE_RESUME_GRACE_MS = 3_000;
 const LIVE_STANDBY_PREROLL_MS = 5_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
-const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
 const LIVE_STANDBY_SPEECH_PREROLL_MS = 2_000;
-const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
-const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
-const LIVE_STANDBY_ABSOLUTE_VOICE_TRIGGER_DB = -44;
-const LIVE_STANDBY_ABSOLUTE_VOICE_STRONG_TRIGGER_DB = -36;
-const LIVE_STANDBY_VOICE_LEVEL_TRIGGER = 0.16;
-const LIVE_STANDBY_VOICE_LEVEL_STRONG_TRIGGER = 0.34;
+const LIVE_STANDBY_VOICE_LEVEL_TRIGGER = 0.18;
+const LIVE_STANDBY_VOICE_LEVEL_STRONG_TRIGGER = 0.3;
 const LIVE_STANDBY_VOICE_WINDOW_MS = 3_000;
 const LIVE_STANDBY_VOICE_WINDOW_MIN_LOUD_MS = 1_000;
 const LIVE_STANDBY_VOICE_WINDOW_MIN_STRONG_MS = 450;
-const LIVE_STANDBY_NOISE_UPDATE_DB = 4;
 const LIVE_STANDBY_RECONNECT_GRACE_MS = 2_500;
-const LIVE_SPEECH_END_TRIGGER_DB = 6;
-const LIVE_SPEECH_END_LEVEL_TRIGGER = 0.12;
+const LIVE_SPEECH_END_LEVEL_TRIGGER = 0.1;
 const LIVE_SPEECH_END_MIN_SPEECH_MS = 350;
 const LIVE_SPEECH_END_TRAILING_SILENCE_MS = 1_200;
 const LIVE_SPEECH_END_STABLE_LEVEL_MS = 1_600;
@@ -559,29 +552,16 @@ function normalizeMicrophoneUiLevel(rms: number) {
   return Math.max(0, Math.min(1, Math.sqrt(Math.min(1, rms / LIVE_MICROPHONE_LEVEL_REFERENCE_RMS))));
 }
 
-function isLiveSpeechFrameActive(currentDb: number, noiseFloorDb: number | null, microphoneLevel: number) {
-  if (microphoneLevel >= LIVE_SPEECH_END_LEVEL_TRIGGER) return true;
-  return (
-    noiseFloorDb !== null &&
-    microphoneLevel >= LIVE_SPEECH_END_LEVEL_TRIGGER * 0.65 &&
-    currentDb >= noiseFloorDb + LIVE_SPEECH_END_TRIGGER_DB
-  );
+function isLiveSpeechFrameActive(microphoneLevel: number) {
+  return microphoneLevel >= LIVE_SPEECH_END_LEVEL_TRIGGER;
 }
 
-function isLiveSpeechStartFrameLoud(currentDb: number, noiseFloorDb: number | null, microphoneLevel: number) {
-  return (
-    microphoneLevel >= LIVE_STANDBY_VOICE_LEVEL_TRIGGER ||
-    currentDb >= LIVE_STANDBY_ABSOLUTE_VOICE_TRIGGER_DB ||
-    (noiseFloorDb !== null && currentDb >= noiseFloorDb + LIVE_STANDBY_VOICE_TRIGGER_DB)
-  );
+function isLiveSpeechStartFrameLoud(microphoneLevel: number) {
+  return microphoneLevel >= LIVE_STANDBY_VOICE_LEVEL_TRIGGER;
 }
 
-function isLiveSpeechStartFrameStrong(currentDb: number, noiseFloorDb: number | null, microphoneLevel: number) {
-  return (
-    microphoneLevel >= LIVE_STANDBY_VOICE_LEVEL_STRONG_TRIGGER ||
-    currentDb >= LIVE_STANDBY_ABSOLUTE_VOICE_STRONG_TRIGGER_DB ||
-    (noiseFloorDb !== null && currentDb >= noiseFloorDb + LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB)
-  );
+function isLiveSpeechStartFrameStrong(microphoneLevel: number) {
+  return microphoneLevel >= LIVE_STANDBY_VOICE_LEVEL_STRONG_TRIGGER;
 }
 
 async function decodeAudioBlobToPcm16ChunksBase64(blob: Blob, sampleRate = 16000, chunkSize = 3200) {
@@ -1213,6 +1193,7 @@ export function LiveTalkPanel({
   const nextAudioTimeRef = useRef(0);
   const assistantPlaybackMutedUntilRef = useRef(0);
   const liveAssistantTurnIdRef = useRef<string | null>(null);
+  const microphoneAnalysisAccumulatorRef = useRef({ durationMs: 0, sampleCount: 0, sumSquares: 0 });
   const readyRef = useRef(false);
   const connectingRef = useRef(false);
   const activeRef = useRef(active);
@@ -1299,8 +1280,6 @@ export function LiveTalkPanel({
   const contextLimitHandlingRef = useRef(false);
   const standbyPreRollRef = useRef<Array<{ bytes: Uint8Array; base64: string; durationMs: number }>>([]);
   const standbyPreRollDurationMsRef = useRef(0);
-  const standbyNoiseFloorDbRef = useRef<number | null>(null);
-  const standbyNoiseCalibrationMsRef = useRef(0);
   const standbyVoiceWindowRef = useRef<LiveVoiceWindowFrame[]>([]);
   const standbyReconnectBlockedUntilRef = useRef(0);
   const voiceActivationPendingRef = useRef(false);
@@ -1475,13 +1454,7 @@ export function LiveTalkPanel({
       : "Live talk disconnected.";
   }, []);
 
-  const resetStandbyVoiceActivationState = useCallback((options?: { resetNoiseFloor?: boolean }) => {
-    if (options?.resetNoiseFloor) {
-      standbyNoiseFloorDbRef.current = null;
-      standbyNoiseCalibrationMsRef.current = 0;
-    } else if (standbyNoiseFloorDbRef.current !== null) {
-      standbyNoiseCalibrationMsRef.current = LIVE_STANDBY_NOISE_CALIBRATION_MS;
-    }
+  const resetStandbyVoiceActivationState = useCallback(() => {
     standbyVoiceWindowRef.current = [];
   }, []);
 
@@ -1507,7 +1480,7 @@ export function LiveTalkPanel({
     standbyReconnectBlockedUntilRef.current = performance.now() + LIVE_STANDBY_RECONNECT_GRACE_MS;
     standbyPreRollRef.current = [];
     standbyPreRollDurationMsRef.current = 0;
-    resetStandbyVoiceActivationState({ resetNoiseFloor: true });
+    resetStandbyVoiceActivationState();
     setStatus(message ?? standbyStatusMessage());
   }, [clearAssistantReplyTimeout, finalizeSpeechCaptureState, resetStandbyVoiceActivationState, standbyStatusMessage]);
 
@@ -2260,9 +2233,10 @@ export function LiveTalkPanel({
       microphoneHighPassStateRef.current = createSpeechHighPassState();
       microphoneLowPassStateRef.current = createSpeechLowPassState();
       microphoneNoiseGateStateRef.current = createSpeechNoiseGateState();
+      microphoneAnalysisAccumulatorRef.current = { durationMs: 0, sampleCount: 0, sumSquares: 0 };
       standbyPreRollRef.current = [];
       standbyPreRollDurationMsRef.current = 0;
-      resetStandbyVoiceActivationState({ resetNoiseFloor: true });
+      resetStandbyVoiceActivationState();
       pendingSpeechReadyToSendRef.current = false;
       pendingSpeechSendingRef.current = false;
       pendingSpeechVideoRef.current = null;
@@ -2405,17 +2379,28 @@ export function LiveTalkPanel({
               liveTurnRecorderSessionRef.current?.chunks.push(pcm16Bytes);
               const base64Pcm16 = float32ToBase64Pcm16(processed);
               appendStandbyPreRoll(pcm16Bytes, base64Pcm16, durationMs);
-              const analysisSamples = resampleFloat32Array(processed, LIVE_AUDIO_STREAM_SAMPLE_RATE, LIVE_AUDIO_ANALYSIS_SAMPLE_RATE);
-              let sumSquares = 0;
-              for (let index = 0; index < analysisSamples.length; index += 1) {
-                const sample = analysisSamples[index] ?? 0;
-                sumSquares += sample * sample;
+              let frameSumSquares = 0;
+              for (let index = 0; index < processed.length; index += 1) {
+                const sample = processed[index] ?? 0;
+                frameSumSquares += sample * sample;
               }
-              const rms = Math.sqrt(sumSquares / Math.max(1, analysisSamples.length));
               microphoneLastFrameAtRef.current = performance.now();
-              const microphoneLevel = normalizeMicrophoneUiLevel(rms);
-              onMicrophoneLevelChangeRef.current?.(microphoneLevel);
-              const currentDb = 20 * Math.log10(Math.max(rms, 1e-6));
+              const analysisAccumulator = microphoneAnalysisAccumulatorRef.current;
+              analysisAccumulator.durationMs += durationMs;
+              analysisAccumulator.sampleCount += processed.length;
+              analysisAccumulator.sumSquares += frameSumSquares;
+              const analysisReady = analysisAccumulator.durationMs >= LIVE_AUDIO_ANALYSIS_INTERVAL_MS;
+              const analyzedDurationMs = analysisReady ? analysisAccumulator.durationMs : 0;
+              const microphoneLevel = analysisReady
+                ? normalizeMicrophoneUiLevel(
+                    Math.sqrt(analysisAccumulator.sumSquares / Math.max(1, analysisAccumulator.sampleCount)),
+                  )
+                : null;
+              if (analysisReady) {
+                const nextMicrophoneLevel = microphoneLevel;
+                microphoneAnalysisAccumulatorRef.current = { durationMs: 0, sampleCount: 0, sumSquares: 0 };
+                onMicrophoneLevelChangeRef.current?.(nextMicrophoneLevel ?? 0);
+              }
 
               if (
                 userAudioSentToModelRef.current ||
@@ -2429,12 +2414,6 @@ export function LiveTalkPanel({
               if (performance.now() < standbyReconnectBlockedUntilRef.current) {
                 standbyPreRollRef.current = [];
                 standbyPreRollDurationMsRef.current = 0;
-                standbyNoiseFloorDbRef.current =
-                  standbyNoiseFloorDbRef.current === null ? currentDb : standbyNoiseFloorDbRef.current * 0.75 + currentDb * 0.25;
-                standbyNoiseCalibrationMsRef.current = Math.min(
-                  LIVE_STANDBY_NOISE_CALIBRATION_MS,
-                  standbyNoiseCalibrationMsRef.current + durationMs,
-                );
                 standbyVoiceWindowRef.current = [];
                 return;
               }
@@ -2449,24 +2428,22 @@ export function LiveTalkPanel({
               };
 
               const markPendingSpeechReadyIfSilent = () => {
-                const noiseFloorDb = standbyNoiseFloorDbRef.current;
+                if (microphoneLevel === null) return;
                 const lastMicrophoneLevel = userAudioLastMicrophoneLevelRef.current;
                 const levelStable =
                   lastMicrophoneLevel !== null &&
                   Math.abs(microphoneLevel - lastMicrophoneLevel) <= LIVE_SPEECH_END_STABLE_LEVEL_DELTA;
                 userAudioLastMicrophoneLevelRef.current = microphoneLevel;
                 userAudioStableLevelMsRef.current = levelStable
-                  ? userAudioStableLevelMsRef.current + durationMs
+                  ? userAudioStableLevelMsRef.current + analyzedDurationMs
                   : 0;
                 const stableBackground = userAudioStableLevelMsRef.current >= LIVE_SPEECH_END_STABLE_LEVEL_MS;
-                const speechActive = isLiveSpeechFrameActive(currentDb, noiseFloorDb, microphoneLevel);
+                const speechActive = isLiveSpeechFrameActive(microphoneLevel);
                 if (speechActive && !stableBackground) {
-                  userAudioSpeechDurationMsRef.current += durationMs;
+                  userAudioSpeechDurationMsRef.current += analyzedDurationMs;
                   userAudioTrailingSilenceMsRef.current = 0;
-                } else if (noiseFloorDb !== null) {
-                  userAudioTrailingSilenceMsRef.current += durationMs;
-                  const smoothing = currentDb <= noiseFloorDb + LIVE_STANDBY_NOISE_UPDATE_DB ? 0.04 : 0.002;
-                  standbyNoiseFloorDbRef.current = noiseFloorDb * (1 - smoothing) + currentDb * smoothing;
+                } else {
+                  userAudioTrailingSilenceMsRef.current += analyzedDurationMs;
                 }
 
                 const enoughSpeech = userAudioSpeechDurationMsRef.current >= LIVE_SPEECH_END_MIN_SPEECH_MS;
@@ -2481,28 +2458,24 @@ export function LiveTalkPanel({
 
               if (voiceActivationPendingRef.current || (socketRequestedRef.current && pendingUserAudioBase64ChunksRef.current.length > 0)) {
                 appendPendingSpeechChunk();
+                if (!analysisReady) return;
                 markPendingSpeechReadyIfSilent();
                 return;
               }
 
-              const currentNoiseFloorDb = standbyNoiseFloorDbRef.current;
-              if (currentNoiseFloorDb === null) {
-                standbyNoiseFloorDbRef.current = currentDb;
-                standbyNoiseCalibrationMsRef.current = durationMs;
-                standbyVoiceWindowRef.current = [];
+              if (!analysisReady || microphoneLevel === null) {
                 return;
               }
 
-              const volumeLiftDb = currentDb - currentNoiseFloorDb;
-              const loudSpeechFrame = isLiveSpeechStartFrameLoud(currentDb, currentNoiseFloorDb, microphoneLevel);
-              const strongSpeechFrame = isLiveSpeechStartFrameStrong(currentDb, currentNoiseFloorDb, microphoneLevel);
+              const loudSpeechFrame = isLiveSpeechStartFrameLoud(microphoneLevel);
+              const strongSpeechFrame = isLiveSpeechStartFrameStrong(microphoneLevel);
               const now = performance.now();
               const voiceWindow = standbyVoiceWindowRef.current.filter(
                 (frame) => now - frame.timeMs <= LIVE_STANDBY_VOICE_WINDOW_MS,
               );
               if (loudSpeechFrame || strongSpeechFrame) {
                 voiceWindow.push({
-                  durationMs,
+                  durationMs: analyzedDurationMs,
                   loud: loudSpeechFrame,
                   strong: strongSpeechFrame,
                   timeMs: now,
@@ -2510,18 +2483,6 @@ export function LiveTalkPanel({
                 standbyVoiceWindowRef.current = voiceWindow;
               } else {
                 standbyVoiceWindowRef.current = voiceWindow;
-                const smoothing = volumeLiftDb <= LIVE_STANDBY_NOISE_UPDATE_DB ? 0.08 : 0.005;
-                standbyNoiseFloorDbRef.current = currentNoiseFloorDb * (1 - smoothing) + currentDb * smoothing;
-              }
-
-              if (standbyNoiseCalibrationMsRef.current < LIVE_STANDBY_NOISE_CALIBRATION_MS) {
-                standbyNoiseCalibrationMsRef.current += durationMs;
-                if (!loudSpeechFrame) {
-                  standbyNoiseFloorDbRef.current = Math.min(
-                    standbyNoiseFloorDbRef.current ?? currentDb,
-                    currentNoiseFloorDb * 0.85 + currentDb * 0.15,
-                  );
-                }
               }
 
               const loudSpeechMs = voiceWindow.reduce((total, frame) => total + (frame.loud ? frame.durationMs : 0), 0);
