@@ -142,6 +142,10 @@ export type LiveVideoControls = {
   stopVideoShare: () => void;
 };
 
+export type LiveAssistantAudioControls = {
+  stop: () => void;
+};
+
 export type LiveVideoShareState = {
   mode: "camera" | "screen" | null;
   cameraDeviceId?: string | null;
@@ -1064,6 +1068,8 @@ export function LiveTalkPanel({
   onRegisterSend,
   onRegisterVideoControls,
   onRegisterHistoryControls,
+  onRegisterAssistantAudioControls,
+  onAssistantAudioPlayingChange,
   onHistoryInteract,
   onHistoryTargetsChange,
   onImageGenerationStateChange,
@@ -1096,6 +1102,8 @@ export function LiveTalkPanel({
   onRegisterSend?: ((send: LiveSendHandle | null) => void) | undefined;
   onRegisterVideoControls?: ((controls: LiveVideoControls | null) => void) | undefined;
   onRegisterHistoryControls?: ((controls: LiveHistoryControls | null) => void) | undefined;
+  onRegisterAssistantAudioControls?: ((controls: LiveAssistantAudioControls | null) => void) | undefined;
+  onAssistantAudioPlayingChange?: ((playing: boolean) => void) | undefined;
   onHistoryInteract?: (() => void) | undefined;
   onHistoryTargetsChange?: ((targets: LiveHistoryTargets) => void) | undefined;
   onImageGenerationStateChange?: ((generating: boolean) => void) | undefined;
@@ -1127,6 +1135,7 @@ export function LiveTalkPanel({
   const [activeVideoTurnId, setActiveVideoTurnId] = useState<string | null>(null);
   const [historyNotice, setHistoryNotice] = useState<{ id: string; content: string } | null>(null);
   const [transientStatusNotice, setTransientStatusNotice] = useState<string | null>(null);
+  const [assistantAudioPlayingTurnId, setAssistantAudioPlayingTurnId] = useState<string | null>(null);
   const liveHistoryRef = useRef<HTMLDivElement>(null);
   const lastLiveHistoryTouchYRef = useRef<number | null>(null);
   const turnsRef = useRef<LiveTurn[]>([]);
@@ -1156,6 +1165,10 @@ export function LiveTalkPanel({
   const pauseLiveSpeechRecordingRef = useRef(() => {});
   const resumeLiveSpeechRecordingRef = useRef(() => {});
   const assistantPlaybackGainRef = useRef<GainNode | null>(null);
+  const assistantPlaybackSourceReleasesRef = useRef<Set<() => void>>(new Set());
+  const assistantPlaybackSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  const assistantAudioPlayingTurnIdRef = useRef<string | null>(null);
+  const assistantAudioStoppedTurnIdRef = useRef<string | null>(null);
   const onFindInNoteRef = useRef(onFindInNote);
   const onMicrophoneLevelChangeRef = useRef(onMicrophoneLevelChange);
   const onScrollNoteRef = useRef(onScrollNote);
@@ -1196,6 +1209,7 @@ export function LiveTalkPanel({
   });
   const socketSessionIdRef = useRef(0);
   const userTurnIdRef = useRef<string | null>(null);
+  const userAudioUrlAppliedTurnIdRef = useRef<string | null>(null);
   const userAudioChunksRef = useRef<Uint8Array[]>([]);
   const liveTurnRecorderSessionRef = useRef<LiveTurnRecorderSession | null>(null);
   const pendingUserAudioChunksRef = useRef<Uint8Array[]>([]);
@@ -1314,6 +1328,47 @@ export function LiveTalkPanel({
     assistantPlaybackMutedUntilRef.current = 0;
     microphoneStreamingPausedRef.current = false;
   }, []);
+
+  const stopAssistantAudioPlayback = useCallback(() => {
+    assistantAudioStoppedTurnIdRef.current = assistantAudioPlayingTurnIdRef.current;
+    const releases = Array.from(assistantPlaybackSourceReleasesRef.current);
+    assistantPlaybackSourceReleasesRef.current.clear();
+    for (const release of releases) {
+      release();
+    }
+    const sources = Array.from(assistantPlaybackSourcesRef.current);
+    assistantPlaybackSourcesRef.current.clear();
+    for (const source of sources) {
+      try {
+        source.stop();
+      } catch {
+        // Already stopped sources are harmless.
+      }
+      try {
+        source.disconnect();
+      } catch {
+        // Already disconnected sources are harmless.
+      }
+    }
+    if (audioContextRef.current) {
+      nextAudioTimeRef.current = audioContextRef.current.currentTime;
+    } else {
+      nextAudioTimeRef.current = 0;
+    }
+    clearExpiredPlaybackPause();
+    assistantAudioPlayingTurnIdRef.current = null;
+    setAssistantAudioPlayingTurnId(null);
+  }, [clearExpiredPlaybackPause]);
+
+  useEffect(() => {
+    onAssistantAudioPlayingChange?.(Boolean(assistantAudioPlayingTurnId));
+  }, [assistantAudioPlayingTurnId, onAssistantAudioPlayingChange]);
+
+  useEffect(() => {
+    if (!onRegisterAssistantAudioControls) return;
+    onRegisterAssistantAudioControls({ stop: stopAssistantAudioPlayback });
+    return () => onRegisterAssistantAudioControls(null);
+  }, [onRegisterAssistantAudioControls, stopAssistantAudioPlayback]);
 
   const hasAudibleWebappPlayback = useCallback(() => {
     for (const element of webappPlayingMediaElementsRef.current) {
@@ -2690,6 +2745,20 @@ export function LiveTalkPanel({
       moveVideoShareTurnToEnd();
     };
 
+    const applyCapturedUserAudioUrl = (turnId: string | null, chunks: Uint8Array[]) => {
+      if (!turnId || chunks.length === 0 || userAudioUrlAppliedTurnIdRef.current === turnId) {
+        return;
+      }
+      const audioUrl = pcm16ChunksToWavUrl(chunks, LIVE_AUDIO_STREAM_SAMPLE_RATE);
+      if (!audioUrl) return;
+      userAudioUrlAppliedTurnIdRef.current = turnId;
+      audioUrlsRef.current.push(audioUrl);
+      setTurns((current) =>
+        current.map((turn) => (turn.id === turnId ? { ...turn, audioUrl } : turn)),
+      );
+      moveVideoShareTurnToEnd();
+    };
+
     const videoShareContent = (mode: "camera" | "screen") =>
       mode === "camera"
         ? cameraShareSendModeRef.current === "video"
@@ -2735,7 +2804,8 @@ export function LiveTalkPanel({
       const streamedChunks = [...userAudioChunksRef.current];
       const recorderSession = liveTurnRecorderSessionRef.current;
       const applyUserAudioUrl = (audioUrl: string | null) => {
-        if (!audioUrl || !userTurnId) return;
+        if (!audioUrl || !userTurnId || userAudioUrlAppliedTurnIdRef.current === userTurnId) return;
+        userAudioUrlAppliedTurnIdRef.current = userTurnId;
         audioUrlsRef.current.push(audioUrl);
         setTurns((current) =>
           current.map((turn) => (turn.id === userTurnId ? { ...turn, audioUrl } : turn)),
@@ -2771,6 +2841,7 @@ export function LiveTalkPanel({
       userAudioStreamEndedRef.current = false;
       userAudioSpeechDurationMsRef.current = 0;
       userAudioTrailingSilenceMsRef.current = 0;
+      userAudioUrlAppliedTurnIdRef.current = null;
     };
     finalizeUserAudioRef.current = finalizeUserAudio;
 
@@ -2934,10 +3005,14 @@ export function LiveTalkPanel({
     };
 
     const resetAssistantTurn = () => {
+      if (assistantAudioStoppedTurnIdRef.current === liveAssistantTurnIdRef.current) {
+        assistantAudioStoppedTurnIdRef.current = null;
+      }
       liveAssistantTurnIdRef.current = null;
     };
 
-    const playAudioChunk = (base64Audio: string) => {
+    const playAudioChunk = (base64Audio: string, turnId: string) => {
+      if (assistantAudioStoppedTurnIdRef.current === turnId) return;
       const context = createAudioContext();
       if (!context) return;
       if (context.state === "suspended") {
@@ -2959,16 +3034,31 @@ export function LiveTalkPanel({
       const releasePlayback = () => {
         if (!playbackTracked) return;
         playbackTracked = false;
+        assistantPlaybackSourceReleasesRef.current.delete(releasePlayback);
+        assistantPlaybackSourcesRef.current.delete(source);
         if (watchdogTimerId !== null) {
           window.clearTimeout(watchdogTimerId);
           webappPlaybackWatchdogTimerIdsRef.current = webappPlaybackWatchdogTimerIdsRef.current.filter((timerId) => timerId !== watchdogTimerId);
           watchdogTimerId = null;
         }
+        try {
+          source.disconnect();
+        } catch {
+          // Already disconnected sources are harmless.
+        }
         endWebappPlayback();
+        if (assistantPlaybackSourcesRef.current.size === 0) {
+          assistantAudioPlayingTurnIdRef.current = null;
+          setAssistantAudioPlayingTurnId(null);
+        }
       };
       source.onended = releasePlayback;
       beginWebappPlayback();
       playbackTracked = true;
+      assistantPlaybackSourceReleasesRef.current.add(releasePlayback);
+      assistantPlaybackSourcesRef.current.add(source);
+      assistantAudioPlayingTurnIdRef.current = turnId;
+      setAssistantAudioPlayingTurnId(turnId);
       try {
         source.start(startAt);
       } catch {
@@ -3385,6 +3475,7 @@ export function LiveTalkPanel({
           }),
         );
         sendUserAudioStreamEnd();
+        applyCapturedUserAudioUrl(userTurnIdRef.current, [...userAudioChunksRef.current]);
       } catch (error) {
         onError(error instanceof Error ? error.message : "Failed to send captured speech to live talk.");
         pendingSpeechSendingRef.current = false;
@@ -4514,10 +4605,10 @@ export function LiveTalkPanel({
               updateAssistantTurn(part.text);
             }
             if (part.inlineData?.data) {
-              createAssistantTurn();
+              const assistantTurnId = createAssistantTurn();
               moveVideoShareTurnToEnd();
               assistantAudioChunksRef.current.push(base64ToUint8Array(part.inlineData.data));
-              playAudioChunk(part.inlineData.data);
+              playAudioChunk(part.inlineData.data, assistantTurnId);
             }
           }
           if (serverContent.interrupted) {
@@ -4586,9 +4677,26 @@ export function LiveTalkPanel({
       stopVideoShare();
       webappPlaybackWatchdogTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
       webappPlaybackWatchdogTimerIdsRef.current = [];
+      assistantPlaybackSourceReleasesRef.current.clear();
+      assistantPlaybackSourcesRef.current.forEach((source) => {
+        try {
+          source.stop();
+        } catch {
+          // Already stopped sources are harmless.
+        }
+        try {
+          source.disconnect();
+        } catch {
+          // Already disconnected sources are harmless.
+        }
+      });
+      assistantPlaybackSourcesRef.current.clear();
       webappPlaybackCountRef.current = 0;
       nextAudioTimeRef.current = 0;
       assistantPlaybackMutedUntilRef.current = 0;
+      assistantAudioPlayingTurnIdRef.current = null;
+      assistantAudioStoppedTurnIdRef.current = null;
+      setAssistantAudioPlayingTurnId(null);
       assistantAudioChunksRef.current = [];
       cancelledToolCallIdsRef.current.clear();
       liveAssistantTurnIdRef.current = null;
@@ -4708,6 +4816,9 @@ export function LiveTalkPanel({
                     ))}
                   </div>
                 ) : null}
+                {turn.role === "user" && turn.audioUrl && userAudioDisplay.inlineIds.has(turn.id) ? (
+                  <audio className={turn.content ? "mb-2 h-10 w-full" : "h-10 w-full"} controls preload="metadata" src={turn.audioUrl} />
+                ) : null}
                 {turn.content ? <div className="whitespace-pre-wrap break-words">{turn.content}</div> : null}
                 {turn.videoStream ? (
                   <div
@@ -4802,7 +4913,7 @@ export function LiveTalkPanel({
                     ) : null}
                   </div>
                 ) : null}
-                {turn.audioUrl && (turn.role !== "user" || userAudioDisplay.inlineIds.has(turn.id)) ? (
+                {turn.audioUrl && turn.role !== "user" ? (
                   <audio className="mt-2 h-10 w-full" controls preload="metadata" src={turn.audioUrl} />
                 ) : null}
               </div>
@@ -4827,7 +4938,7 @@ export function LiveTalkPanel({
           ) : null}
           {orderedTurns.length === 0 ? (
             <div className="mt-auto px-1 py-2 text-sm text-ink/45">
-              Live transcript history appears here once Gemini starts speaking.
+              Live transcript history appears here once you send live audio or Gemini starts speaking.
             </div>
           ) : null}
           {orderedTurns.length > 0 ? <div aria-hidden="true" className="shrink-0 rounded-t-[20px]" style={{ height: 128 }} /> : null}

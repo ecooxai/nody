@@ -1058,7 +1058,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     syncSelectedGutterLines([]);
 
     if (!editable) {
-      publishBodyChange(bodyDraft, "typing");
+      publishBodyChange(bodyDraftRef.current, "typing");
       selectionRef.current = { start: 0, end: 0 };
       return;
     }

@@ -4,6 +4,7 @@ import { type DragEvent, type TouchEvent, type WheelEvent, useCallback, useEffec
 
 import {
   LiveTalkPanel,
+  type LiveAssistantAudioControls,
   type LiveHistoryControls,
   type LiveHistoryImage,
   type LiveHistoryTargets,
@@ -835,6 +836,8 @@ export function AIChatPanel({
   const [liveSendHandle, setLiveSendHandle] = useState<LiveSendHandle | null>(null);
   const [liveVideoControls, setLiveVideoControls] = useState<LiveVideoControls | null>(null);
   const [liveHistoryControls, setLiveHistoryControls] = useState<LiveHistoryControls | null>(null);
+  const [liveAssistantAudioControls, setLiveAssistantAudioControls] = useState<LiveAssistantAudioControls | null>(null);
+  const [liveAssistantAudioPlaying, setLiveAssistantAudioPlaying] = useState(false);
   const [imageGenerationActive, setImageGenerationActive] = useState(false);
   const [chatLatestMessageAvailable, setChatLatestMessageAvailable] = useState(false);
   const [liveLatestMessageAvailable, setLiveLatestMessageAvailable] = useState(false);
@@ -2649,6 +2652,20 @@ export function AIChatPanel({
           </div>
         </div>
         <div className="flex items-center gap-1">
+          {activeTab === "live" && liveAssistantAudioPlaying && liveAssistantAudioControls ? (
+            <button
+              aria-label="Mute AI audio reply"
+              className="flex h-7 w-7 items-center justify-center rounded-[4px] bg-[#fff7e8] text-[#bb3e2d] transition hover:bg-[#ffeacd]"
+              onClick={() => liveAssistantAudioControls.stop()}
+              title="Mute AI audio"
+              type="button"
+            >
+              <svg aria-hidden="true" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
+                <path d="M5 9v6h3l5 4V5L8 9H5Z" stroke="currentColor" strokeLinejoin="round" strokeWidth="1.8" />
+                <path d="m17 9 4 4m0-4-4 4" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+              </svg>
+            </button>
+          ) : null}
           <button
             aria-label={historyOnly ? `Return to ${activeTab}` : activeTab === "live" ? "Show transcript" : "Show history"}
             className={`flex h-7 w-7 items-center justify-center rounded-[4px] transition ${
@@ -3783,6 +3800,8 @@ export function AIChatPanel({
             onOpenNote={onOpenNote}
             onScrollNote={onScrollNote}
             onRegisterHistoryControls={setLiveHistoryControls}
+            onRegisterAssistantAudioControls={setLiveAssistantAudioControls}
+            onAssistantAudioPlayingChange={setLiveAssistantAudioPlaying}
             onRegisterSend={setLiveSendHandle}
             onRegisterVideoControls={setLiveVideoControls}
             onSessionStateChange={setLiveSessionState}
