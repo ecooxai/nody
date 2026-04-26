@@ -86,6 +86,7 @@ const LIVE_AUDIO_ANALYSIS_SAMPLE_RATE = 1000;
 const LIVE_AUDIO_STREAM_PROCESSOR_BUFFER_SIZE = 4096;
 const LIVE_MICROPHONE_LEVEL_REFERENCE_RMS = 0.12;
 const LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS = 1200;
+const LIVE_MICROPHONE_DETECTOR_WATCHDOG_INTERVAL_MS = 3_000;
 const LIVE_MICROPHONE_STALE_TIMEOUT_MS = 3200;
 const LIVE_SPEECH_HIGH_PASS_CUTOFF_HZ = 80;
 const LIVE_SPEECH_LOW_PASS_CUTOFF_HZ = 7000;
@@ -1753,7 +1754,10 @@ export function LiveTalkPanel({
         clearExpiredPlaybackPause();
       }
       const mutedByPlayback =
-        microphoneStreamingPausedRef.current || webappPlaybackCountRef.current > 0 || now < assistantPlaybackMutedUntilRef.current;
+        microphoneStreamingPausedRef.current ||
+        webappPlaybackCountRef.current > 0 ||
+        now < assistantPlaybackMutedUntilRef.current ||
+        hasAudibleWebappPlayback();
 
       if (mutedByPlayback) {
         onMicrophoneLevelChangeRef.current?.(0);
@@ -1775,6 +1779,61 @@ export function LiveTalkPanel({
         void refreshMicrophoneRef.current();
       }
     }, LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [clearExpiredPlaybackPause, hasAudibleWebappPlayback, sessionRequested]);
+
+  useEffect(() => {
+    if (!sessionRequested) return;
+
+    const intervalId = window.setInterval(() => {
+      if (!microphoneCaptureEnabledRef.current) return;
+
+      const stream = microphoneStreamRef.current;
+      const track = stream?.getAudioTracks()[0] ?? null;
+      const processor = microphoneProcessorRef.current;
+      const audioContext = microphoneAudioContextRef.current;
+      const now = performance.now();
+
+      if (
+        webappPlaybackCountRef.current > 0 &&
+        assistantPlaybackMutedUntilRef.current > 0 &&
+        now > assistantPlaybackMutedUntilRef.current + LIVE_PLAYBACK_STALE_RESUME_GRACE_MS &&
+        !hasAudibleWebappPlayback()
+      ) {
+        clearExpiredPlaybackPause();
+      }
+
+      if (audioContext?.state === "suspended") {
+        void audioContext.resume().catch(() => undefined);
+      }
+
+      const mutedByPlayback =
+        microphoneStreamingPausedRef.current ||
+        webappPlaybackCountRef.current > 0 ||
+        now < assistantPlaybackMutedUntilRef.current ||
+        hasAudibleWebappPlayback();
+      if (mutedByPlayback) {
+        return;
+      }
+
+      const detectorMissing =
+        !stream ||
+        !stream.active ||
+        !track ||
+        track.readyState !== "live" ||
+        !processor ||
+        !processor.onaudioprocess ||
+        !audioContext ||
+        audioContext.state === "closed";
+      const detectorStale =
+        microphoneLastFrameAtRef.current > 0 &&
+        now - microphoneLastFrameAtRef.current > LIVE_MICROPHONE_DETECTOR_WATCHDOG_INTERVAL_MS;
+
+      if (detectorMissing || detectorStale) {
+        void refreshMicrophoneRef.current();
+      }
+    }, LIVE_MICROPHONE_DETECTOR_WATCHDOG_INTERVAL_MS);
 
     return () => window.clearInterval(intervalId);
   }, [clearExpiredPlaybackPause, hasAudibleWebappPlayback, sessionRequested]);
@@ -2118,13 +2177,21 @@ export function LiveTalkPanel({
     const requestMicrophone = async (options?: { force?: boolean }) => {
       const forceRefresh = Boolean(options?.force);
       const preferredDeviceId = preferredMicrophoneDeviceIdRef.current;
+      const now = performance.now();
+      const audiblePlaybackActive =
+        webappPlaybackCountRef.current > 0 || now < assistantPlaybackMutedUntilRef.current || hasAudibleWebappPlayback();
       const existingStream = microphoneStreamRef.current;
       const existingTracks = existingStream?.getAudioTracks() ?? [];
       const existingStreamLive = existingStream?.active && existingTracks.some((track) => track.readyState === "live");
+      const existingDetectorLive =
+        Boolean(microphoneProcessorRef.current?.onaudioprocess) && microphoneAudioContextRef.current?.state !== "closed";
       const existingVideoAudio = microphoneUsesVideoAudioTrackRef.current && videoShareModeRef.current === "camera";
       const existingPreferredDevice = preferredDeviceId ? microphoneStreamDeviceIdRef.current === preferredDeviceId : true;
-      if (!forceRefresh && existingStream && existingStreamLive && (existingVideoAudio || existingPreferredDevice)) {
+      if (!forceRefresh && existingStream && existingStreamLive && existingDetectorLive && (existingVideoAudio || existingPreferredDevice)) {
         return existingStream;
+      }
+      if (audiblePlaybackActive) {
+        return existingStreamLive ? existingStream : null;
       }
       if (typeof navigator === "undefined" || !navigator.mediaDevices?.getUserMedia) {
         return null;
@@ -2430,7 +2497,14 @@ export function LiveTalkPanel({
       resetMicrophoneRef.current = () => {};
       resetMicrophone();
     };
-  }, [appendStandbyPreRoll, armAssistantReplyTimeout, requestSocketConnection, resetStandbyVoiceActivationState, sendUserAudioStreamEnd]);
+  }, [
+    appendStandbyPreRoll,
+    armAssistantReplyTimeout,
+    hasAudibleWebappPlayback,
+    requestSocketConnection,
+    resetStandbyVoiceActivationState,
+    sendUserAudioStreamEnd,
+  ]);
 
   useEffect(
     () => () => {
