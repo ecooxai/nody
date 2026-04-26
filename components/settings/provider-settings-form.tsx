@@ -7,6 +7,74 @@ import { Panel } from "@/components/ui/panel";
 import { defaultLiveRecordingSettings, providerDefaults } from "@/lib/providers/defaults";
 import type { ProviderName, ProviderSettings } from "@/shared/types";
 
+const uniqueOptions = (items: string[]) => Array.from(new Set(items.filter(Boolean)));
+
+const geminiModelOptions = uniqueOptions([
+  "gemini-3.1-pro-preview",
+  "gemini-flash-latest",
+  "gemini-flash-lite-latest",
+  providerDefaults.gemini.model,
+]);
+const geminiLiveModelOptions = uniqueOptions([
+  "gemini-3.1-flash-live-preview",
+  "gemini-2.5-flash-native-audio-preview-12-2025",
+  providerDefaults.gemini.liveModel,
+]);
+const geminiImageModelOptions = uniqueOptions([
+  "gemini-3-pro-image-preview",
+  "gemini-2.5-flash-image",
+  providerDefaults.gemini.imageModel,
+]);
+
+function ModelInput({
+  label,
+  onChange,
+  options,
+  placeholder,
+  value,
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  options: string[];
+  placeholder?: string;
+  value: string;
+}) {
+  const [focused, setFocused] = useState(false);
+  const showOptions = focused && value.trim() === "" && options.length > 0;
+
+  return (
+    <label className="relative grid gap-1 text-sm">
+      <span>{label}</span>
+      <input
+        className="rounded-2xl border border-ink/10 px-3 py-2"
+        onBlur={() => setFocused(false)}
+        onChange={(event) => onChange(event.target.value)}
+        onFocus={() => setFocused(true)}
+        placeholder={placeholder}
+        value={value}
+      />
+      {showOptions ? (
+        <div className="absolute left-0 right-0 top-full z-30 mt-1 grid gap-1 rounded-[12px] border border-ink/10 bg-white p-1 shadow-[0_14px_30px_rgba(15,23,42,0.12)]">
+          {options.map((option) => (
+            <button
+              className="truncate rounded-[8px] px-3 py-2 text-left text-xs text-ink transition hover:bg-mist"
+              key={option}
+              onClick={() => {
+                onChange(option);
+                setFocused(false);
+              }}
+              onMouseDown={(event) => event.preventDefault()}
+              type="button"
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </label>
+  );
+}
+
 export function ProviderSettingsForm({
   initialValue,
   onSave,
@@ -28,7 +96,9 @@ export function ProviderSettingsForm({
       apiUrl: providerDefaults[provider].apiUrl,
       apiKey: value.apiKey,
       model: providerDefaults[provider].model,
+      liveApiKey: value.liveApiKey ?? "",
       liveModel: providerDefaults[provider].liveModel,
+      imageApiKey: value.imageApiKey ?? "",
       imageModel: providerDefaults[provider].imageModel,
       liveRecording,
     });
@@ -73,34 +143,48 @@ export function ProviderSettingsForm({
             value={value.apiKey}
           />
         </label>
-        <label className="grid gap-1 text-sm">
-          <span>Model</span>
-          <input
-            className="rounded-2xl border border-ink/10 px-3 py-2"
-            onChange={(event) => setValue({ ...value, model: event.target.value })}
-            value={value.model}
-          />
-        </label>
+        <ModelInput
+          label="Model"
+          onChange={(model) => setValue({ ...value, model })}
+          options={value.provider === "gemini" ? geminiModelOptions : []}
+          value={value.model}
+        />
         {value.provider === "gemini" ? (
           <>
+            <ModelInput
+              label="Live model"
+              onChange={(liveModel) => setValue({ ...value, liveModel })}
+              options={geminiLiveModelOptions}
+              value={value.liveModel}
+            />
             <label className="grid gap-1 text-sm">
-              <span>Live model</span>
+              <span>Live model API key</span>
               <input
                 className="rounded-2xl border border-ink/10 px-3 py-2"
-                onChange={(event) => setValue({ ...value, liveModel: event.target.value })}
-                value={value.liveModel}
+                onChange={(event) => setValue({ ...value, liveApiKey: event.target.value })}
+                placeholder="Uses global API key when empty"
+                type="password"
+                value={value.liveApiKey ?? ""}
               />
             </label>
+            <ModelInput
+              label="Image model"
+              onChange={(imageModel) => setValue({ ...value, imageModel })}
+              options={geminiImageModelOptions}
+              placeholder={providerDefaults.gemini.imageModel}
+              value={value.imageModel}
+            />
             <label className="grid gap-1 text-sm">
-              <span>Image model</span>
+              <span>Image model API key</span>
               <input
                 className="rounded-2xl border border-ink/10 px-3 py-2"
-                onChange={(event) => setValue({ ...value, imageModel: event.target.value })}
-                placeholder="gemini-3.1-flash-image-preview"
-                value={value.imageModel}
+                onChange={(event) => setValue({ ...value, imageApiKey: event.target.value })}
+                placeholder="Uses global API key when empty"
+                type="password"
+                value={value.imageApiKey ?? ""}
               />
               <span className="text-xs text-ink/55">
-                Gemini image generation is wired to this field. Examples: `gemini-3.1-flash-image-preview`, `gemini-3-pro-image-preview`.
+                Empty model-specific keys fall back to the global Gemini API key.
               </span>
             </label>
           </>
@@ -188,7 +272,7 @@ export function ProviderSettingsForm({
               />
             </div>
             <span className="text-xs text-ink/55">
-              When enabled, live talk falls back to standby after 20 seconds with no AI reply, keeps listening locally, and reconnects after about 2 seconds of speech that rises above the background level.
+              When enabled, live talk falls back to standby after 60 seconds with no AI reply, keeps listening locally, and reconnects after about 2 seconds of speech that rises above the background level.
             </span>
           </label>
         </div>

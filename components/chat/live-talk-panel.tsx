@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type TouchEvent, type WheelEvent } from "react";
 
 import { apiClient } from "@/lib/api/client";
 import { stripMarkdown } from "@/lib/editor/markdown";
@@ -92,24 +92,28 @@ const LIVE_SPEECH_LOW_PASS_CUTOFF_HZ = 7000;
 const LIVE_SPEECH_NOISE_GATE_FLOOR_RMS = 0.004;
 const LIVE_SPEECH_NOISE_GATE_OPEN_RMS = 0.018;
 const LIVE_SPEECH_NOISE_GATE_MIN_GAIN = 0.25;
-const LIVE_STANDBY_REPLY_TIMEOUT_MS = 20_000;
+const LIVE_STANDBY_REPLY_TIMEOUT_MS = 60_000;
+const LIVE_STANDBY_INTERACTION_IDLE_DELAY_MS = 2_000;
+const LIVE_PLAYBACK_STALE_RESUME_GRACE_MS = 3_000;
 const LIVE_STANDBY_PREROLL_MS = 5_000;
 const LIVE_STANDBY_BUFFER_LIMIT_MS = 30_000;
 const LIVE_STANDBY_NOISE_CALIBRATION_MS = 1_500;
 const LIVE_STANDBY_SPEECH_PREROLL_MS = 2_000;
 const LIVE_STANDBY_VOICE_TRIGGER_DB = 8;
 const LIVE_STANDBY_VOICE_STRONG_TRIGGER_DB = 16;
-const LIVE_STANDBY_VOICE_TRIGGER_MS = 2_000;
+const LIVE_STANDBY_VOICE_TRIGGER_MS = 900;
 const LIVE_STANDBY_VOICE_BURST_WINDOW_MS = 2_000;
 const LIVE_STANDBY_VOICE_BURST_TRIGGER_COUNT = 3;
 const LIVE_STANDBY_VOICE_BURST_RESET_DB = 3;
 const LIVE_STANDBY_NOISE_UPDATE_DB = 4;
 const LIVE_STANDBY_RECONNECT_GRACE_MS = 2_500;
-const LIVE_SPEECH_END_TRIGGER_DB = 6;
+const LIVE_SPEECH_END_TRIGGER_DB = 3;
 const LIVE_SPEECH_END_MIN_SPEECH_MS = 350;
-const LIVE_SPEECH_END_TRAILING_SILENCE_MS = 2_000;
+const LIVE_SPEECH_END_TRAILING_SILENCE_MS = 1_200;
+const LIVE_SPEECH_FORCE_SEND_MS = 30_000;
 const LIVE_RECONNECT_TRANSCRIPT_MAX_CHARS = 6000;
 const LOCAL_AUDIO_INPUT_LABEL_PATTERN = /\b(stereo mix|what u hear|loopback|monitor of|blackhole|soundflower|vb-audio|voicemeeter|cable output|system audio|desktop audio)\b/i;
+const LIVE_SCROLL_EDGE_TOLERANCE = 1;
 
 export type LiveSendAttachment = {
   kind: AIMediaKind;
@@ -357,6 +361,33 @@ function isAndroidChromeBrowser() {
   if (typeof navigator === "undefined") return false;
   const userAgent = navigator.userAgent.toLowerCase();
   return userAgent.includes("android") && (userAgent.includes("chrome") || userAgent.includes("chromium"));
+}
+
+function canScrollVertically(element: HTMLElement) {
+  if (element.scrollHeight <= element.clientHeight + LIVE_SCROLL_EDGE_TOLERANCE) return false;
+  const overflowY = window.getComputedStyle(element).overflowY;
+  return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+}
+
+function findVerticalScrollContainer(target: EventTarget | null, boundary: HTMLElement) {
+  if (!(target instanceof Node)) return null;
+
+  let current: Node | null = target;
+  while (current && boundary.contains(current)) {
+    if (current instanceof HTMLElement && canScrollVertically(current)) {
+      return current;
+    }
+    if (current === boundary) break;
+    current = current.parentNode;
+  }
+
+  return null;
+}
+
+function normalizeWheelDeltaY(event: WheelEvent<HTMLElement>) {
+  if (event.deltaMode === 1) return event.deltaY * 16;
+  if (event.deltaMode === 2) return event.deltaY * window.innerHeight;
+  return event.deltaY;
 }
 
 function buildLiveMicAudioConstraints(settings: LiveRecordingSettings): MediaTrackConstraints {
@@ -1096,6 +1127,7 @@ export function LiveTalkPanel({
   const [historyNotice, setHistoryNotice] = useState<{ id: string; content: string } | null>(null);
   const [transientStatusNotice, setTransientStatusNotice] = useState<string | null>(null);
   const liveHistoryRef = useRef<HTMLDivElement>(null);
+  const lastLiveHistoryTouchYRef = useRef<number | null>(null);
   const turnsRef = useRef<LiveTurn[]>([]);
   const wasNearLiveHistoryBottomRef = useRef(true);
   const historyNoticeTimerRef = useRef<number | null>(null);
@@ -1188,6 +1220,7 @@ export function LiveTalkPanel({
   const videoShareElementRef = useRef<HTMLVideoElement | null>(null);
   const videoShareCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoShareIntervalRef = useRef<number | null>(null);
+  const videoShareFrameInFlightRef = useRef(false);
   const videoShareModeRef = useRef<"camera" | "screen" | null>(null);
   const cameraShareSendModeRef = useRef<CameraShareSendMode | null>(null);
   const screenShareSendModeRef = useRef<ScreenShareSendMode | null>(null);
@@ -1204,6 +1237,8 @@ export function LiveTalkPanel({
   const noteReconnectTimerRef = useRef<number | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const assistantReplyTimeoutRef = useRef<number | null>(null);
+  const webappInteractionPointerCountRef = useRef(0);
+  const webappInteractionActiveUntilRef = useRef(0);
   const pendingGeneratedImageScrollRef = useRef(false);
   const liveContextTokensRef = useRef(0);
   const contextLimitHandlingRef = useRef(false);
@@ -1267,11 +1302,39 @@ export function LiveTalkPanel({
     }
   }, []);
 
+  const clearExpiredPlaybackPause = useCallback(() => {
+    if (webappPlaybackResumeTimerRef.current) {
+      window.clearTimeout(webappPlaybackResumeTimerRef.current);
+      webappPlaybackResumeTimerRef.current = null;
+    }
+    webappPlaybackWatchdogTimerIdsRef.current.forEach((timerId) => window.clearTimeout(timerId));
+    webappPlaybackWatchdogTimerIdsRef.current = [];
+    webappPlaybackCountRef.current = 0;
+    assistantPlaybackMutedUntilRef.current = 0;
+    microphoneStreamingPausedRef.current = false;
+  }, []);
+
+  const hasAudibleWebappPlayback = useCallback(() => {
+    for (const element of webappPlayingMediaElementsRef.current) {
+      if (!element.paused && !element.ended && !element.muted && element.volume > 0) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+
   const clearAssistantReplyTimeout = useCallback(() => {
     if (assistantReplyTimeoutRef.current) {
       window.clearTimeout(assistantReplyTimeoutRef.current);
       assistantReplyTimeoutRef.current = null;
     }
+  }, []);
+
+  const getWebappInteractionDelayMs = useCallback(() => {
+    if (webappInteractionPointerCountRef.current > 0) {
+      return LIVE_STANDBY_INTERACTION_IDLE_DELAY_MS;
+    }
+    return Math.max(0, webappInteractionActiveUntilRef.current - performance.now());
   }, []);
 
   const sendUserAudioStreamEnd = useCallback(() => {
@@ -1337,19 +1400,30 @@ export function LiveTalkPanel({
   const armAssistantReplyTimeout = useCallback(() => {
     clearAssistantReplyTimeout();
     if (!sessionRequestedRef.current || !liveRecordingSettingsRef.current.standbyEnabled) return;
+    const enterStandbyWhenIdle = () => {
+      const interactionDelayMs = getWebappInteractionDelayMs();
+      if (interactionDelayMs > 0) {
+        assistantReplyTimeoutRef.current = window.setTimeout(() => {
+          assistantReplyTimeoutRef.current = null;
+          enterStandbyWhenIdle();
+        }, interactionDelayMs);
+        return;
+      }
+      enterStandby("No AI reply for 60 seconds. Back in standby listening.");
+    };
     assistantReplyTimeoutRef.current = window.setTimeout(() => {
       assistantReplyTimeoutRef.current = null;
       if (sendUserAudioStreamEnd()) {
         setStatus("No AI reply yet. Ending the current audio stream...");
         assistantReplyTimeoutRef.current = window.setTimeout(() => {
           assistantReplyTimeoutRef.current = null;
-          enterStandby("No AI reply for 20 seconds. Back in standby listening.");
+          enterStandbyWhenIdle();
         }, LIVE_STANDBY_REPLY_TIMEOUT_MS);
         return;
       }
-      enterStandby("No AI reply for 20 seconds. Back in standby listening.");
+      enterStandbyWhenIdle();
     }, LIVE_STANDBY_REPLY_TIMEOUT_MS);
-  }, [clearAssistantReplyTimeout, enterStandby, sendUserAudioStreamEnd]);
+  }, [clearAssistantReplyTimeout, enterStandby, getWebappInteractionDelayMs, sendUserAudioStreamEnd]);
 
   const buildConnectionAudioNotice = useCallback(() => {
     const enabledProcessing = [
@@ -1466,6 +1540,38 @@ export function LiveTalkPanel({
       }
     };
   }, [beginWebappPlayback, endWebappPlayback]);
+
+  useEffect(() => {
+    const markKeyboardInteraction = () => {
+      webappInteractionActiveUntilRef.current = performance.now() + LIVE_STANDBY_INTERACTION_IDLE_DELAY_MS;
+    };
+    const handlePointerDown = () => {
+      webappInteractionPointerCountRef.current += 1;
+      markKeyboardInteraction();
+    };
+    const handlePointerUp = () => {
+      webappInteractionPointerCountRef.current = Math.max(0, webappInteractionPointerCountRef.current - 1);
+      markKeyboardInteraction();
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown, true);
+    window.addEventListener("pointerup", handlePointerUp, true);
+    window.addEventListener("pointercancel", handlePointerUp, true);
+    window.addEventListener("keydown", markKeyboardInteraction, true);
+    window.addEventListener("beforeinput", markKeyboardInteraction, true);
+    window.addEventListener("input", markKeyboardInteraction, true);
+
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown, true);
+      window.removeEventListener("pointerup", handlePointerUp, true);
+      window.removeEventListener("pointercancel", handlePointerUp, true);
+      window.removeEventListener("keydown", markKeyboardInteraction, true);
+      window.removeEventListener("beforeinput", markKeyboardInteraction, true);
+      window.removeEventListener("input", markKeyboardInteraction, true);
+      webappInteractionPointerCountRef.current = 0;
+      webappInteractionActiveUntilRef.current = 0;
+    };
+  }, []);
 
   const clearVideoShareIdleTimer = () => {
     if (videoShareIdleTimerRef.current) {
@@ -1635,14 +1741,27 @@ export function LiveTalkPanel({
 
       const stream = microphoneStreamRef.current;
       const processor = microphoneProcessorRef.current;
+      const audioContext = microphoneAudioContextRef.current;
       const track = stream?.getAudioTracks()[0] ?? null;
       const now = performance.now();
+      if (
+        webappPlaybackCountRef.current > 0 &&
+        assistantPlaybackMutedUntilRef.current > 0 &&
+        now > assistantPlaybackMutedUntilRef.current + LIVE_PLAYBACK_STALE_RESUME_GRACE_MS &&
+        !hasAudibleWebappPlayback()
+      ) {
+        clearExpiredPlaybackPause();
+      }
       const mutedByPlayback =
         microphoneStreamingPausedRef.current || webappPlaybackCountRef.current > 0 || now < assistantPlaybackMutedUntilRef.current;
 
       if (mutedByPlayback) {
         onMicrophoneLevelChangeRef.current?.(0);
         return;
+      }
+
+      if (audioContext?.state === "suspended") {
+        void audioContext.resume().catch(() => undefined);
       }
 
       if (!stream || !stream.active || !processor || !track || track.readyState !== "live") {
@@ -1658,7 +1777,7 @@ export function LiveTalkPanel({
     }, LIVE_MICROPHONE_STALE_CHECK_INTERVAL_MS);
 
     return () => window.clearInterval(intervalId);
-  }, [sessionRequested]);
+  }, [clearExpiredPlaybackPause, hasAudibleWebappPlayback, sessionRequested]);
 
   useEffect(() => {
     onVideoShareStateChangeRef.current = onVideoShareStateChange;
@@ -1802,6 +1921,49 @@ export function LiveTalkPanel({
     wasNearLiveHistoryBottomRef.current = nearLatest;
     setLatestMessageAvailable(!nearLatest);
   }, [setLatestMessageAvailable]);
+
+  const containLiveHistoryWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    if (event.ctrlKey || event.metaKey || event.deltaY === 0) return;
+
+    event.stopPropagation();
+    onHistoryInteract?.();
+    const deltaY = normalizeWheelDeltaY(event);
+    const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
+    if (scrollContainer) {
+      scrollContainer.scrollTop += deltaY;
+    }
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    updateLiveHistoryScrollState();
+  }, [onHistoryInteract, updateLiveHistoryScrollState]);
+
+  const rememberLiveHistoryTouch = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    lastLiveHistoryTouchYRef.current = event.touches[0]?.clientY ?? null;
+  }, []);
+
+  const containLiveHistoryTouch = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    if (event.touches.length !== 1) return;
+
+    event.stopPropagation();
+    onHistoryInteract?.();
+    const currentY = event.touches[0].clientY;
+    const previousY = lastLiveHistoryTouchYRef.current;
+    lastLiveHistoryTouchYRef.current = currentY;
+    if (previousY === null) return;
+
+    const deltaY = previousY - currentY;
+    if (deltaY === 0) return;
+
+    const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
+    if (scrollContainer) {
+      scrollContainer.scrollTop += deltaY;
+    }
+    if (event.cancelable) {
+      event.preventDefault();
+    }
+    updateLiveHistoryScrollState();
+  }, [onHistoryInteract, updateLiveHistoryScrollState]);
 
   const scrollToLiveLatest = useCallback(() => {
     const container = liveHistoryRef.current;
@@ -2041,6 +2203,7 @@ export function LiveTalkPanel({
             microphoneGainRef.current = gain;
             microphoneProcessorRef.current = processor;
             microphoneSinkGainRef.current = sinkGain;
+            microphoneLastFrameAtRef.current = performance.now();
 
             pauseLiveSpeechRecordingRef.current = () => {
               microphoneStreamingPausedRef.current = true;
@@ -2127,10 +2290,10 @@ export function LiveTalkPanel({
                   standbyNoiseFloorDbRef.current = noiseFloorDb * (1 - smoothing) + currentDb * smoothing;
                 }
 
-                if (
-                  userAudioSpeechDurationMsRef.current >= LIVE_SPEECH_END_MIN_SPEECH_MS &&
-                  userAudioTrailingSilenceMsRef.current >= LIVE_SPEECH_END_TRAILING_SILENCE_MS
-                ) {
+                const enoughSpeech = userAudioSpeechDurationMsRef.current >= LIVE_SPEECH_END_MIN_SPEECH_MS;
+                const silenceEndedTurn = userAudioTrailingSilenceMsRef.current >= LIVE_SPEECH_END_TRAILING_SILENCE_MS;
+                const captureWindowFull = pendingUserAudioDurationMsRef.current >= LIVE_SPEECH_FORCE_SEND_MS;
+                if (enoughSpeech && (silenceEndedTurn || captureWindowFull)) {
                   pendingSpeechReadyToSendRef.current = true;
                   voiceActivationPendingRef.current = false;
                   void flushPendingSpeechAudioRef.current();
@@ -2323,11 +2486,12 @@ export function LiveTalkPanel({
       return;
     }
 
-    if (!providerSettings.apiKey) {
+    const liveApiKey = (providerSettings.liveApiKey || providerSettings.apiKey).trim();
+    if (!liveApiKey) {
       clearReconnectTimer();
       setConnecting(false);
       setReady(false);
-      setStatus("Save your Gemini API key to start live talk.");
+      setStatus("Save your Gemini global or live API key to start live talk.");
       return;
     }
 
@@ -2340,7 +2504,7 @@ export function LiveTalkPanel({
       return;
     }
 
-    const url = buildLiveWebSocketUrl(providerSettings.apiUrl, providerSettings.apiKey);
+    const url = buildLiveWebSocketUrl(providerSettings.apiUrl, liveApiKey);
     setConnecting(true);
     setReady(false);
     setStatus("Connecting to Gemini Live...");
@@ -2878,6 +3042,7 @@ export function LiveTalkPanel({
         window.clearInterval(videoShareIntervalRef.current);
         videoShareIntervalRef.current = null;
       }
+      videoShareFrameInFlightRef.current = false;
       videoShareStreamRef.current?.getTracks().forEach((track) => track.stop());
       videoShareStreamRef.current = null;
       if (videoShareElementRef.current) {
@@ -2922,6 +3087,33 @@ export function LiveTalkPanel({
       return dataBase64 || null;
     };
 
+    const captureVideoFrameBase64Async = async (maxWidth = 960, quality = 0.68) => {
+      const videoElement = videoShareElementRef.current;
+      if (!videoElement) {
+        return null;
+      }
+      if (videoElement.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || videoElement.videoWidth <= 0 || videoElement.videoHeight <= 0) {
+        return null;
+      }
+
+      const canvas = videoShareCanvasRef.current ?? document.createElement("canvas");
+      videoShareCanvasRef.current = canvas;
+      const ratio = maxWidth / Math.max(videoElement.videoWidth, 1);
+      canvas.width = videoElement.videoWidth > maxWidth ? Math.max(1, Math.round(videoElement.videoWidth * ratio)) : videoElement.videoWidth;
+      canvas.height =
+        videoElement.videoWidth > maxWidth ? Math.max(1, Math.round(videoElement.videoHeight * ratio)) : videoElement.videoHeight;
+
+      const context = canvas.getContext("2d");
+      if (!context) return null;
+      context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+      const frameBlob = await new Promise<Blob | null>((resolve) => {
+        canvas.toBlob((nextBlob) => resolve(nextBlob), "image/jpeg", quality);
+      });
+      if (!frameBlob) return null;
+      return readBlobAsBase64(frameBlob);
+    };
+
     const markLatestImageContext = (image: LiveGeneratedImage) => {
       latestImageContextRef.current = {
         id: image.id,
@@ -2939,17 +3131,25 @@ export function LiveTalkPanel({
       };
     };
 
-    const sendVideoFrame = () => {
+    const sendVideoFrame = async () => {
       const socketConnection = socketRef.current;
       if (
         !socketConnection ||
         socketConnection.readyState !== WebSocket.OPEN ||
-        (videoShareModeRef.current !== "screen" && cameraShareSendModeRef.current !== "video")
+        (videoShareModeRef.current !== "screen" && cameraShareSendModeRef.current !== "video") ||
+        videoShareFrameInFlightRef.current
       ) {
         return;
       }
-      const dataBase64 = captureVideoFrameBase64();
-      if (!dataBase64) return;
+      videoShareFrameInFlightRef.current = true;
+      let dataBase64: string | null = null;
+      try {
+        const screenVideo = videoShareModeRef.current === "screen";
+        dataBase64 = await captureVideoFrameBase64Async(screenVideo ? 720 : 960, screenVideo ? 0.54 : 0.68);
+      } finally {
+        videoShareFrameInFlightRef.current = false;
+      }
+      if (!dataBase64 || socketConnection.readyState !== WebSocket.OPEN) return;
 
       socketConnection.send(
         JSON.stringify({
@@ -3161,8 +3361,9 @@ export function LiveTalkPanel({
       const cameraMode = mode === "camera" ? options?.cameraMode ?? "snapshot" : null;
       const screenMode = mode === "screen" ? options?.screenMode ?? "screenshot" : null;
       if ((mode === "screen" && screenMode === "video") || (mode === "camera" && cameraMode === "video")) {
+        const frameIntervalMs = mode === "screen" ? 2500 : 1200;
         sendVideoFrame();
-        videoShareIntervalRef.current = window.setInterval(sendVideoFrame, 900);
+        videoShareIntervalRef.current = window.setInterval(sendVideoFrame, frameIntervalMs);
       }
       const videoTrack = stream.getVideoTracks()[0];
       const resolvedCameraDeviceId = mode === "camera" ? videoTrack?.getSettings().deviceId ?? cameraDeviceId ?? null : null;
@@ -3297,7 +3498,9 @@ export function LiveTalkPanel({
       }
 
       const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
+        video: {
+          frameRate: { ideal: 5, max: 10 },
+        },
         audio: false,
       });
       await startVideoShare(stream, "screen", null, { screenMode: options?.video ? "video" : "screenshot" });
@@ -4333,8 +4536,9 @@ export function LiveTalkPanel({
     onImageGenerationStateChange,
     onError,
     onRegisterVideoControls,
-    providerSettings.apiKey,
     providerSettings.apiUrl,
+    providerSettings.apiKey,
+    providerSettings.liveApiKey,
     providerSettings.liveModel,
     providerSettings.model,
     sessionRequested,
@@ -4379,11 +4583,15 @@ export function LiveTalkPanel({
   return (
     <div className="relative flex h-full min-h-0 flex-col gap-0 bg-transparent p-0">
       <div
-        className="min-h-0 flex-1 overflow-auto rounded-[4px] bg-mist/75 p-2 pb-0"
+        className="min-h-0 flex-1 overflow-auto overscroll-contain rounded-[4px] bg-mist/75 p-2 pb-0 touch-pan-y"
         onPointerDown={onHistoryInteract}
         onScroll={updateLiveHistoryScrollState}
-        onTouchMove={onHistoryInteract}
-        onWheel={onHistoryInteract}
+        onTouchEndCapture={() => {
+          lastLiveHistoryTouchYRef.current = null;
+        }}
+        onTouchMoveCapture={containLiveHistoryTouch}
+        onTouchStartCapture={rememberLiveHistoryTouch}
+        onWheelCapture={containLiveHistoryWheel}
         ref={liveHistoryRef}
       >
         <div className="flex min-h-full flex-col gap-1.5">

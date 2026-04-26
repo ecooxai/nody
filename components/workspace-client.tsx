@@ -2,7 +2,7 @@
 
 import { UserButton, useAuth } from "@clerk/nextjs";
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent as ReactDragEvent, type TouchEvent, type WheelEvent } from "react";
 
 import { AIChatPanel } from "@/components/chat/ai-chat-panel";
 import { RichEditor, type RichEditorBodyChangeReason, type RichEditorHandle } from "@/components/editor/rich-editor";
@@ -72,10 +72,78 @@ type PendingAiScroll = {
   position: "top" | "middle" | "bottom";
   restoreView: boolean;
 };
+type WorkspaceDragItem =
+  | { kind: "asset"; id: string }
+  | { kind: "document"; id: string }
+  | { kind: "folder"; id: string };
 type BodyHistoryReason = RichEditorBodyChangeReason | "ai";
 type NoteHistorySnapshot = {
   bodyMarkdown: string;
 };
+
+const SCROLL_EDGE_TOLERANCE = 1;
+
+function canScrollVertically(element: HTMLElement) {
+  if (element.scrollHeight <= element.clientHeight + SCROLL_EDGE_TOLERANCE) return false;
+  const overflowY = window.getComputedStyle(element).overflowY;
+  return overflowY === "auto" || overflowY === "scroll" || overflowY === "overlay";
+}
+
+function findVerticalScrollContainer(target: EventTarget | null, boundary: HTMLElement) {
+  if (!(target instanceof Node)) return null;
+
+  let current: Node | null = target;
+  while (current && boundary.contains(current)) {
+    if (current instanceof HTMLElement && canScrollVertically(current)) {
+      return current;
+    }
+    if (current === boundary) break;
+    current = current.parentNode;
+  }
+
+  return null;
+}
+
+function normalizeWheelDeltaY(event: WheelEvent<HTMLElement>) {
+  if (event.deltaMode === 1) return event.deltaY * 16;
+  if (event.deltaMode === 2) return event.deltaY * window.innerHeight;
+  return event.deltaY;
+}
+
+function containBoundaryWheel(event: WheelEvent<HTMLElement>) {
+  if (event.ctrlKey || event.metaKey || event.deltaY === 0) return;
+
+  event.stopPropagation();
+  const deltaY = normalizeWheelDeltaY(event);
+  const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
+  if (scrollContainer) {
+    scrollContainer.scrollTop += deltaY;
+  }
+  if (event.cancelable) {
+    event.preventDefault();
+  }
+}
+
+function containBoundaryTouch(event: TouchEvent<HTMLElement>, previousY: number | null) {
+  if (event.touches.length !== 1) return event.touches[0]?.clientY ?? null;
+
+  event.stopPropagation();
+  const currentY = event.touches[0].clientY;
+  if (previousY === null) return currentY;
+
+  const deltaY = previousY - currentY;
+  if (deltaY === 0) return currentY;
+
+  const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
+  if (scrollContainer) {
+    scrollContainer.scrollTop += deltaY;
+  }
+  if (event.cancelable) {
+    event.preventDefault();
+  }
+
+  return currentY;
+}
 type NoteHistoryState = {
   redo: NoteHistorySnapshot[];
   undo: NoteHistorySnapshot[];
@@ -84,7 +152,7 @@ type NoteTypingHistoryTracker = {
   baselineBodyMarkdown: string;
   changedCharacters: number;
 };
-const RECENT_NOTE_LIMIT = 5;
+const RECENT_NOTE_INLINE_LIMIT = 3;
 const RECENT_NOTE_HISTORY_LIMIT = 20;
 const NOTE_HISTORY_LIMIT = 80;
 const NOTE_TYPING_CHECKPOINT_CHARS = 5;
@@ -276,10 +344,11 @@ function menuButtonClass(active: boolean) {
     : "bg-transparent text-ink hover:bg-black/[0.04]";
 }
 
-function noteButtonClass(active: boolean) {
-  return active
-    ? "bg-mist text-ink"
-    : "bg-white text-ink hover:bg-mist";
+function noteButtonClass(active: boolean, nested = false) {
+  if (nested) {
+    return active ? "bg-transparent text-ink" : "bg-transparent text-ink/80 hover:bg-black/[0.025] hover:text-ink";
+  }
+  return active ? "bg-mist text-ink" : "bg-white text-ink hover:bg-mist";
 }
 
 function actionButtonClass(active: boolean) {
@@ -382,8 +451,23 @@ function MenuDropdown({
   children: React.ReactNode;
   onClose: () => void;
 }) {
+  const lastTouchYRef = useRef<number | null>(null);
+  const handleTouchMove = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    lastTouchYRef.current = containBoundaryTouch(event, lastTouchYRef.current);
+  }, []);
+
   return (
-    <Panel className="absolute left-0 right-0 top-full z-40 mt-2 bg-[#fffdf8]/96 p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)] backdrop-blur">
+    <Panel
+      className="absolute left-0 right-0 top-full z-40 mt-2 overscroll-contain bg-[#fffdf8]/96 p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)] backdrop-blur"
+      onTouchEndCapture={() => {
+        lastTouchYRef.current = null;
+      }}
+      onTouchMoveCapture={handleTouchMove}
+      onTouchStartCapture={(event) => {
+        lastTouchYRef.current = event.touches[0]?.clientY ?? null;
+      }}
+      onWheelCapture={containBoundaryWheel}
+    >
       <div className="flex items-center justify-between gap-3 px-4 py-3">
         <h2 className="text-xs font-semibold uppercase tracking-[0.24em] text-ink/55">{title}</h2>
         <button
@@ -397,7 +481,7 @@ function MenuDropdown({
           </svg>
         </button>
       </div>
-      <div className="max-h-[70vh] overflow-auto p-3">{children}</div>
+      <div className="max-h-[70vh] overflow-auto overscroll-contain p-3 touch-pan-y">{children}</div>
     </Panel>
   );
 }
@@ -407,6 +491,7 @@ function WorkspaceClientContent() {
   const { pushError } = useErrorToast();
   const deviceId = useMemo(() => getDeviceId(), []);
   const editorRef = useRef<RichEditorHandle>(null);
+  const menuTouchYRef = useRef<number | null>(null);
   const noteSearchRef = useRef<{ noteId: string; query: string; index: number } | null>(null);
   const noteHistoryRef = useRef<Map<string, NoteHistoryState>>(new Map());
   const typingHistoryTrackerRef = useRef<Map<string, NoteTypingHistoryTracker>>(new Map());
@@ -453,16 +538,21 @@ function WorkspaceClientContent() {
   const [pendingAiScroll, setPendingAiScroll] = useState<PendingAiScroll | null>(null);
   const [pendingEditorInsert, setPendingEditorInsert] = useState<PendingEditorInsert | null>(null);
   const [selectedText, setSelectedText] = useState("");
-  const [recentOpen, setRecentOpen] = useState(true);
-  const [showAllRecent, setShowAllRecent] = useState(false);
+  const [headerRecentOpen, setHeaderRecentOpen] = useState(false);
+  const [draggingItem, setDraggingItem] = useState<WorkspaceDragItem | null>(null);
+  const [dragTargetFolderId, setDragTargetFolderId] = useState<string | null | undefined>(undefined);
   const previewFrameRef = useRef<HTMLDivElement>(null);
   const editorShellRef = useRef<HTMLDivElement>(null);
   const folderCreateInputRef = useRef<HTMLInputElement>(null);
+  const documentRowRefs = useRef<Map<string, HTMLButtonElement>>(new Map());
   const copyResetTimerRef = useRef<number | null>(null);
   const messagesRef = useRef<AIMessage[]>([]);
   const idleTimerRef = useRef<number | null>(null);
   const undoNoticeTimerRef = useRef<number | null>(null);
   const undoLongPressTimerRef = useRef<number | null>(null);
+  const handleMenuTouchMove = useCallback((event: TouchEvent<HTMLDivElement>) => {
+    menuTouchYRef.current = containBoundaryTouch(event, menuTouchYRef.current);
+  }, []);
   const undoLongPressTriggeredRef = useRef(false);
   const wasIdleRef = useRef(false);
   const syncInFlightRef = useRef(false);
@@ -561,6 +651,12 @@ function WorkspaceClientContent() {
     () => recentDocumentIds.map((id) => documents.find((item) => item.id === id)).filter((item): item is DocumentRecord => Boolean(item)),
     [documents, recentDocumentIds],
   );
+  const headerRecentDocuments = useMemo(
+    () => recentDocuments.filter((item) => item.id !== document.id),
+    [document.id, recentDocuments],
+  );
+  const inlineRecentDocuments = headerRecentDocuments.slice(0, RECENT_NOTE_INLINE_LIMIT);
+  const dropdownRecentDocuments = headerRecentDocuments.slice(RECENT_NOTE_INLINE_LIMIT);
   const aiAvailableNotes = useMemo<AINoteReference[]>(
     () =>
       documents.map((item) => ({
@@ -570,7 +666,6 @@ function WorkspaceClientContent() {
       })),
     [documents, folderById],
   );
-  const visibleRecentDocuments = showAllRecent ? recentDocuments : recentDocuments.slice(0, RECENT_NOTE_LIMIT);
   const selectedFolderName = currentFolder?.name ?? "Workspace";
   const folderStorageBytesById = useMemo(() => {
     const cache = new Map<string, number>();
@@ -637,6 +732,9 @@ function WorkspaceClientContent() {
     return count;
   }, [currentFolder, currentFolderBranchIds, folderAssets, folderAssetsByFolder]);
   const workspaceRootFolders = foldersByParent.get(null) ?? [];
+  const workspaceRootNotes = documentsByFolder.get("root") ?? [];
+  const workspaceRootAssets = folderAssetsByFolder.get(null) ?? [];
+  const hasWorkspaceRootItems = workspaceRootFolders.length + workspaceRootNotes.length + workspaceRootAssets.length > 0;
   const libraryFolders = workspaceRootFolders;
   const assetPickerBranchIds = useMemo(() => {
     if (!assetPickerFolderId) return new Set<string>();
@@ -726,18 +824,68 @@ function WorkspaceClientContent() {
     });
   };
 
-  const selectDocument = (next: DocumentRecord) => {
+  const syncDocumentSnapshot = async (snapshot: DocumentRecord) => {
+    if (!snapshot.id) return false;
+    if (syncInFlightRef.current) {
+      window.setTimeout(() => void syncDocumentSnapshot(snapshot), 300);
+      return false;
+    }
+
+    syncInFlightRef.current = true;
+    setSyncStatus("Syncing");
+    try {
+      const result = await apiClient.syncDocument(snapshot.id, buildSyncPayload(snapshot, deviceId));
+      const normalizedDocument = normalizeDocumentRecord(result.document);
+      setDocuments((current) => upsertDocument(current, normalizedDocument));
+
+      if (documentStateRef.current.id === normalizedDocument.id) {
+        documentStateRef.current = normalizedDocument;
+        dirtyStateRef.current = false;
+        setDocument(normalizedDocument);
+        setDirty(false);
+        saveCachedDocument(normalizedDocument);
+        setSyncStatus(result.conflict ? "Conflict" : "Synced");
+      } else {
+        setSyncStatus(result.conflict ? "Conflict" : "Live");
+      }
+
+      if (result.conflict) pushError(result.message ?? "Sync conflict detected");
+      return true;
+    } catch (error) {
+      setSyncStatus("Offline");
+      pushError(error instanceof Error ? error.message : "Sync failed");
+      return false;
+    } finally {
+      syncInFlightRef.current = false;
+    }
+  };
+
+  const selectDocument = (next: DocumentRecord, options?: { preserveActiveWindow?: boolean }) => {
+    editorRef.current?.flushBodyChanges();
+    const previousDocument = documentStateRef.current;
+    const shouldSyncPrevious = dirtyStateRef.current && previousDocument.id !== next.id;
+
+    clearDelayedSync();
     documentStateRef.current = next;
+    dirtyStateRef.current = false;
     setDocument(next);
+    setDirty(false);
     setIsEditing(false);
     setPendingAiEditPreview(null);
     setSelectedFolderId(next.folderId);
     setSelectedFolderAsset(null);
     setSelectedText("");
+    setSyncStatus("Live");
     saveCachedDocument(next);
     markRecentDocument(next.id);
     expandFolderPath(next.folderId);
-    setActiveWindow(null);
+    if (!options?.preserveActiveWindow) {
+      setActiveWindow(null);
+    }
+
+    if (shouldSyncPrevious) {
+      void syncDocumentSnapshot(previousDocument);
+    }
   };
 
   const toggleWindow = (windowName: WorkspaceWindow) => {
@@ -749,6 +897,17 @@ function WorkspaceClientContent() {
       return nextWindow;
     });
   };
+
+  useEffect(() => {
+    if (activeWindow !== "library") return;
+    expandFolderPath(document.folderId);
+    const firstFrame = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        documentRowRefs.current.get(document.id)?.scrollIntoView({ block: "center", behavior: "smooth" });
+      });
+    });
+    return () => window.cancelAnimationFrame(firstFrame);
+  }, [activeWindow, document.folderId, document.id]);
 
   useEffect(() => {
     if (activeWindow === "ai") {
@@ -809,7 +968,11 @@ function WorkspaceClientContent() {
     !reason || reason === "typing" || reason === "paste" || reason === "cut" || reason === "delete";
 
   const syncDirtyDocument = async () => {
-    if (!dirtyStateRef.current || syncInFlightRef.current) return false;
+    if (!dirtyStateRef.current) return false;
+    if (syncInFlightRef.current) {
+      scheduleDelayedSync();
+      return false;
+    }
     if (isNoteChangeSyncPaused()) {
       scheduleDelayedSync();
       return false;
@@ -1014,13 +1177,11 @@ function WorkspaceClientContent() {
 
   const updateDocument = (next: Partial<DocumentRecord>) => {
     markNoteChangeForSyncDelay();
-    setDocument((current) => {
-      const updated = { ...current, ...next, updatedAt: new Date().toISOString() };
-      documentStateRef.current = updated;
-      setDocuments((currentDocuments) => upsertDocument(currentDocuments, updated));
-      saveCachedDocument(updated);
-      return updated;
-    });
+    const updated = { ...documentStateRef.current, ...next, updatedAt: new Date().toISOString() };
+    documentStateRef.current = updated;
+    setDocument(updated);
+    setDocuments((currentDocuments) => upsertDocument(currentDocuments, updated));
+    saveCachedDocument(updated);
     dirtyStateRef.current = true;
     setDirty(true);
     setSyncStatus("Pending");
@@ -1405,24 +1566,6 @@ function WorkspaceClientContent() {
     setActiveWindow("create");
   };
 
-  const uploadAndInsertEditorAsset = (kind: FolderAsset["kind"]) => {
-    if (!isEditing) {
-      pushError("Click the edit button on the note to enter edit mode.");
-      return;
-    }
-
-    const acceptByKind: Record<FolderAsset["kind"], string> = {
-      image: "image/*",
-      audio: "audio/*",
-      video: "video/*",
-    };
-
-    pickFolderUpload(selectedFolderId, {
-      accept: acceptByKind[kind],
-      insertIntoNote: true,
-    });
-  };
-
   const addNoteMediaToAi = (attachment: PendingAiAttachment) => {
     setPendingAiAttachment(attachment);
     setActiveWindow("ai");
@@ -1501,7 +1644,7 @@ function WorkspaceClientContent() {
       return false;
     }
 
-    selectDocument(target);
+    selectDocument(target, { preserveActiveWindow: true });
     noteSearchRef.current = null;
     return true;
   };
@@ -1745,13 +1888,121 @@ function WorkspaceClientContent() {
     );
   };
 
+  const parseDragItem = (event: ReactDragEvent<HTMLElement>): WorkspaceDragItem | null => {
+    const [kind, id] = event.dataTransfer.getData("text/plain").split(":");
+    if (!id) return null;
+    if (kind === "asset" || kind === "document" || kind === "folder") {
+      return { kind, id } as WorkspaceDragItem;
+    }
+    return null;
+  };
+
+  const startWorkspaceDrag = (event: ReactDragEvent<HTMLElement>, item: WorkspaceDragItem) => {
+    setDraggingItem(item);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", `${item.kind}:${item.id}`);
+  };
+
+  const clearWorkspaceDrag = () => {
+    setDraggingItem(null);
+    setDragTargetFolderId(undefined);
+  };
+
+  const canDropOnFolder = (targetFolderId: string | null, item = draggingItem) => {
+    if (!item) return false;
+
+    if (item.kind === "document") {
+      const draggedDocument = documents.find((entry) => entry.id === item.id);
+      return Boolean(draggedDocument && draggedDocument.folderId !== targetFolderId);
+    }
+
+    if (item.kind === "asset") {
+      const draggedAsset = folderAssets.find((entry) => entry.id === item.id);
+      return Boolean(draggedAsset && draggedAsset.folderId !== targetFolderId);
+    }
+
+    const draggedFolder = folderById.get(item.id);
+    if (!draggedFolder || draggedFolder.parentFolderId === targetFolderId || targetFolderId === item.id) return false;
+
+    let cursor = targetFolderId;
+    while (cursor) {
+      if (cursor === item.id) return false;
+      cursor = folderById.get(cursor)?.parentFolderId ?? null;
+    }
+    return true;
+  };
+
+  const moveWorkspaceDragItem = async (item: WorkspaceDragItem, targetFolderId: string | null) => {
+    try {
+      if (item.kind === "folder") {
+        const updated = await apiClient.moveFolder(item.id, targetFolderId);
+        setFolders((current) => sortFolders(current.map((folder) => (folder.id === updated.id ? updated : folder))));
+        expandFolderPath(updated.id);
+        return;
+      }
+
+      if (item.kind === "document") {
+        const updated = normalizeDocumentRecord(await apiClient.moveDocument(item.id, targetFolderId));
+        setDocuments((current) => upsertDocument(current, updated));
+        if (document.id === updated.id) {
+          documentStateRef.current = updated;
+          setDocument(updated);
+          setSelectedFolderId(updated.folderId);
+          saveCachedDocument(updated);
+        }
+        expandFolderPath(updated.folderId);
+        return;
+      }
+
+      const updated = await apiClient.moveFolderAsset(item.id, targetFolderId);
+      setFolderAssets((current) => current.map((asset) => (asset.id === updated.id ? updated : asset)));
+      setSelectedFolderAsset((current) => (current?.id === updated.id ? updated : current));
+      expandFolderPath(updated.folderId);
+    } catch (error) {
+      pushError(error instanceof Error ? error.message : "Failed to move item");
+    } finally {
+      clearWorkspaceDrag();
+    }
+  };
+
+  const handleFolderDragOver = (event: ReactDragEvent<HTMLElement>, targetFolderId: string | null) => {
+    const item = draggingItem ?? parseDragItem(event);
+    if (!canDropOnFolder(targetFolderId, item)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "move";
+    setDragTargetFolderId(targetFolderId);
+  };
+
+  const handleFolderDrop = (event: ReactDragEvent<HTMLElement>, targetFolderId: string | null) => {
+    const item = draggingItem ?? parseDragItem(event);
+    if (!item) return;
+    if (!canDropOnFolder(targetFolderId, item)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    void moveWorkspaceDragItem(item, targetFolderId);
+  };
+
   const renderDocumentRow = (item: DocumentRecord, depth = 0) => {
     const active = document.id === item.id;
+    const nested = depth > 0;
     return (
       <button
-        className={`flex items-center gap-2 rounded-2xl px-3 py-2 text-left text-sm transition ${noteButtonClass(active)}`}
+        className={`flex items-center gap-2 rounded-2xl px-3 py-2 text-left transition ${
+          nested ? "text-xs" : "text-sm"
+        } ${noteButtonClass(active, nested)}`}
+        draggable={Boolean(item.id)}
         key={item.id}
         onClick={() => selectDocument(item)}
+        onDragEnd={clearWorkspaceDrag}
+        onDragStart={(event) => startWorkspaceDrag(event, { kind: "document", id: item.id })}
+        ref={(node) => {
+          if (node) {
+            documentRowRefs.current.set(item.id, node);
+            return;
+          }
+          documentRowRefs.current.delete(item.id);
+        }}
         style={{ paddingLeft: `${12 + depth * 14}px` }}
         type="button"
       >
@@ -1765,7 +2016,9 @@ function WorkspaceClientContent() {
           />
           <path d="M13 3.5V9h5.5" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
         </svg>
-        <span className="min-w-0 flex-1 truncate">{item.title || UNTITLED_NOTE_TITLE}</span>
+        <span className={`min-w-0 flex-1 truncate ${nested && active ? "font-semibold text-ink" : ""}`}>
+          {item.title || UNTITLED_NOTE_TITLE}
+        </span>
       </button>
     );
   };
@@ -1969,13 +2222,19 @@ function WorkspaceClientContent() {
 
   const renderFolderAssetRow = (asset: FolderAsset, depth = 0) => {
     const active = selectedFolderAsset?.id === asset.id || activeFolderAssetMenuId === asset.id;
+    const nested = depth > 0;
     return (
       <div key={asset.id} className="grid gap-1" style={{ paddingLeft: `${depth * 14}px` }}>
         <button
-          className={`grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl px-3 py-2 text-left text-sm transition ${
-            active ? "bg-ink/5" : "bg-white hover:bg-mist"
+          className={`grid w-full grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-2xl px-3 py-2 text-left transition ${
+            nested ? "text-xs" : "text-sm"
+          } ${
+            active ? (nested ? "bg-black/[0.035]" : "bg-ink/5") : nested ? "bg-transparent hover:bg-black/[0.025]" : "bg-white hover:bg-mist"
           }`}
+          draggable
           type="button"
+          onDragEnd={clearWorkspaceDrag}
+          onDragStart={(event) => startWorkspaceDrag(event, { kind: "asset", id: asset.id })}
           onClick={() => {
             setActiveFolderAssetMenuId((current) => (current === asset.id ? null : asset.id));
             setActiveAssetPickerMenuId(null);
@@ -2035,6 +2294,8 @@ function WorkspaceClientContent() {
 
   const renderFolderNode = (folder: FolderRecord, depth = 0): React.ReactNode => {
     const isOpen = expandedFolderIds.includes(folder.id);
+    const isDropTarget = dragTargetFolderId === folder.id;
+    const nested = depth > 0;
     const folderNotes = documentsByFolder.get(folder.id) ?? [];
     const folderAssetsInFolder = folderAssetsByFolder.get(folder.id) ?? [];
     const childFolders = foldersByParent.get(folder.id) ?? [];
@@ -2044,9 +2305,24 @@ function WorkspaceClientContent() {
       <div key={folder.id} className="grid gap-1">
         <div className="flex items-center gap-1">
           <button
-            className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 text-left text-sm transition ${
-              selectedFolderId === folder.id ? "bg-sky-50 text-sky-950" : "bg-white text-ink hover:bg-mist"
+            className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 text-left transition ${
+              nested ? "text-xs" : "text-sm"
+            } ${
+              isDropTarget
+                ? "bg-[#e8f4ed] text-[#174a32] shadow-[inset_0_0_0_1px_rgba(23,74,50,0.18)]"
+                : selectedFolderId === folder.id
+                  ? nested
+                    ? "bg-black/[0.035] text-ink"
+                    : "bg-sky-50 text-sky-950"
+                  : nested
+                    ? "bg-transparent text-ink hover:bg-black/[0.025]"
+                    : "bg-white text-ink hover:bg-mist"
             }`}
+            draggable
+            onDragEnd={clearWorkspaceDrag}
+            onDragOver={(event) => handleFolderDragOver(event, folder.id)}
+            onDragStart={(event) => startWorkspaceDrag(event, { kind: "folder", id: folder.id })}
+            onDrop={(event) => handleFolderDrop(event, folder.id)}
             onClick={() => toggleAndSelectFolder(folder.id)}
             style={{ paddingLeft: `${12 + depth * 12}px` }}
             type="button"
@@ -2106,10 +2382,72 @@ function WorkspaceClientContent() {
           </IconActionButton>
         </div>
         {isOpen ? (
-          <div className="grid gap-1">
+          <div className="ml-3 grid gap-1 rounded-xl border-l border-ink/10 bg-black/[0.045] py-1 pl-2 pr-1">
             {folderNotes.map((item) => renderDocumentRow(item, depth + 1))}
             {folderAssetsInFolder.map((asset) => renderFolderAssetRow(asset, depth + 1))}
             {childFolders.map((child) => renderFolderNode(child, depth + 1))}
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  const renderHeaderRecentNotes = () => {
+    if (headerRecentDocuments.length === 0) return null;
+
+    const openRecentDocument = (item: DocumentRecord) => {
+      setHeaderRecentOpen(false);
+      selectDocument(item);
+    };
+
+    return (
+      <div className="relative flex min-w-0 items-center gap-1">
+        {inlineRecentDocuments.map((item) => (
+          <button
+            className="h-8 w-[20vw] min-w-0 truncate rounded-full bg-transparent px-3 text-left text-xs text-ink/50 transition hover:bg-black/[0.025] hover:text-ink/70"
+            key={item.id}
+            onClick={() => openRecentDocument(item)}
+            title={item.title || UNTITLED_NOTE_TITLE}
+            type="button"
+          >
+            {item.title || UNTITLED_NOTE_TITLE}
+          </button>
+        ))}
+        {dropdownRecentDocuments.length > 0 ? (
+          <IconActionButton
+            active={headerRecentOpen}
+            label={headerRecentOpen ? "Hide recent notes" : "Show more recent notes"}
+            onClick={() => setHeaderRecentOpen((current) => !current)}
+          >
+            <svg
+              aria-hidden="true"
+              className={`h-4 w-4 transition ${headerRecentOpen ? "rotate-180" : ""}`}
+              fill="none"
+              viewBox="0 0 24 24"
+            >
+              <path
+                d="M6 9l6 6 6-6"
+                stroke="currentColor"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="1.8"
+              />
+            </svg>
+          </IconActionButton>
+        ) : null}
+        {headerRecentOpen ? (
+          <div className="absolute right-0 top-full z-30 mt-2 grid w-[min(22rem,calc(100vw-1rem))] gap-1 rounded-[14px] bg-white p-2 shadow-[0_16px_34px_rgba(15,23,42,0.15)]">
+            {dropdownRecentDocuments.map((item) => (
+              <button
+                className="truncate rounded-[10px] px-3 py-2 text-left text-sm text-ink transition hover:bg-mist"
+                key={item.id}
+                onClick={() => openRecentDocument(item)}
+                title={item.title || UNTITLED_NOTE_TITLE}
+                type="button"
+              >
+                {item.title || UNTITLED_NOTE_TITLE}
+              </button>
+            ))}
           </div>
         ) : null}
       </div>
@@ -2224,36 +2562,18 @@ function WorkspaceClientContent() {
               </div>
 
               {activeWindow === "library" ? (
-                <Panel className="absolute left-3 right-3 top-full z-40 mt-2 max-h-[calc(100vh-5.5rem)] overflow-hidden !bg-white !p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)]">
-                  <div className="flex items-center justify-between gap-3 px-4 py-3">
-                    <div>
-                      <h2 className="text-xs font-semibold uppercase tracking-[0.24em] text-ink/55">Library</h2>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <IconActionButton label="New note in workspace root" onClick={() => void createNote(null)}>
-                        <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                          <path d="M12 5v14M5 12h14" stroke="currentColor" strokeLinecap="round" strokeWidth="1.7" />
-                        </svg>
-                      </IconActionButton>
-                      <IconActionButton
-                        disabled={creatingFolder}
-                        label="New folder in workspace root"
-                        onClick={() => openFolderCreateForm(null)}
-                      >
-                        <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                          <path
-                            d="M3.5 8.5v7A2.5 2.5 0 0 0 6 18h12a2.5 2.5 0 0 0 2.5-2.5v-6A2.5 2.5 0 0 0 18 7h-6l-1.5-1.5H6A2.5 2.5 0 0 0 3.5 8.5Z"
-                            stroke="currentColor"
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                            strokeWidth="1.5"
-                          />
-                          <path d="M12 10.25v5.5M9.25 13h5.5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
-                        </svg>
-                      </IconActionButton>
-                    </div>
-                  </div>
-                  <div className="grid max-h-[calc(100vh-9.5rem)] gap-3 overflow-y-auto p-3">
+                <Panel
+                  className="absolute left-3 right-3 top-full z-40 mt-2 max-h-[calc(100vh-5.5rem)] overflow-hidden overscroll-contain !bg-white !p-0 shadow-[0_20px_48px_rgba(15,23,42,0.14)]"
+                  onTouchEndCapture={() => {
+                    menuTouchYRef.current = null;
+                  }}
+                  onTouchMoveCapture={handleMenuTouchMove}
+                  onTouchStartCapture={(event) => {
+                    menuTouchYRef.current = event.touches[0]?.clientY ?? null;
+                  }}
+                  onWheelCapture={containBoundaryWheel}
+                >
+                  <div className="grid max-h-[calc(100vh-9.5rem)] gap-3 overflow-y-auto overscroll-contain p-3 touch-pan-y">
                     {folderCreateOpen ? (
                       <section className="rounded-[20px] bg-white p-3">
                         <div className="mb-2 text-xs font-semibold uppercase tracking-[0.24em] text-ink/45">
@@ -2366,81 +2686,13 @@ function WorkspaceClientContent() {
                       </section>
                     ) : null}
 
-                    <section className="rounded-[24px] bg-white p-3">
-                      <div className="flex items-center justify-between gap-2">
-                        <button
-                          className="flex min-w-0 items-center gap-2 text-left text-xs font-semibold uppercase tracking-[0.24em] text-ink/45 transition hover:text-ink/70"
-                          onClick={() => setRecentOpen((current) => !current)}
-                          aria-expanded={recentOpen}
-                          type="button"
-                        >
-                          <svg
-                            aria-hidden="true"
-                            className={`h-4 w-4 shrink-0 transition ${recentOpen ? "rotate-90" : "rotate-0"}`}
-                            fill="none"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              d="M9 6l6 6-6 6"
-                              stroke="currentColor"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth="1.8"
-                            />
-                          </svg>
-                          <svg aria-hidden="true" className="h-4 w-4 shrink-0" fill="none" viewBox="0 0 24 24">
-                            <path
-                              d="M7 4h10l2 3H5l2-3Zm-2 4h14v11a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V8Z"
-                              stroke="currentColor"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth="1.5"
-                            />
-                          </svg>
-                          Recent
-                        </button>
-                        <div className="flex items-center gap-2">
-                          <span className="rounded-full bg-black/[0.04] px-2 py-1 text-[10px] font-medium uppercase tracking-[0.14em] text-ink/55">
-                            {visibleRecentDocuments.length}
-                          </span>
-                          {recentDocuments.length > RECENT_NOTE_LIMIT ? (
-                            <IconActionButton
-                              active={showAllRecent}
-                              label={showAllRecent ? "Show fewer recent notes" : "Show more recent notes"}
-                              onClick={() => setShowAllRecent((current) => !current)}
-                            >
-                              <svg
-                                aria-hidden="true"
-                                className={`h-4 w-4 transition ${showAllRecent ? "rotate-180" : ""}`}
-                                fill="none"
-                                viewBox="0 0 24 24"
-                              >
-                                <path
-                                  d="M6 9l6 6 6-6"
-                                  stroke="currentColor"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                  strokeWidth="1.8"
-                                />
-                              </svg>
-                            </IconActionButton>
-                          ) : null}
-                        </div>
-                      </div>
-                      {recentOpen ? (
-                        <div className="mt-2 grid gap-1">
-                          {visibleRecentDocuments.length === 0 ? (
-                            <div className="rounded-2xl bg-black/[0.03] px-3 py-2 text-sm text-ink/45">
-                              No recent notes.
-                            </div>
-                          ) : (
-                            visibleRecentDocuments.map((item) => renderDocumentRow(item))
-                          )}
-                        </div>
-                      ) : null}
-                    </section>
-
-                    <section className="rounded-[24px] bg-white p-3">
+                    <section
+                      className={`rounded-[24px] bg-white p-3 transition ${
+                        dragTargetFolderId === null ? "shadow-[inset_0_0_0_1px_rgba(23,74,50,0.24)]" : ""
+                      }`}
+                      onDragOver={(event) => handleFolderDragOver(event, null)}
+                      onDrop={(event) => handleFolderDrop(event, null)}
+                    >
                       <div className="flex items-center justify-between gap-2">
                         <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.24em] text-ink/45">
                           <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
@@ -2461,16 +2713,36 @@ function WorkspaceClientContent() {
                           <div className="hidden rounded-full bg-black/[0.04] px-3 py-1 text-[10px] font-medium uppercase tracking-[0.14em] text-ink/55 sm:block">
                             {selectedFolderName}
                           </div>
+                          <IconActionButton
+                            disabled={creatingFolder}
+                            label="New folder in workspace root"
+                            onClick={() => openFolderCreateForm(null)}
+                          >
+                            <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                              <path
+                                d="M3.5 8.5v7A2.5 2.5 0 0 0 6 18h12a2.5 2.5 0 0 0 2.5-2.5v-6A2.5 2.5 0 0 0 18 7h-6l-1.5-1.5H6A2.5 2.5 0 0 0 3.5 8.5Z"
+                                stroke="currentColor"
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                strokeWidth="1.5"
+                              />
+                              <path d="M12 10.25v5.5M9.25 13h5.5" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5" />
+                            </svg>
+                          </IconActionButton>
                         </div>
                       </div>
-                      <div className="mt-3 max-h-[52vh] overflow-y-auto pr-1">
+                      <div className="mt-3 max-h-[52vh] overflow-y-auto overscroll-contain pr-1 touch-pan-y">
                         <div className="grid gap-1">
-                          {libraryFolders.length === 0 ? (
+                          {!hasWorkspaceRootItems ? (
                             <div className="rounded-2xl bg-black/[0.03] px-3 py-2 text-sm text-ink/45">
                               No folders yet.
                             </div>
                           ) : (
-                            libraryFolders.map((folder) => renderFolderNode(folder))
+                            <>
+                              {workspaceRootNotes.map((item) => renderDocumentRow(item))}
+                              {workspaceRootAssets.map((asset) => renderFolderAssetRow(asset))}
+                              {libraryFolders.map((folder) => renderFolderNode(folder))}
+                            </>
                           )}
                         </div>
                       </div>
@@ -2685,6 +2957,7 @@ function WorkspaceClientContent() {
               ref={editorRef}
               bodyMarkdown={document.bodyMarkdown}
               editable={isEditing}
+              noteId={document.id}
               inlineNotice={
                 pendingAiEditPreview ? (
                   <div className="overflow-hidden rounded-[8px] bg-[#fff7e8] shadow-[0_16px_36px_rgba(15,23,42,0.14)]">
@@ -2801,68 +3074,7 @@ function WorkspaceClientContent() {
                 updateDocument({ title });
               }}
               title={document.title}
-              topRight={
-                isEditing ? (
-                  <>
-                    <IconActionButton
-                      disabled={uploading}
-                      label="Upload and insert image"
-                      onClick={() => uploadAndInsertEditorAsset("image")}
-                    >
-                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                        <path
-                          d="M4 6.5A1.5 1.5 0 0 1 5.5 5h13A1.5 1.5 0 0 1 20 6.5v11A1.5 1.5 0 0 1 18.5 19h-13A1.5 1.5 0 0 1 4 17.5v-11Z"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="1.5"
-                        />
-                        <path
-                          d="M8 11.5a1.25 1.25 0 1 0 0-2.5a1.25 1.25 0 0 0 0 2.5Zm-3.5 5L9 11l3.5 4 2-2 4 3.5"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="1.5"
-                        />
-                      </svg>
-                    </IconActionButton>
-                    <IconActionButton
-                      disabled={uploading}
-                      label="Upload and insert audio"
-                      onClick={() => uploadAndInsertEditorAsset("audio")}
-                    >
-                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                        <path d="M9 15V9l8-2v6" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7" />
-                        <circle cx="7.5" cy="16.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                        <circle cx="16.5" cy="14.5" r="2.5" stroke="currentColor" strokeWidth="1.7" />
-                      </svg>
-                    </IconActionButton>
-                    <IconActionButton
-                      disabled={uploading}
-                      label="Upload and insert video"
-                      onClick={() => uploadAndInsertEditorAsset("video")}
-                    >
-                      <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
-                        <path
-                          d="M4 8.5A1.5 1.5 0 0 1 5.5 7h9A1.5 1.5 0 0 1 16 8.5v7A1.5 1.5 0 0 1 14.5 17h-9A1.5 1.5 0 0 1 4 15.5v-7Z"
-                          stroke="currentColor"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                          strokeWidth="1.5"
-                        />
-                        <path d="M16 10l4-2v8l-4-2" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" />
-                      </svg>
-                    </IconActionButton>
-                    <button
-                      className="rounded-full bg-ink px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-ink/90"
-                      onClick={exitEditMode}
-                      type="button"
-                    >
-                      Done
-                    </button>
-                  </>
-                ) : null
-              }
+              topRight={renderHeaderRecentNotes()}
             />
           </div>
 

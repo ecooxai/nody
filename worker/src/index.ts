@@ -10,6 +10,9 @@ import {
   listFolders,
   listFolderAssets,
   listPromptTemplates,
+  moveDocument,
+  moveFolder,
+  moveFolderAsset,
   updatePromptTemplate,
   getSettings,
   listDocuments,
@@ -41,6 +44,13 @@ function normalizeFileName(value: unknown) {
   const fileName = value.trim();
   if (!fileName || fileName.length > 180 || /[\\/]/.test(fileName)) return null;
   return fileName;
+}
+
+function normalizeNullableId(value: unknown) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") return undefined;
+  const id = value.trim();
+  return id || null;
 }
 
 type ParsedByteRange = {
@@ -177,6 +187,13 @@ export default {
         const payload = await request.json() as { name: string; parentFolderId?: string | null };
         return json(await createFolder(env.DB, userId, payload), { status: 201 });
       }
+      if (request.method === "PUT" && parts[0] === "folders" && parts[2] === "move") {
+        const payload = await request.json() as { parentFolderId?: unknown };
+        const parentFolderId = normalizeNullableId(payload.parentFolderId);
+        if (parentFolderId === undefined) return json({ error: "Invalid target folder" }, { status: 400 });
+        const folder = await moveFolder(env.DB, userId, parts[1], parentFolderId);
+        return folder ? json(folder) : json({ error: "Not found" }, { status: 404 });
+      }
       if (request.method === "POST" && parts[0] === "prompts" && parts.length === 1) {
         const payload = await request.json() as { name: string; content: string };
         return json(await createPromptTemplate(env.DB, userId, payload), { status: 201 });
@@ -190,6 +207,13 @@ export default {
         const fileName = normalizeFileName(payload.fileName);
         if (!fileName) return json({ error: "Use a file name without slashes." }, { status: 400 });
         const asset = await updateFolderAssetName(env.DB, userId, parts[1], fileName);
+        return asset ? json(asset) : json({ error: "Not found" }, { status: 404 });
+      }
+      if (request.method === "PUT" && parts[0] === "folder-assets" && parts[2] === "move") {
+        const payload = await request.json() as { folderId?: unknown };
+        const folderId = normalizeNullableId(payload.folderId);
+        if (folderId === undefined) return json({ error: "Invalid target folder" }, { status: 400 });
+        const asset = await moveFolderAsset(env.DB, userId, parts[1], folderId);
         return asset ? json(asset) : json({ error: "Not found" }, { status: 404 });
       }
       if (request.method === "POST" && parts[0] === "folders" && parts[2] === "assets") {
@@ -217,6 +241,13 @@ export default {
         const payload = await request.json() as { title: string; bodyMarkdown: string; baseRevision: number; deviceId: string };
         const result = await syncDocument(env.DB, userId, parts[1], payload);
         return result ? json(result, { status: result.conflict ? 409 : 200 }) : json({ error: "Not found" }, { status: 404 });
+      }
+      if (request.method === "PUT" && parts[0] === "documents" && parts[2] === "move") {
+        const payload = await request.json() as { folderId?: unknown };
+        const folderId = normalizeNullableId(payload.folderId);
+        if (folderId === undefined) return json({ error: "Invalid target folder" }, { status: 400 });
+        const document = await moveDocument(env.DB, userId, parts[1], folderId);
+        return document ? json(document) : json({ error: "Not found" }, { status: 404 });
       }
       if (request.method === "POST" && parts[0] === "documents" && parts[2] === "assets") {
         const formData = await request.formData();

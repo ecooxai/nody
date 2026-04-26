@@ -83,12 +83,12 @@ type GeminiImageRequestConfig = {
 };
 
 export async function askProvider(env: Env, userId: string, settings: ProviderSettings, request: AIRequest): Promise<AIResponse> {
-  if (!settings.apiKey) {
-    throw new Error("Missing API key. Save provider settings first.");
-  }
   if (request.mode === "tts") {
     if (settings.provider !== "gemini") {
       throw new Error("Text-to-speech is currently supported only with the Gemini provider.");
+    }
+    if (!settings.apiKey) {
+      throw new Error("Missing API key. Save provider settings first.");
     }
     return askGeminiTts(settings, request);
   }
@@ -96,18 +96,24 @@ export async function askProvider(env: Env, userId: string, settings: ProviderSe
     if (settings.provider !== "gemini") {
       throw new Error("Image generation is currently supported only with the Gemini provider.");
     }
+    if (!effectiveGeminiImageApiKey(settings)) {
+      throw new Error("Missing Gemini image API key. Save a global or image API key first.");
+    }
     return askGeminiImage(env, userId, settings, request);
+  }
+  if (!settings.apiKey) {
+    throw new Error("Missing API key. Save provider settings first.");
   }
   return settings.provider === "gemini" ? askGemini(env, userId, settings, request) : askOpenAI(settings, request);
 }
 
 export async function streamProvider(env: Env, userId: string, settings: ProviderSettings, request: AIRequest): Promise<Response> {
-  if (!settings.apiKey) {
-    throw new Error("Missing API key. Save provider settings first.");
-  }
   if (request.mode === "image" || request.mode === "tts") {
     const response = await askProvider(env, userId, settings, request);
     return doneStream(response);
+  }
+  if (!settings.apiKey) {
+    throw new Error("Missing API key. Save provider settings first.");
   }
 
   const upstream =
@@ -729,6 +735,10 @@ function effectiveGeminiImageModel(settings: ProviderSettings) {
   return settings.imageModel.trim() || defaultGeminiImageModel;
 }
 
+function effectiveGeminiImageApiKey(settings: ProviderSettings) {
+  return (settings.imageApiKey || settings.apiKey).trim();
+}
+
 function supportsGeminiImageSize(model: string) {
   return /\bgemini-3(?:[.-]|$)/i.test(model);
 }
@@ -834,7 +844,7 @@ function buildGeminiTtsUrl(settings: ProviderSettings) {
 
 function buildGeminiImageUrl(settings: ProviderSettings, imageModel = effectiveGeminiImageModel(settings)) {
   const base = settings.apiUrl.replace(/\/$/, "");
-  const key = encodeURIComponent(settings.apiKey);
+  const key = encodeURIComponent(effectiveGeminiImageApiKey(settings));
   const model = encodeURIComponent(imageModel);
   return `${base}/v1beta/models/${model}:generateContent?key=${key}`;
 }

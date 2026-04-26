@@ -32,7 +32,9 @@ export function createDefaultSettings(): ProviderSettings {
     apiUrl: providerDefaults.gemini.apiUrl,
     apiKey: "",
     model: providerDefaults.gemini.model,
+    liveApiKey: "",
     liveModel: providerDefaults.gemini.liveModel,
+    imageApiKey: "",
     imageModel: providerDefaults.gemini.imageModel,
     liveRecording: { ...defaultLiveRecordingSettings },
   };

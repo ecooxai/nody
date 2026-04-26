@@ -9,7 +9,9 @@ describe("provider defaults", () => {
     expect(settings.provider).toBe("gemini");
     expect(settings.apiUrl).toBe(providerDefaults.gemini.apiUrl);
     expect(settings.model).toBe(providerDefaults.gemini.model);
+    expect(settings.liveApiKey).toBe("");
     expect(settings.liveModel).toBe(providerDefaults.gemini.liveModel);
+    expect(settings.imageApiKey).toBe("");
     expect(settings.imageModel).toBe(providerDefaults.gemini.imageModel);
     expect(settings.liveRecording).toMatchObject({
       autoGainControl: false,

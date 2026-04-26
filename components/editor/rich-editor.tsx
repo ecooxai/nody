@@ -53,6 +53,7 @@ export type RichEditorHandle = {
 };
 
 type RichEditorProps = {
+  noteId?: string;
   title: string;
   bodyMarkdown: string;
   editable: boolean;
@@ -616,6 +617,7 @@ function extractEmbeddedMedia(target: EventTarget | null): EmbeddedMedia | null 
 }
 
 export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function RichEditor({
+  noteId,
   title,
   bodyMarkdown,
   editable,
@@ -643,6 +645,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const previewPointerStartRef = useRef<{ x: number; y: number } | null>(null);
   const lastPreviewSelectionRef = useRef("");
   const bodyChangeTimerRef = useRef<number | null>(null);
+  const lastNoteIdRef = useRef(noteId);
   const lastPublishedBodyRef = useRef(bodyMarkdown);
   const pendingBodyChangeReasonRef = useRef<RichEditorBodyChangeReason>("typing");
   const viewerCopyTimerRef = useRef<number | null>(null);
@@ -660,6 +663,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const [viewerMedia, setViewerMedia] = useState<EmbeddedMedia | null>(null);
   const [floatingEditButton, setFloatingEditButton] = useState<{ x: number; y: number } | null>(null);
   const [selectedGutterLines, setSelectedGutterLines] = useState<number[]>([]);
+  const [activeEditorLineNumber, setActiveEditorLineNumber] = useState<number | null>(null);
   const selectedGutterLinesRef = useRef<number[]>([]);
   const [viewerImageInfo, setViewerImageInfo] = useState<{
     copied: boolean;
@@ -1000,6 +1004,28 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     [],
   );
 
+  useLayoutEffect(() => {
+    if (lastNoteIdRef.current === noteId) return;
+    lastNoteIdRef.current = noteId;
+    const compactedBodyMarkdown = compactMediaTags(bodyMarkdown);
+    lastPublishedBodyRef.current = compactedBodyMarkdown;
+    bodyDraftRef.current = compactedBodyMarkdown;
+    selectionRef.current = { start: 0, end: 0 };
+    pendingBodyChangeReasonRef.current = "typing";
+    clearBodyChangeTimer();
+    clearActiveMediaHideTimer();
+    clearFloatingEditButtonTimer();
+    clearPreviewSelectionTimer();
+    setBodyDraft(compactedBodyMarkdown);
+    setActiveMedia(null);
+    setActiveEditorMediaKey(null);
+    setActiveEditorLineNumber(null);
+    syncSelectedGutterLines([]);
+    onSelectionChange?.("");
+    setTextareaScrollTop(0);
+    textareaRef.current?.setSelectionRange(0, 0);
+  }, [bodyMarkdown, noteId, onSelectionChange]);
+
   useEffect(() => {
     const compactedBodyMarkdown = compactMediaTags(bodyMarkdown);
     if (compactedBodyMarkdown !== bodyMarkdown) {
@@ -1213,23 +1239,42 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
   const syncTextareaSelection = (target = textareaRef.current) => {
     const textarea = target;
     if (!textarea) return;
-    selectionRef.current = {
+    const nextSelection = {
       start: displayOffsetToSourceOffset(editorDisplayModel, textarea.selectionStart ?? 0),
       end: displayOffsetToSourceOffset(editorDisplayModel, textarea.selectionEnd ?? 0),
     };
+    selectionRef.current = nextSelection;
+    setActiveEditorLineNumber(Math.max(1, noteBodyMarkdown.slice(0, nextSelection.end).split("\n").length));
     onSelectionChange?.(noteBodyMarkdown.slice(selectionRef.current.start, selectionRef.current.end).trim());
   };
 
-  const handleBodyTextareaChange = (displayValue: string) => {
+  const handleBodyTextareaChange = (target: HTMLTextAreaElement) => {
     if (selectedGutterLines.length > 0) {
       clearGutterLineSelection();
     }
+    const displayValue = target.value;
+    const displaySelection = {
+      start: target.selectionStart ?? 0,
+      end: target.selectionEnd ?? target.selectionStart ?? 0,
+    };
     const reason = pendingBodyChangeReasonRef.current;
     pendingBodyChangeReasonRef.current = "typing";
     onBodyDraftChange?.(reason);
     const value = restoreEditorDisplayValue(displayValue, editorDisplayModel.media);
+    const nextDisplayModel = buildEditorDisplayModel(ensureTrailingNewlines(value));
+    const nextSelection = {
+      start: displayOffsetToSourceOffset(nextDisplayModel, displaySelection.start),
+      end: displayOffsetToSourceOffset(nextDisplayModel, displaySelection.end),
+    };
     bodyDraftRef.current = value;
     setBodyDraft(value);
+    selectionRef.current = nextSelection;
+    setActiveEditorLineNumber(Math.max(1, value.slice(0, nextSelection.end).split("\n").length));
+    window.requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.setSelectionRange(displaySelection.start, displaySelection.end);
+    });
     if (reason === "paste" || reason === "cut" || reason === "delete") {
       publishBodyChange(value, reason);
       return;
@@ -1631,6 +1676,21 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
     );
   };
 
+  const renderEditorFocusLineLayer = () => {
+    if (!activeEditorLineNumber) return null;
+
+    const rowHeight = editorLineLayout.heights[activeEditorLineNumber - 1] ?? EDITOR_TEXT_LINE_HEIGHT_PX;
+    const top = getEditorLineTop(activeEditorLineNumber) - textareaScrollTop;
+    return (
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0 overflow-hidden">
+        <div
+          className="absolute left-[6px] right-[6px] rounded-[8px] bg-black/[0.035]"
+          style={{ height: `${rowHeight}px`, top: `${top}px` }}
+        />
+      </div>
+    );
+  };
+
   const renderEditorMediaPreviewLayer = () => {
     if (editorDisplayModel.media.length === 0) return null;
 
@@ -1821,7 +1881,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
         publishBodyChange(bodyDraftRef.current, "typing");
       },
     }),
-    [noteBodyMarkdown, editable, lineStartTops, editorLineLayout, editorDisplayModel],
+    [noteBodyMarkdown, editable, lineStartTops, editorLineLayout, editorDisplayModel, noteId],
   );
 
   return (
@@ -1871,17 +1931,22 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               <div className="relative grid grid-cols-[20px_minmax(0,1fr)]">
                 {renderLineNumberGutter(textareaScrollTop, { interactive: true, lineHeights: editorLineLayout.heights })}
                 <div className="relative min-w-0">
+                  {renderEditorFocusLineLayer()}
                   {renderEditorLineSelectionLayer()}
                   <textarea
-                    className="min-h-[34rem] w-full resize-none overflow-hidden whitespace-pre-wrap break-words bg-transparent px-[10px] py-[5px] text-[15px] leading-7 text-ink outline-none"
+                    className="relative min-h-[34rem] w-full resize-none overflow-hidden whitespace-pre-wrap break-words bg-transparent py-0 pl-[5px] pr-0 text-[15px] leading-7 text-ink outline-none"
+                    onBlur={() => setActiveEditorLineNumber(null)}
                     onCopy={handleLineSelectionCopy}
-                    onChange={(event) => handleBodyTextareaChange(event.target.value)}
+                    onChange={(event) => handleBodyTextareaChange(event.currentTarget)}
                     onCut={(event) => {
                       if (event.currentTarget.selectionStart !== event.currentTarget.selectionEnd) {
                         pendingBodyChangeReasonRef.current = "cut";
                       }
                     }}
-                    onFocus={onNoteInteract}
+                    onFocus={(event) => {
+                      onNoteInteract?.();
+                      syncTextareaSelection(event.currentTarget);
+                    }}
                     onKeyDown={handleBodyTextareaKeyDown}
                     onKeyUp={(event) => syncTextareaSelection(event.currentTarget)}
                     onMouseUp={(event) => syncTextareaSelection(event.currentTarget)}
@@ -1916,7 +1981,7 @@ export const RichEditor = forwardRef<RichEditorHandle, RichEditorProps>(function
               <div className="relative grid grid-cols-[20px_minmax(0,1fr)]">
                 {renderLineNumberGutter(0, { everyTenOnly: true, interactive: true, lineHeights: viewerLineHeights })}
                 <div
-                  className="markdown-preview min-h-[34rem] cursor-text px-[10px] py-[5px]"
+                  className="markdown-preview min-h-[34rem] cursor-text py-0 pl-[5px] pr-0"
                   dangerouslySetInnerHTML={{ __html: previewHtml }}
                   onClick={handlePreviewClick}
                   onCopy={handleLineSelectionCopy}

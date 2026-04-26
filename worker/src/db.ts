@@ -14,10 +14,7 @@ type DB = D1Database;
 
 const defaultGeminiLiveModel = "gemini-3.1-flash-live-preview";
 const defaultGeminiImageModel = "gemini-3.1-flash-image-preview";
-const deprecatedGeminiLiveModels = new Set([
-  "gemini-2.5-flash-native-audio-preview-12-2025",
-  "gemini-live-2.5-flash-preview",
-]);
+const deprecatedGeminiLiveModels = new Set(["gemini-live-2.5-flash-preview"]);
 
 function isMissingTableError(error: unknown, tableName: string) {
   return error instanceof Error && error.message.includes(`no such table: ${tableName}`);
@@ -98,6 +95,51 @@ export async function createFolder(
   } satisfies FolderRecord;
 }
 
+async function getFolder(db: DB, userId: string, folderId: string) {
+  const row = await db
+    .prepare("SELECT * FROM folders WHERE id = ? AND user_id = ?")
+    .bind(folderId, userId)
+    .first<Record<string, unknown>>();
+  return row ? mapFolder(row) : null;
+}
+
+async function folderBelongsToUser(db: DB, userId: string, folderId: string | null) {
+  if (folderId === null) return true;
+  return Boolean(await getFolder(db, userId, folderId));
+}
+
+async function isFolderDescendant(db: DB, userId: string, folderId: string, possibleDescendantId: string) {
+  let cursor: string | null = possibleDescendantId;
+  const seen = new Set<string>();
+
+  while (cursor && !seen.has(cursor)) {
+    if (cursor === folderId) return true;
+    seen.add(cursor);
+    const folder = await getFolder(db, userId, cursor);
+    cursor = folder?.parentFolderId ?? null;
+  }
+
+  return false;
+}
+
+export async function moveFolder(db: DB, userId: string, folderId: string, parentFolderId: string | null) {
+  const folder = await getFolder(db, userId, folderId);
+  if (!folder) return null;
+  if (!(await folderBelongsToUser(db, userId, parentFolderId))) {
+    throw new Error("Target folder not found");
+  }
+  if (parentFolderId && (parentFolderId === folderId || (await isFolderDescendant(db, userId, folderId, parentFolderId)))) {
+    throw new Error("Cannot move a folder into itself");
+  }
+
+  const now = new Date().toISOString();
+  await db
+    .prepare("UPDATE folders SET parent_folder_id = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+    .bind(parentFolderId, now, folderId, userId)
+    .run();
+  return getFolder(db, userId, folderId);
+}
+
 export async function listDocuments(db: DB, userId: string) {
   const rows = await db
     .prepare("SELECT * FROM documents WHERE user_id = ? ORDER BY updated_at DESC, title COLLATE NOCASE ASC")
@@ -123,6 +165,19 @@ export async function createDocument(
   return getDocument(db, id, userId);
 }
 
+export async function moveDocument(db: DB, userId: string, documentId: string, folderId: string | null) {
+  if (!(await folderBelongsToUser(db, userId, folderId))) {
+    throw new Error("Target folder not found");
+  }
+
+  const now = new Date().toISOString();
+  await db
+    .prepare("UPDATE documents SET folder_id = ?, updated_at = ? WHERE id = ? AND user_id = ?")
+    .bind(folderId, now, documentId, userId)
+    .run();
+  return getDocument(db, documentId, userId);
+}
+
 export async function listFolderAssets(db: DB, userId: string) {
   const rows = await db
     .prepare("SELECT * FROM folder_assets WHERE user_id = ? ORDER BY created_at DESC")
@@ -143,6 +198,18 @@ export async function updateFolderAssetName(db: DB, userId: string, assetId: str
   await db
     .prepare("UPDATE folder_assets SET file_name = ? WHERE id = ? AND user_id = ?")
     .bind(fileName, assetId, userId)
+    .run();
+  return getFolderAsset(db, userId, assetId);
+}
+
+export async function moveFolderAsset(db: DB, userId: string, assetId: string, folderId: string | null) {
+  if (!(await folderBelongsToUser(db, userId, folderId))) {
+    throw new Error("Target folder not found");
+  }
+
+  await db
+    .prepare("UPDATE folder_assets SET folder_id = ? WHERE id = ? AND user_id = ?")
+    .bind(folderId, assetId, userId)
     .run();
   return getFolderAsset(db, userId, assetId);
 }
@@ -274,7 +341,7 @@ export async function syncDocument(
 export async function getSettings(db: DB, userId: string): Promise<ProviderSettings | null> {
   const row = await db
     .prepare(
-      "SELECT provider, api_url, api_key, model, COALESCE(live_model, '') AS live_model, COALESCE(image_model, '') AS image_model, COALESCE(live_echo_cancellation, 0) AS live_echo_cancellation, COALESCE(live_noise_suppression, 0) AS live_noise_suppression, COALESCE(live_standby_enabled, 1) AS live_standby_enabled, COALESCE(live_auto_gain_control, 0) AS live_auto_gain_control, COALESCE(live_silence_trim, 1) AS live_silence_trim, COALESCE(live_speech_threshold, 0.007) AS live_speech_threshold, COALESCE(live_trim_sensitivity, 0.18) AS live_trim_sensitivity FROM provider_settings WHERE user_id = ?",
+      "SELECT provider, api_url, api_key, model, COALESCE(live_api_key, '') AS live_api_key, COALESCE(live_model, '') AS live_model, COALESCE(image_api_key, '') AS image_api_key, COALESCE(image_model, '') AS image_model, COALESCE(live_echo_cancellation, 0) AS live_echo_cancellation, COALESCE(live_noise_suppression, 0) AS live_noise_suppression, COALESCE(live_standby_enabled, 1) AS live_standby_enabled, COALESCE(live_auto_gain_control, 0) AS live_auto_gain_control, COALESCE(live_silence_trim, 1) AS live_silence_trim, COALESCE(live_speech_threshold, 0.007) AS live_speech_threshold, COALESCE(live_trim_sensitivity, 0.18) AS live_trim_sensitivity FROM provider_settings WHERE user_id = ?",
     )
     .bind(userId)
     .first<Record<string, unknown>>();
@@ -289,12 +356,14 @@ export async function getSettings(db: DB, userId: string): Promise<ProviderSetti
     apiUrl: String(row.api_url),
     apiKey: String(row.api_key),
     model: String(row.model).trim() ? String(row.model) : fallbackModel,
+    liveApiKey: String(row.live_api_key),
     liveModel:
       provider === "gemini"
         ? normalizedLiveModel && !deprecatedGeminiLiveModels.has(normalizedLiveModel)
           ? normalizedLiveModel
           : defaultGeminiLiveModel
         : "",
+    imageApiKey: String(row.image_api_key),
     imageModel: imageModel.trim() ? imageModel : provider === "gemini" ? defaultGeminiImageModel : "",
     liveRecording: { ...defaultLiveRecordingSettings },
   };
@@ -304,7 +373,7 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
   const now = new Date().toISOString();
   await db
     .prepare(
-      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_model, image_model, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_model = excluded.live_model, image_model = excluded.image_model, updated_at = excluded.updated_at",
+      "INSERT INTO provider_settings (user_id, provider, api_url, api_key, model, live_api_key, live_model, image_api_key, image_model, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET provider = excluded.provider, api_url = excluded.api_url, api_key = excluded.api_key, model = excluded.model, live_api_key = excluded.live_api_key, live_model = excluded.live_model, image_api_key = excluded.image_api_key, image_model = excluded.image_model, updated_at = excluded.updated_at",
     )
     .bind(
       userId,
@@ -312,7 +381,9 @@ export async function saveSettings(db: DB, userId: string, settings: ProviderSet
       settings.apiUrl,
       settings.apiKey,
       settings.model,
+      settings.liveApiKey ?? "",
       settings.liveModel ?? "",
+      settings.imageApiKey ?? "",
       settings.imageModel ?? "",
       now,
     )

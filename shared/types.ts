@@ -54,7 +54,9 @@ export type ProviderSettings = {
   apiUrl: string;
   apiKey: string;
   model: string;
+  liveApiKey: string;
   liveModel: string;
+  imageApiKey: string;
   imageModel: string;
   liveRecording: LiveRecordingSettings;
 };

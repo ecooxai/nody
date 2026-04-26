@@ -62,6 +62,12 @@ export const apiClient = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  moveFolder: (id: string, parentFolderId: string | null) =>
+    request<FolderRecord>(`/folders/${id}/move`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ parentFolderId }),
+    }),
   createPrompt: (payload: Pick<PromptTemplate, "name" | "content">) =>
     request<PromptTemplate>("/prompts", {
       method: "POST",
@@ -81,6 +87,12 @@ export const apiClient = {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     }),
+  moveDocument: (id: string, folderId: string | null) =>
+    request<DocumentRecord>(`/documents/${id}/move`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ folderId }),
+    }),
   uploadFolderAsset: async (folderId: string | null, file: File, kind: FolderAsset["kind"]) => {
     const formData = new FormData();
     formData.append("file", file);
@@ -95,6 +107,12 @@ export const apiClient = {
       method: "PUT",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ fileName }),
+    }),
+  moveFolderAsset: (id: string, folderId: string | null) =>
+    request<FolderAsset>(`/folder-assets/${id}/move`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ folderId }),
     }),
   syncDocument: (id: string, payload: SyncPayload) =>
     request<SyncResult>(`/documents/${id}/sync`, {

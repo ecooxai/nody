@@ -187,15 +187,6 @@ function findVerticalScrollContainer(target: EventTarget | null, boundary: HTMLE
   return null;
 }
 
-function canConsumeVerticalDelta(element: HTMLElement, deltaY: number) {
-  if (deltaY < 0) return Math.abs(deltaY) <= element.scrollTop + SCROLL_EDGE_TOLERANCE;
-  if (deltaY > 0) {
-    const maxScrollTop = element.scrollHeight - element.clientHeight;
-    return deltaY <= maxScrollTop - element.scrollTop + SCROLL_EDGE_TOLERANCE;
-  }
-  return true;
-}
-
 function normalizeWheelDeltaY(event: WheelEvent<HTMLElement>) {
   if (event.deltaMode === 1) return event.deltaY * 16;
   if (event.deltaMode === 2) return event.deltaY * window.innerHeight;
@@ -804,7 +795,9 @@ export function AIChatPanel({
   onUploadImageToCurrentFolder: (attachment: { fileName: string; mimeType: string; previewUrl: string }) => Promise<unknown>;
 }) {
   const supportsMedia = provider === "gemini";
-  const supportsLive = provider === "gemini" && Boolean(providerSettings.apiKey) && Boolean(providerSettings.liveModel || providerSettings.model);
+  const globalApiKeyAvailable = Boolean(providerSettings.apiKey.trim());
+  const liveApiKeyAvailable = Boolean((providerSettings.liveApiKey || providerSettings.apiKey).trim());
+  const supportsLive = provider === "gemini" && liveApiKeyAvailable && Boolean(providerSettings.liveModel || providerSettings.model);
   const liveRecordingSettings = normalizeLiveRecordingSettings(providerSettings.liveRecording);
   const availablePrompts = [...builtInPrompts, ...prompts];
   const [attachments, setAttachments] = useState<LocalAttachment[]>([]);
@@ -976,6 +969,7 @@ export function AIChatPanel({
   const selectedTextForReadAloud = selectedText?.trim() ?? "";
   const liveDisconnected = activeTab === "live" && !liveSessionState.listening;
   const activeLiveMicrophoneLevel = activeTab === "live" && liveMicrophoneEnabled ? liveMicrophoneLevel : 0;
+  const liveSpeechDetected = liveSessionState.status.startsWith("Speech detected.");
   const liveSpeechAttachments: LiveSendAttachment[] = attachments
     .filter((attachment) => attachment.kind === "image" || attachment.kind === "video")
     .map((attachment) => ({
@@ -1074,10 +1068,10 @@ export function AIChatPanel({
     focusHistory();
     const deltaY = normalizeWheelDeltaY(event);
     const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
-    if (!scrollContainer || !canConsumeVerticalDelta(scrollContainer, deltaY)) {
-      if (scrollContainer) {
-        scrollContainer.scrollTop += deltaY;
-      }
+    if (scrollContainer) {
+      scrollContainer.scrollTop += deltaY;
+    }
+    if (event.cancelable) {
       event.preventDefault();
     }
   }, [focusHistory]);
@@ -1100,10 +1094,10 @@ export function AIChatPanel({
     if (deltaY === 0) return;
 
     const scrollContainer = findVerticalScrollContainer(event.target, event.currentTarget);
-    if ((!scrollContainer || !canConsumeVerticalDelta(scrollContainer, deltaY)) && event.cancelable) {
-      if (scrollContainer) {
-        scrollContainer.scrollTop += deltaY;
-      }
+    if (scrollContainer) {
+      scrollContainer.scrollTop += deltaY;
+    }
+    if (event.cancelable) {
       event.preventDefault();
     }
   }, [focusHistory]);
@@ -1964,7 +1958,8 @@ export function AIChatPanel({
 
     const readKey = `${activeTab}:${text}`;
     if (lastAutoReadSelectionKeyRef.current === readKey) return;
-    if (provider !== "gemini" || !providerSettings.apiKey) return;
+    if (provider !== "gemini") return;
+    if (activeTab === "live" ? !liveApiKeyAvailable : !globalApiKeyAvailable) return;
     if (readingSelection) return;
 
     if (activeTab === "live") {
@@ -1995,7 +1990,8 @@ export function AIChatPanel({
     liveConnectionRequested,
     liveSendHandle,
     provider,
-    providerSettings.apiKey,
+    globalApiKeyAvailable,
+    liveApiKeyAvailable,
     readingSelection,
     selectedTextForReadAloud,
   ]);
@@ -2828,6 +2824,10 @@ export function AIChatPanel({
             >
               {preparingRecording ? (
                 <span className="text-[10px] font-medium uppercase tracking-[0.18em]">...</span>
+              ) : liveSpeechDetected ? (
+                <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <path d="M4 12h2M8 8v8M12 5v14M16 8v8M20 12h-2" stroke="currentColor" strokeLinecap="round" strokeWidth="1.8" />
+                </svg>
               ) : (
                 <svg aria-hidden="true" className="h-4 w-4" fill="none" viewBox="0 0 24 24">
                   <path
@@ -3382,7 +3382,11 @@ export function AIChatPanel({
             <button
               aria-label="Read selected text aloud"
               className="flex h-8 w-8 items-center justify-center rounded-[4px] bg-transparent text-[#1f6f78] transition hover:bg-mist disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={!providerSettings.apiKey || readingSelection || (activeTab === "live" ? !liveSendHandle : busy)}
+              disabled={
+                activeTab === "live"
+                  ? !liveApiKeyAvailable || readingSelection || !liveSendHandle
+                  : !globalApiKeyAvailable || readingSelection || busy
+              }
               onClick={() => void handleReadSelectedText()}
               title={activeTab === "live" ? "Read selected text in Live" : "Generate read-aloud audio"}
               type="button"

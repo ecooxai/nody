@@ -16,7 +16,9 @@ const geminiSettings: ProviderSettings = {
   apiUrl: "https://generativelanguage.googleapis.test",
   apiKey: "test-key",
   model: "gemini-flash-latest",
+  liveApiKey: "",
   liveModel: "gemini-3.1-flash-live-preview",
+  imageApiKey: "",
   imageModel: "gemini-3.1-flash-image-preview",
   liveRecording: {
     autoGainControl: false,

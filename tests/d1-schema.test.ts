@@ -66,7 +66,9 @@ describe("D1 schema", () => {
 
     expect(folderColumns).toContain("parent_folder_id");
     expect(documentColumns).toContain("folder_id");
+    expect(providerColumns).toContain("live_api_key");
     expect(providerColumns).toContain("live_model");
+    expect(providerColumns).toContain("image_api_key");
     expect(providerColumns).toContain("image_model");
     expect(providerColumns).toContain("live_echo_cancellation");
     expect(providerColumns).toContain("live_noise_suppression");
@@ -87,5 +89,6 @@ describe("D1 schema", () => {
     expect(migrationNames).toContain("0009_raise_live_speech_threshold.sql");
     expect(migrationNames).toContain("0010_raise_live_speech_threshold_again.sql");
     expect(migrationNames).toContain("0011_live_standby_enabled.sql");
+    expect(migrationNames).toContain("0012_provider_model_api_keys.sql");
   });
 });
